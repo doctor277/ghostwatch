@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.text_utils import escape_surrogates, safe_structure
+
 
 class Settings(BaseModel):
     """Backward-compatible core settings persisted by GhostWatch 1.x."""
@@ -194,6 +196,11 @@ class Alert(BaseModel):
     last_occurrence: datetime | None = None
     occurrence_count: int = Field(default=1, ge=0)
     condition_active: bool | None = None
+
+    _escape_text = field_validator(
+        "id", "source", "metric", "explanation", "rule_id", "incident_id", mode="before"
+    )(escape_surrogates)
+    _sanitize_evidence = field_validator("evidence", mode="before")(safe_structure)
     last_recovery: datetime | None = None
 
 
@@ -389,6 +396,11 @@ class EventRecord(BaseModel):
     summary: str = Field(default="", max_length=2000)
     related_id: str | None = Field(default=None, max_length=200)
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+    _escape_text = field_validator(
+        "id", "event_type", "title", "summary", "related_id", mode="before"
+    )(escape_surrogates)
+    _sanitize_evidence = field_validator("evidence", mode="before")(safe_structure)
 
 
 class WindowsEventRecord(BaseModel):

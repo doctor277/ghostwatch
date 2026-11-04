@@ -21,6 +21,12 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: snapshot serialization hardening below, Python 3.11.9 on Windows:
   265 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff
   and compilation passed. Hosted CI has not run on these changes.
+- VERIFIED: hosted run
+  [41919724946](https://github.com/doctor277/ghostwatch/actions/runs/41919724946) at
+  `55ca2cb`: Python 3.11.9 and 3.13.17 each 265 passed, Chromium 16 passed.
+- VERIFIED LOCALLY: alert serialization hardening below, Python 3.11.9 on Windows:
+  295 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff and
+  compilation passed. Hosted CI has not run on this change.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -83,12 +89,61 @@ byte-identical to those at `9e4f29d`.
 Regression tests are in `tests/test_v3_snapshot_serialization.py`. Restoring the old
 WebSocket path fails 7 of its 17 tests, and restoring the old REST path fails 4.
 
+## Alert serialization
+
+Originally recorded as a 500 from `/api/alerts`. Tracing it at `55ca2cb` showed the
+cause was not in that route. `Alert` and `EventRecord` accepted values that consumers
+could not handle, and each consumer failed differently. Reproduced with synthetic
+alerts injected the way `collect_once` handles them:
+
+| Input | Failures at `55ca2cb` |
+| --- | --- |
+| Lone surrogate in alert text | `_alert_event` raised, so every collection cycle aborted and `latest` froze. The queued write could never succeed, so storage stayed degraded through every recovery attempt. `/api/alerts`, `PATCH /api/alerts/{id}` and 12 report variants returned 500 |
+| Lone surrogate in evidence | `/api/alerts`, the PATCH route, `/api/events` and 16 report variants returned 500. The alert and event routes stayed broken after a restart |
+| Unserializable object in evidence | `/api/alerts`, the PATCH route, `/api/events` and all 48 report variants returned 500. The AI prompt received the object's `repr` |
+| Circular evidence | `/api/alerts` returned 500 and the failed write degraded storage |
+| Lone surrogate in a nested evidence key | `/api/alerts` returned 500 |
+
+No current collector is known to produce these values: surrogate sources were escaped in
+`d088c41` and Windows event text passes through an XML parser. Their impact, not a known
+live trigger, is why this was fixed before review.
+
+The fix has two layers:
+
+- Model boundary: `Alert` and `EventRecord` escape lone surrogates with `safe_text`, and
+  `safe_structure` makes evidence JSON-compatible. Values it cannot represent, including
+  objects and cycles, become an explicit `[UNSERIALIZABLE]` marker and never their
+  `repr`. The alert is kept, so one bad value cannot hide the others. Stored rows pass
+  through the same models, so existing databases are covered.
+- Response boundary: `PydanticSerializationError` and `UnicodeEncodeError` return a fixed
+  JSON 503 and log only the exception type. This covers evidence mutated after
+  construction. It also replaces the plain-text 500 from `POST /api/incidents` and
+  `POST /api/file-integrity/folders` for unencodable input.
+
+After the fix, all four matrix shapes returned 200 on all 55 route checks, storage stayed
+healthy, nothing stayed pending, and restart was clean. Valid alerts, `NaN`, infinite
+values, tuples and datetimes keep their JSON output.
+
+Regression tests are in `tests/test_v3_alert_serialization.py`. 26 of its 30 tests failed
+at `55ca2cb`. Mutation checks: removing text escaping failed 5, removing evidence
+sanitizing 16, removing the response handlers 6, and replacing the marker with `str()` 4.
+Removing cycle detection made the branching-cycle test run until the 110 second limit.
+
+`tests/test_v3_snapshot_serialization.py` now assigns malformed text after construction,
+because the constructor would otherwise repair it before reaching that boundary.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
 
-- Reproduced: `/api/alerts` returns a plain-text 500 for a malformed live alert. Report
-  and AI routes also read `latest` directly and were not tested with malformed data.
+- Reproduced with synthetic data: an alert explanation over 2,000 characters fails
+  `EventRecord` validation in `_alert_event` and aborts the collection cycle. No current
+  source is known to produce text that long.
+- Reproduced: unencodable input to `POST /api/incidents` and
+  `POST /api/file-integrity/folders` returns 503. A 422 would describe it better.
+- A permanently failing queued write can keep storage degraded, because
+  `_flush_pending` stops at the first failure. The reproduced causes are fixed, but no
+  general limit on retries exists.
 - `broadcast` can send directly to a client that is registered but not yet accepted,
   then close it. The window is narrow.
 - `unregister_client` suppresses `CancelledError`, including the caller's own.
@@ -106,6 +161,8 @@ These come from code review and have not been reproduced, unless noted.
   History is dropped while degraded, but Windows events are still collected into
   bounded memory even if saved settings disable them.
 - An escaped name is a display form. Only the on-disk path is authoritative.
+- Evidence mutated after construction bypasses the model boundary, and one such alert
+  makes the whole `/api/alerts` response a 503. No application code does this.
 - `telemetry_degraded` covers snapshots that exist but cannot be served. The dashboard
   has no watchdog for frames that stop arriving while the socket stays open, so it can
   still show `CONNECTED` if collection itself stops.

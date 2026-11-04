@@ -26,8 +26,10 @@ def with_alert(snapshot, sequence, explanation="synthetic"):
         severity="INFO",
         source="synthetic",
         metric="synthetic",
-        explanation=explanation,
+        explanation="synthetic",
     )
+    # Assign after construction so this boundary still sees malformed text.
+    alert.explanation = explanation
     return snapshot.model_copy(update={"sequence": sequence, "alerts": [alert]})
 
 

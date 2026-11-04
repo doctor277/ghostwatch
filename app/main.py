@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic_core import PydanticSerializationError
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.ai import LocalAIAnalyst
@@ -16,6 +19,14 @@ from app.api.websocket import router as websocket_router
 from app.config import ALLOWED_HTTP_HOSTS, DATABASE_PATH, FRONTEND_DIR
 from app.service import TelemetryService
 from app.storage.database import Database
+
+LOGGER = logging.getLogger(__name__)
+
+
+async def unavailable_response(_: Request, exc: Exception) -> JSONResponse:
+    # The exception text can quote the offending value, so only its type is logged.
+    LOGGER.warning("A response could not be encoded (%s)", type(exc).__name__)
+    return JSONResponse({"detail": "The requested data is unavailable"}, status_code=503)
 
 
 class LocalSecurityMiddleware:
@@ -93,6 +104,8 @@ def create_app(database_path: Path | None = None, start_background: bool = True)
         allowed_hosts.add("testserver")
     app.state.allowed_hosts = frozenset(allowed_hosts)
     app.state.ai_analyst = LocalAIAnalyst()
+    app.add_exception_handler(PydanticSerializationError, unavailable_response)
+    app.add_exception_handler(UnicodeEncodeError, unavailable_response)
     app.add_middleware(
         LocalSecurityMiddleware, allowed_hosts=app.state.allowed_hosts
     )
