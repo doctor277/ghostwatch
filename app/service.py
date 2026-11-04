@@ -122,6 +122,7 @@ class TelemetryService:
         self._windows_seen: OrderedDict[str, None] = OrderedDict()
         self._file_integrity_seen: OrderedDict[str, None] = OrderedDict()
         self._stop = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
         self._collection_lock = asyncio.Lock()
         self._sequence = 0
         self._pending_alerts: OrderedDict[str, Alert] = OrderedDict()
@@ -165,6 +166,17 @@ class TelemetryService:
         return True
 
     async def start(self) -> None:
+        async with self._lifecycle_lock:
+            if self._task is not None:
+                return
+            try:
+                await self._start_workers()
+            except BaseException:
+                # Startup cancellation must also release workers already created.
+                await self._stop_workers()
+                raise
+
+    async def _start_workers(self) -> None:
         if not self.storage.persistence_available:
             await self.initialize_storage()
         self._stop.clear()
@@ -181,29 +193,44 @@ class TelemetryService:
         self._task = asyncio.create_task(self._run(), name="ghostwatch-telemetry")
 
     async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            cleanup = asyncio.create_task(self._stop_workers(), name="ghostwatch-shutdown")
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Finish the bounded async cleanup before propagating cancellation.
+                await cleanup
+                raise
+
+    async def _stop_workers(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+        producers = [
+            task for task in (self._task, self._windows_task, self._file_integrity_task)
+            if task is not None
+        ]
+        for task in producers:
+            task.cancel()
+        results = await asyncio.gather(*producers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.warning("Monitoring worker stopped with %s", type(result).__name__)
+        self._task = self._windows_task = self._file_integrity_task = None
         if self._history_task:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self._history_queue.join(), timeout=2.0)
+            if not self._history_task.done():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self._history_queue.join(), timeout=2.0)
             self._history_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._history_task
+            results = await asyncio.gather(self._history_task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    LOGGER.warning("History worker stopped with %s", type(result).__name__)
             self._history_task = None
-        if self._windows_task:
-            self._windows_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._windows_task
-            self._windows_task = None
-        if self._file_integrity_task:
-            self._file_integrity_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._file_integrity_task
-            self._file_integrity_task = None
+        # Account for batches the bounded drain could not persist; do not replay
+        # stale work on a later start. An in-flight thread may still finish.
+        while not self._history_queue.empty():
+            self._history_queue.get_nowait()
+            self._history_queue.task_done()
+            self.history_dropped_samples += 1
         async with self._clients_lock:
             clients = list(self.clients)
         for client in clients:

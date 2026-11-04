@@ -74,9 +74,11 @@ def create_app(database_path: Path | None = None, start_background: bool = True)
             await telemetry.start()
         application.state.database = database
         application.state.telemetry = telemetry
-        yield
-        if start_background:
-            await telemetry.stop()
+        try:
+            yield
+        finally:
+            if start_background:
+                await telemetry.stop()
 
     app = FastAPI(
         title="GhostWatch V3",
