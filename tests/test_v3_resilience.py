@@ -5,20 +5,25 @@ import sqlite3
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
 
 from app.main import create_app
 from app.models import (
+    Alert,
+    AlertUpdate,
+    DetectionSettings,
     FileBaselineEntry,
     FileScanResult,
+    HistorySettings,
     MonitoredFolder,
+    Settings,
 )
 from app.monitoring.network import NetworkCollector
 from app.monitoring.processes import ProcessCollector
-from app.service import TelemetryService
+from app.service import StorageUnavailableError, TelemetryService
 from app.storage.database import Database
 
 WORKERS = ("_task", "_history_task", "_windows_task", "_file_integrity_task")
@@ -203,6 +208,215 @@ async def test_surrogate_file_present_when_folder_is_added(tmp_path):
 
     assert list(service.database.load_file_baseline(folder.id)) == ["evasive\\ud800.txt"]
     assert service.storage.status == "healthy"
+
+
+def synthetic_alert():
+    return Alert(
+        id="synthetic-alert",
+        timestamp=datetime.now(UTC),
+        severity="WARNING",
+        source="synthetic",
+        metric="synthetic",
+        explanation="synthetic",
+    )
+
+
+async def test_direct_write_recovery_still_flushes_pending_writes(tmp_path, monkeypatch):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"), storage_retry_seconds=60)
+    assert await service.initialize_storage()
+    alert = synthetic_alert()
+    real_add_alert = service.database.add_alert
+
+    def fail(*args):
+        raise sqlite3.OperationalError("synthetic")
+
+    monkeypatch.setattr(service.database, "add_alert", fail)
+    assert not await service._persist_alert(alert)
+    monkeypatch.setattr(service.database, "add_alert", real_add_alert)
+
+    # A settings write succeeds and restores health without the recovery path.
+    await service.update_detection_settings(DetectionSettings())
+    assert service.storage.persistence_available
+    await service._maybe_recover_storage()
+
+    assert not service._pending_alerts
+    assert not service._pending_events
+    assert [stored.id for stored in service.database.list_alerts(10, True)] == [alert.id]
+    assert not next(
+        item for item in service.live_alerts if item.id == alert.id
+    ).persistence_pending
+
+
+async def failed_startup_service(database, monkeypatch):
+    service = TelemetryService(database, storage_retry_seconds=0)
+
+    def fail():
+        raise sqlite3.OperationalError("synthetic")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(database, "initialize", fail)
+        assert not await service.initialize_storage()
+    return service
+
+
+async def test_recovery_reports_storage_available_only_after_settings_load(
+    tmp_path, monkeypatch
+):
+    database = Database(tmp_path / "synthetic.db")
+    database.initialize()
+    service = await failed_startup_service(database, monkeypatch)
+    real_load = database.load_history_settings
+    available_during_load = []
+
+    def spy():
+        available_during_load.append(service.storage.persistence_available)
+        return real_load()
+
+    monkeypatch.setattr(database, "load_history_settings", spy)
+    await service._maybe_recover_storage()
+    assert available_during_load == [False]
+    assert service.storage.persistence_available
+
+
+async def test_history_is_not_written_until_saved_settings_are_loaded(tmp_path, monkeypatch):
+    database = Database(tmp_path / "synthetic.db")
+    database.initialize()
+    service = await failed_startup_service(database, monkeypatch)
+    # A direct write restores health before the next collection reconciles.
+    await service.update_detection_settings(DetectionSettings())
+    assert service.storage.persistence_available
+    write = Mock()
+    monkeypatch.setattr(database, "add_history_batch", write)
+    writer = asyncio.create_task(service._history_writer())
+    try:
+        service._history_queue.put_nowait(
+            SimpleNamespace(sample=None, processes=[], connection_summary=None)
+        )
+        await asyncio.wait_for(service._history_queue.join(), timeout=2.0)
+    finally:
+        await cleanup_tasks([writer])
+    write.assert_not_called()
+    assert service.history_dropped_samples == 1
+
+
+async def test_saved_logging_opt_out_discards_writes_queued_under_defaults(
+    tmp_path, monkeypatch
+):
+    database = Database(tmp_path / "synthetic.db")
+    database.initialize()
+    database.save_settings(Settings(event_logging_enabled=False))
+    service = await failed_startup_service(database, monkeypatch)
+    alert = synthetic_alert()
+    service._remember_live_alert(alert)
+    assert not await service._persist_alert(alert)
+
+    await service._maybe_recover_storage()
+
+    assert not service.settings.event_logging_enabled
+    assert database.list_alerts(10, True) == []
+    assert not service._pending_alerts
+    assert not service.live_alerts[0].persistence_pending
+
+
+@pytest.mark.parametrize(
+    "update, maintenance, applied",
+    [
+        (
+            lambda service: service.update_history_settings(HistorySettings(enabled=False)),
+            "prune_telemetry",
+            lambda service: not service.history_settings.enabled,
+        ),
+        (
+            lambda service: service.update_settings(Settings(event_logging_enabled=False)),
+            "enforce_retention",
+            lambda service: not service.settings.event_logging_enabled,
+        ),
+    ],
+)
+async def test_saved_opt_out_applies_when_follow_up_maintenance_fails(
+    tmp_path, monkeypatch, update, maintenance, applied
+):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    assert await service.initialize_storage()
+
+    def fail(*args):
+        raise sqlite3.OperationalError("synthetic")
+
+    monkeypatch.setattr(service.database, maintenance, fail)
+    with pytest.raises(StorageUnavailableError):
+        await update(service)
+    assert applied(service)
+
+
+async def test_alert_update_during_flush_is_not_overwritten(tmp_path, monkeypatch):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"), storage_retry_seconds=60)
+    assert await service.initialize_storage()
+    database = service.database
+    alert = synthetic_alert()
+    service._remember_live_alert(alert)
+    real_add_alert = database.add_alert
+
+    def fail(*args):
+        raise sqlite3.OperationalError("synthetic")
+
+    monkeypatch.setattr(database, "add_alert", fail)
+    assert not await service._persist_alert(alert)
+    await service.update_detection_settings(DetectionSettings())
+    loop = asyncio.get_running_loop()
+
+    def add_then_acknowledge(*args):
+        monkeypatch.setattr(database, "add_alert", real_add_alert)
+        stored = real_add_alert(*args)
+        asyncio.run_coroutine_threadsafe(
+            service.update_alert(alert.id, AlertUpdate(acknowledged=True)), loop
+        ).result(timeout=5.0)
+        return stored
+
+    monkeypatch.setattr(database, "add_alert", add_then_acknowledge)
+    await service._maybe_recover_storage()
+    await service._maybe_recover_storage()
+
+    assert not service._pending_alerts
+    assert next(item for item in service.live_alerts if item.id == alert.id).acknowledged
+    assert database.list_alerts(10, True)[0].acknowledged
+
+
+@pytest.mark.parametrize("direct_write_first", [False, True])
+async def test_recovery_loads_settings_missed_at_startup(
+    tmp_path, monkeypatch, direct_write_first
+):
+    database = Database(tmp_path / "synthetic.db")
+    database.initialize()
+    database.save_history_settings(HistorySettings(enabled=False))
+    service = TelemetryService(database, storage_retry_seconds=0)
+    real_initialize = database.initialize
+
+    def fail():
+        raise sqlite3.OperationalError("synthetic")
+
+    monkeypatch.setattr(database, "initialize", fail)
+    assert not await service.initialize_storage()
+    assert service.history_settings.enabled
+    monkeypatch.setattr(database, "initialize", real_initialize)
+
+    if direct_write_first:
+        await service.update_detection_settings(DetectionSettings())
+    await service._maybe_recover_storage()
+    assert service.storage.persistence_available
+    assert not service.history_settings.enabled
+
+
+async def test_recovery_after_runtime_failure_keeps_live_baseline(tmp_path, monkeypatch):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"), storage_retry_seconds=0)
+    assert await service.initialize_storage()
+    live_baseline = {"cpu_percent": [12.5]}
+    service.baseline_engine.restore_state(live_baseline)
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+
+    await service._maybe_recover_storage()
+
+    assert service.storage.persistence_available
+    assert service.baseline_engine.export_state()["cpu_percent"] == [12.5]
 
 
 def surrogate_process():

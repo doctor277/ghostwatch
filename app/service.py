@@ -131,6 +131,7 @@ class TelemetryService:
         self._pending_events: OrderedDict[str, EventRecord] = OrderedDict()
         self._storage_retry_seconds = storage_retry_seconds
         self._next_storage_retry = 0.0
+        self._persisted_state_missing = False
         self.storage = StorageHealth(
             status="recovering",
             persistence_available=False,
@@ -139,33 +140,38 @@ class TelemetryService:
     async def initialize_storage(self) -> bool:
         try:
             version = await asyncio.to_thread(self.database.initialize)
-            self.settings = await asyncio.to_thread(self.database.load_settings)
-            self.detection_settings = await asyncio.to_thread(
-                self.database.load_detection_settings
-            )
-            self.ai_settings = await asyncio.to_thread(self.database.load_ai_settings)
-            self.history_settings = await asyncio.to_thread(
-                self.database.load_history_settings
-            )
-            self.windows_event_settings = await asyncio.to_thread(
-                self.database.load_windows_event_settings
-            )
-            self.file_integrity_settings = await asyncio.to_thread(
-                self.database.load_file_integrity_settings
-            )
-            self._windows_cursors = await asyncio.to_thread(
-                self.database.load_windows_event_cursors
-            )
-            baseline_state = await asyncio.to_thread(
-                self.database.load_baseline_state
-            )
-            self.baseline_engine.restore_state(baseline_state)
+            await self._load_persisted_state()
         except Exception as exc:
+            self._persisted_state_missing = True
             self._mark_storage_failure(exc)
             return False
+        self._persisted_state_missing = False
         self._mark_storage_success(version)
         await self._flush_pending()
         return True
+
+    async def _load_persisted_state(self) -> None:
+        self.settings = await asyncio.to_thread(self.database.load_settings)
+        self.detection_settings = await asyncio.to_thread(
+            self.database.load_detection_settings
+        )
+        self.ai_settings = await asyncio.to_thread(self.database.load_ai_settings)
+        self.history_settings = await asyncio.to_thread(
+            self.database.load_history_settings
+        )
+        self.windows_event_settings = await asyncio.to_thread(
+            self.database.load_windows_event_settings
+        )
+        self.file_integrity_settings = await asyncio.to_thread(
+            self.database.load_file_integrity_settings
+        )
+        self._windows_cursors = await asyncio.to_thread(
+            self.database.load_windows_event_cursors
+        )
+        baseline_state = await asyncio.to_thread(
+            self.database.load_baseline_state
+        )
+        self.baseline_engine.restore_state(baseline_state)
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -488,6 +494,7 @@ class TelemetryService:
                 if (
                     self.history_settings.enabled
                     and self.storage.persistence_available
+                    and not self._persisted_state_missing
                 ):
                     await asyncio.to_thread(
                         self.database.add_history_batch,
@@ -991,16 +998,43 @@ class TelemetryService:
         return True
 
     async def _maybe_recover_storage(self) -> None:
-        if self.storage.persistence_available or time.monotonic() < self._next_storage_retry:
-            return
-        self.storage = self.storage.model_copy(update={"status": "recovering"})
+        # A direct write can restore health without passing through recovery.
+        recovering = not self.storage.persistence_available
+        if recovering:
+            if time.monotonic() < self._next_storage_retry:
+                return
+            self.storage = self.storage.model_copy(update={"status": "recovering"})
+        version = None
         try:
-            version = await asyncio.to_thread(self.database.initialize)
+            if recovering:
+                version = await asyncio.to_thread(self.database.initialize)
+            await self._load_missed_state()
         except Exception as exc:
             self._mark_storage_failure(exc)
             return
-        self._mark_storage_success(version)
-        await self._flush_pending()
+        if recovering:
+            self._mark_storage_success(version)
+        if self._pending_alerts or self._pending_events:
+            await self._flush_pending()
+
+    async def _load_missed_state(self) -> None:
+        if not self._persisted_state_missing:
+            return
+        # Startup could not read the database, so saved settings such as a history
+        # or logging opt-out are applied here, before any write can use the defaults.
+        await self._load_persisted_state()
+        self._persisted_state_missing = False
+        if not self.settings.event_logging_enabled:
+            self._discard_pending_writes()
+
+    def _discard_pending_writes(self) -> None:
+        self._pending_alerts.clear()
+        self._pending_events.clear()
+        for index, alert in enumerate(self.live_alerts):
+            if alert.persistence_pending:
+                self.live_alerts[index] = alert.model_copy(
+                    update={"persistence_pending": False}
+                )
 
     async def _flush_pending(self) -> None:
         if not self.storage.persistence_available:
@@ -1014,6 +1048,9 @@ class TelemetryService:
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 return
+            if self._pending_alerts.get(alert_id) is not alert:
+                # An operator update arrived during the write; the next pass saves it.
+                continue
             self._pending_alerts.pop(alert_id, None)
             self._remember_live_alert(stored, authoritative=True)
         for event_id, event in list(self._pending_events.items()):
@@ -1131,6 +1168,8 @@ class TelemetryService:
     async def update_settings(self, settings: Settings) -> Settings:
         try:
             await asyncio.to_thread(self.database.save_settings, settings)
+            # A saved opt-out takes effect even if the maintenance below fails.
+            self.settings = settings
             await asyncio.to_thread(
                 self.database.enforce_retention, settings.alert_retention
             )
@@ -1139,7 +1178,6 @@ class TelemetryService:
             raise StorageUnavailableError(
                 "Settings were not persisted; storage is unavailable"
             ) from exc
-        self.settings = settings
         self._mark_storage_success()
         await self.record_event(
             "settings_change",
@@ -1178,6 +1216,8 @@ class TelemetryService:
             await asyncio.to_thread(
                 self.database.save_history_settings, settings
             )
+            # A saved opt-out takes effect even if the maintenance below fails.
+            self.history_settings = settings
             await asyncio.to_thread(
                 self.database.prune_telemetry,
                 settings.retention_hours,
@@ -1193,7 +1233,6 @@ class TelemetryService:
             raise StorageUnavailableError(
                 "Historical telemetry settings were not persisted"
             ) from exc
-        self.history_settings = settings
         self._mark_storage_success()
         return settings
 
