@@ -1,157 +1,151 @@
 # GhostWatch V3
 
-GhostWatch V3 is a local-first Windows monitoring and investigation dashboard. It collects system, process, connection, Windows Event Log, and explicitly enrolled file-integrity metadata; applies explainable detection rules; streams bounded updates to a browser dashboard; and stores selected history in local SQLite.
+**Status: local beta** | Windows 10/11 | Loopback-only dashboard
 
-The current build is a **local beta accepted with limitations**. It is intended for a single Windows user on one computer. It is not an antivirus product, an endpoint protection replacement, a remote scanner, a penetration-testing toolkit, or a claim that a computer is free of compromise.
+GhostWatch is a local-first Windows monitoring and investigation dashboard for exploring system health, processes, network connections, Windows events, file-integrity changes, and explainable detections. It combines a FastAPI backend, local SQLite history, and a dependency-free browser interface without sending host telemetry to a cloud service.
 
-![GhostWatch V3 Demo Mode showing a synthetic network relationship graph](docs/browser-demo-network-graph.png)
+![GhostWatch V3 dashboard in Demo Mode using synthetic data](docs/browser-demo-network-graph.png)
 
-> Current V3 interface captured in Demo Mode. Every process, address, alert, and relationship shown is synthetic and remains in browser memory; it is not saved as host telemetry.
+> The screenshot shows the current V3 interface in Demo Mode. Its processes, addresses, alerts, and relationships are synthetic, remain in browser memory, and are not stored as host telemetry.
 
-## Current verification status
+GhostWatch is a single-user learning and portfolio project, not an antivirus, EDR replacement, remote scanner, penetration-testing toolkit, or proof that a computer is uncompromised.
 
-The final Windows closeout run reported:
+## What it demonstrates
 
-- **222 Python tests passed**
-- **15 Playwright tests passed** using synthetic REST and WebSocket data
-- **77 focused release-security tests passed**
-- Ruff, Python compilation, JavaScript syntax, PowerShell parsing, SQLite integrity, and live Host/Origin/WebSocket checks passed
+- Bounded collection of Windows system, process, socket, and Event Log metadata
+- Explainable threshold and baseline detections with local incident tracking
+- Opt-in SHA-256 file-integrity baselines with path-safety controls
+- Historical telemetry, retention, rollups, exports, and missing-data indicators
+- A secured loopback REST/WebSocket boundary and privacy-redacted reports
+- An isolated browser Demo Mode and synthetic Playwright regression suite
+- Optional local-only Ollama analysis, disabled by default and never treated as a security verdict
 
-Those figures are from the Windows closeout environment on October 27, 2026. They are not results from the separate independent Linux source audit. See [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md) for scope, commands, warnings, and limitations. RC2 through RC5 records are retained as historical engineering evidence and are indexed separately in [Documentation](docs/README.md).
+## Technology
 
-## Feature overview
-
-- **Live system telemetry** — CPU, memory, disk, network rates, uptime, collection health, and bounded WebSocket updates.
-- **Process monitoring** — process inventory, search, sorting, detail drawer, process tree, access-status indicators, and historical observations.
-- **Network intelligence** — full-list aggregate socket counts, a capped detail view, connection ownership where Windows exposes it, rankings, lifecycle summaries, and a relationship graph.
-- **Detection and incidents** — explainable threshold and baseline rules, grouped collection failures, alert acknowledgement/dismissal, and local incident case tracking.
-- **Historical analytics** — durable CPU, memory, network, process, and connection observations with time-range queries, rollups, retention, missing-data gaps, and selected export.
-- **File integrity** — opt-in monitored folders, SHA-256 baselines, create/modify/delete detection, deduplication, and path-safety controls.
-- **Windows Event Logs** — incremental, read-only Defender, System, and Application summaries with cursor recovery and permission-aware degradation.
-- **Privacy-safe reports** — redacted JSON, CSV, and HTML reports with spreadsheet-formula neutralization and explicit raw-data boundaries.
-- **Optional local AI** — disabled by default; when enabled, analysis is sent only to a user-configured loopback Ollama endpoint with no cloud fallback or tool access.
+| Area | Implementation |
+|---|---|
+| Backend | Python 3.11+, FastAPI, Uvicorn, Pydantic, psutil |
+| Storage | SQLite schema v3 with WAL, migrations, retention, and rollups |
+| Frontend | HTML, CSS, and JavaScript with Canvas charts and WebSockets |
+| Testing | pytest, Ruff, Playwright Chromium, and Node syntax checks |
+| Platform | Windows 10/11, PowerShell launcher, loopback-only service |
 
 ## Architecture
 
 ```text
-Windows host collectors
-  system | processes | sockets | event logs | file integrity
+Windows collectors
+  system | processes | sockets | event logs | enrolled folders
                          |
                          v
-                 monitoring service
-              / detection / baselines \
-             v                         v
-      SQLite schema v3          bounded live state
-      WAL + retention           alerts + telemetry
-             \                         /
-              v                       v
-          FastAPI REST + secured WebSocket
+          monitoring + detection + baselines
+                 |                 |
+                 v                 v
+       SQLite history       bounded live state
+                 \                 /
+                  v               v
+             FastAPI REST + WebSocket
                          |
                          v
-          dependency-free HTML/CSS/JavaScript UI
+              browser dashboard
 ```
 
-- `app/monitoring/` isolates system, network, process, Windows-event, and file-integrity collection failures.
-- `app/detection/` contains explainable duration/cooldown rules and baseline evaluation.
-- `app/storage/` owns schema-v3 migrations, WAL handling, retention, rollups, incidents, settings, and recovery.
-- `app/api/` exposes the loopback REST and WebSocket interfaces.
-- `app/reporting.py`, `app/privacy.py`, and `app/ai.py` implement reporting, redaction, and optional local analysis boundaries.
-- `frontend/` is a dependency-free dashboard with Canvas charts and isolated Demo Mode.
-- `tests/` and `e2e/` contain backend/security regressions and synthetic Playwright flows.
+Collectors degrade independently when Windows permissions or providers limit access. `app/storage/` owns persistence, `app/detection/` contains explainable rules, `app/api/` exposes the local interface, and `frontend/` contains the dependency-free dashboard. Tests use temporary databases and synthetic browser fixtures.
 
-## Security and privacy boundaries
-
-- The supported launcher binds Uvicorn only to `127.0.0.1:8765`.
-- Exact HTTP `Host` and unsafe-request `Origin` checks protect the intended browser boundary.
-- WebSockets require an allowed `Host` and exact dashboard `Origin`; client count and sends are bounded.
-- No packet payloads are captured, no remote systems are scanned, and GhostWatch does not block traffic or terminate processes.
-- Runtime databases, WAL/SHM files, logs, test artifacts, environments, and real telemetry screenshots are excluded from public release archives.
-- Windows permissions may limit process names, executable metadata, socket ownership, or Event Log visibility. GhostWatch reports degraded or unavailable collection rather than inventing data.
-- The Windows user account is the local trust boundary. Host/Origin checks are not authentication for another native process running as that same user.
-- Raw Windows event data remains local. Dashboard and default export paths redact usernames, SIDs, home directories, and sensitive paths.
-- Optional AI is not a security verdict. Its output must be treated as an analyst aid and verified against local evidence.
-
-Do not expose GhostWatch through a LAN listener, public reverse proxy, or port-forwarding rule. This project has not been certified by penetration testing.
-
-## Requirements
-
-- Windows 10 or Windows 11
-- PowerShell
-- Python 3.11 or newer
-- Node.js 20 or newer only when running Playwright tests
-
-## Installation and startup
-
-Clone or extract the source into a normal user-writable folder, then run:
+## Quick start
 
 ```powershell
-cd C:\projects\ghostwatch-v3
+git clone https://github.com/doctor277/ghostwatch.git
+cd ghostwatch
 powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-The launcher creates `.venv` if needed, installs pinned Python dependencies only when `requirements.txt` changes, rejects Python versions below 3.11, checks that port 8765 is free, waits for the health endpoint, and opens the dashboard when possible. Use `-NoBrowser` to suppress browser launch.
+Requirements:
 
-Manual startup:
+- Windows 10 or Windows 11
+- PowerShell 5.1 or newer
+- Python 3.11 or newer available as `python` on `PATH` (3.11 verified locally; CI targets 3.11 and 3.13)
+- Internet access on the first run to install the pinned packages in `requirements.txt`
+
+The launcher creates `.venv`, verifies the Python version, installs dependencies when the requirements hash changes, checks port `8765`, starts Uvicorn on `127.0.0.1`, waits for the health endpoint, and opens the dashboard. Use `-NoBrowser` to suppress automatic browser launch. Press `Ctrl+C` in the launcher window to stop GhostWatch.
+
+### Demo Mode
+
+Open **Settings** and select **Enter Demo Mode**. A yellow banner identifies the data as synthetic and not saved. Demo Mode does not scan local folders or persist its observations, making it the safest way to explore the complete interface.
+
+## Testing
+
+Create a development environment and install the pinned Python dependencies:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 ```
 
-Open <http://127.0.0.1:8765>. Keep the PowerShell window open and press `Ctrl+C` there to stop GhostWatch.
-
-### Demo Mode
-
-Open **Settings**, select **Enter Demo Mode**, and navigate through the dashboard. The yellow banner identifies the mode as synthetic and not saved. Demo Mode does not scan local folders or persist its observations.
-
-## Testing
-
-Python and static checks:
+Run the Python suite, focused release-security regressions, linting, and compilation checks:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest tests\test_v3_final_packaging.py tests\test_v3_rc4_hardening.py tests\test_v3_rc5_release.py
 .\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m compileall -q app scripts
+.\.venv\Scripts\python.exe -m compileall -q app scripts tests
 ```
 
-Browser tests:
+Node.js 20 or newer is required only for browser and JavaScript checks:
 
 ```powershell
 npm ci
-npx playwright --version
-npx playwright install --dry-run
+node --check frontend\js\charts.js
+node --check frontend\js\dashboard.js
+node --check frontend\js\demo.js
+node --check frontend\js\network-graph.js
+node --check frontend\js\websocket.js
+node --check e2e\dashboard.spec.js
+node --check e2e\synthetic-backend.js
+node --check playwright.config.js
+npx playwright install chromium
 npm run test:e2e
 ```
 
-Browser binaries are not bundled with the repository. Review the dry-run output before installing any missing browser. The checked-in suite uses synthetic data and starts a temporary loopback server.
+The Playwright suite starts a temporary loopback server and supplies synthetic REST/WebSocket data. Browser binaries are downloaded separately and are not committed or distributed with this repository.
 
-## Troubleshooting
+## Verified results
 
-- **Python is too old:** install Python 3.11 or newer, then recreate `.venv`.
-- **Port 8765 is occupied:** stop the application that owns the port or choose a different time to run GhostWatch; do not expose a different network interface.
-- **Dashboard does not open automatically:** browse to `http://127.0.0.1:8765` after the launcher reports a healthy server.
-- **Process or network details are partial:** run without privilege escalation first and review the collection-status indicators. Protected Windows processes and socket providers may intentionally hide metadata.
-- **Windows events are unavailable:** confirm the relevant log is readable by the current account. GhostWatch does not alter Event Log permissions.
-- **Playwright browser is missing:** run `npx playwright install --dry-run`, review the proposed downloads, and install only the browser you intend to test.
-- **Database recovery warning:** stop GhostWatch and preserve the database plus matching `-wal` and `-shm` files before attempting manual recovery.
+The accepted Windows closeout on **October 27, 2026** reported 222 Python tests passed, 15 synthetic Playwright tests passed, and 77 focused release-security tests passed. Ruff, Python compilation, JavaScript syntax, PowerShell parsing, SQLite integrity, and live Host/Origin/WebSocket checks also passed.
 
-## Documentation and release history
+The portfolio-preparation rerun on **November 1, 2026** reproduced 222 Python passes, 15 Playwright passes, and 77 focused release-security passes. These are dated Windows results, not a claim that every future commit or platform has passed. See [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md) for exact commands, timings, warnings, and scope.
+
+The local portfolio-upgrade branch was revalidated on **November 3, 2026**: 222 Python tests, 77 focused release-security tests, and 15 synthetic Playwright tests passed with no failures or skips. The hosted GitHub Actions workflow has not run yet.
+
+## Security and privacy boundaries
+
+- The supported launcher binds only to `127.0.0.1:8765`; do not expose it through a LAN listener, reverse proxy, tunnel, or port-forward.
+- HTTP `Host`/unsafe-request `Origin` checks and WebSocket `Host`/`Origin` checks enforce the intended browser boundary. They are not authentication against another native process running as the same Windows user.
+- GhostWatch captures metadata, not packet payloads. It does not scan remote systems, block traffic, or terminate processes.
+- File-integrity monitoring is opt-in. File contents are hashed but not stored.
+- Default dashboard/export paths redact usernames, SIDs, home directories, and sensitive paths. Raw Windows event data remains local.
+- Runtime databases, sidecars, logs, environments, test artifacts, real telemetry screenshots, and excluded concept images are ignored or rejected by the release packager.
+- Optional AI sends redacted context only to a user-configured loopback Ollama endpoint. There is no cloud fallback or tool access.
+
+Report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Do not attach real host telemetry, credentials, databases, or diagnostic archives to public issues.
+
+## Limitations
+
+- This local beta supports one Windows user on one computer and has no multi-user authentication or remote deployment model.
+- Windows permissions can make process details, socket ownership, or Event Log data partial or unavailable; GhostWatch reports gaps instead of inferring values.
+- Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
+- Python 3.11 is verified locally. Python 3.13 dependency wheels were checked, but that CI leg remains unverified until the first hosted workflow run.
+- The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification.
+- Historical RC2-RC5 and V2 documents are retained for engineering traceability and do not describe the current beta state.
+
+## Project documentation
 
 - [Documentation index](docs/README.md)
 - [Current beta validation](docs/CURRENT_BETA_VALIDATION.md)
 - [GitHub publication checklist](docs/GITHUB_PUBLICATION_CHECKLIST.md)
-- [MIT license decision record](docs/LICENSE_OPTIONS.md)
-- [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
 - [Public asset provenance](docs/ASSET_PROVENANCE.md)
+- [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
+- [Contributing guidelines](CONTRIBUTING.md)
 
-Historical RC2–RC5 documents describe the state and evidence of those candidates; they are not the current beta status. Older design images are explicitly catalogued as concepts/mockups in the documentation index.
+## License
 
-## License status
-
-GhostWatch-authored source and documentation are available under the [MIT License](LICENSE):
-
-`Copyright (c) 2026 Rafi Dahoui`
-
-Third-party dependencies, optional tools, browser binaries, models, system fonts, and other third-party components remain under their own applicable terms. See [Third-Party Notices](docs/THIRD_PARTY_NOTICES.md). The two historical concept images in the private working directory are not licensed for public redistribution and are excluded from release archives.
-
+GhostWatch-authored source and documentation are available under the [MIT License](LICENSE), copyright 2026 Rafi Dahoui. Third-party packages, optional tools, browser binaries, models, fonts, and other components remain under their own terms; see [Third-Party Notices](docs/THIRD_PARTY_NOTICES.md).
