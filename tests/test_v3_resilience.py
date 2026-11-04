@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import nullcontext
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import psutil
 import pytest
 
 from app.main import create_app
@@ -13,6 +16,8 @@ from app.models import (
     FileScanResult,
     MonitoredFolder,
 )
+from app.monitoring.network import NetworkCollector
+from app.monitoring.processes import ProcessCollector
 from app.service import TelemetryService
 from app.storage.database import Database
 
@@ -103,6 +108,138 @@ async def test_exceptional_lifespan_stops_service(tmp_path, monkeypatch, cancel)
         async with app.router.lifespan_context(app):
             raise asyncio.CancelledError() if cancel else RuntimeError("synthetic lifespan")
     stop.assert_awaited_once()
+
+
+@pytest.mark.parametrize("operation", ["load_file_baseline", "save_file_scan"])
+async def test_file_scan_storage_failure_stays_degraded(tmp_path, monkeypatch, operation):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    assert await service.initialize_storage()
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    await service.add_monitored_folder(str(watched))
+    last_success = service.storage.last_success
+
+    def fail(*args):
+        raise sqlite3.OperationalError("synthetic private path must not be exposed")
+
+    monkeypatch.setattr(service.database, operation, fail)
+    assert await service.scan_file_integrity_once() == []
+    assert service.storage.status == "degraded"
+    assert not service.storage.persistence_available
+    assert service.storage.last_success == last_success
+    assert service.storage.last_error_type == "OperationalError"
+    assert "private path" not in service.storage.model_dump_json()
+
+
+async def test_collector_failure_is_isolated_from_storage_and_other_folders(
+    tmp_path, monkeypatch
+):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    assert await service.initialize_storage()
+    for name in ("first", "second"):
+        watched = tmp_path / name
+        watched.mkdir()
+        await service.add_monitored_folder(str(watched))
+    real_scan = service.file_integrity_collector.scan
+    scanned = []
+
+    def scan(folder, *args, **kwargs):
+        scanned.append(folder.id)
+        if len(scanned) == 1:
+            raise RuntimeError("synthetic collector")
+        return real_scan(folder, *args, **kwargs)
+
+    monkeypatch.setattr(service.file_integrity_collector, "scan", scan)
+    assert await service.scan_file_integrity_once() == []
+    assert len(scanned) == 2
+    assert service.storage.status == "healthy"
+    assert service.storage.persistence_available
+    folders = {
+        folder.id: folder for folder in await asyncio.to_thread(
+            service.database.list_monitored_folders
+        )
+    }
+    assert folders[scanned[0]].status == "unavailable"
+    assert folders[scanned[0]].status_detail == "Folder scan failed (RuntimeError)"
+    assert folders[scanned[1]].status == "healthy"
+
+
+async def test_surrogate_file_name_stays_monitored_without_degrading_storage(tmp_path):
+    service = TelemetryService(Database(tmp_path / "db" / "synthetic.db"))
+    assert await service.initialize_storage()
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    await service.add_monitored_folder(str(watched))
+    target = watched / "evasive\ud800.txt"
+    try:
+        target.write_text("one")
+    except (OSError, UnicodeError):
+        pytest.skip("Filesystem does not accept lone surrogates")
+
+    events = await service.scan_file_integrity_once()
+    assert [(item.change_type, item.relative_path) for item in events] == [
+        ("created", "evasive\\ud800.txt")
+    ]
+    target.write_text("changed")
+    events = await service.scan_file_integrity_once()
+    assert [item.change_type for item in events] == ["modified"]
+    target.unlink()
+    events = await service.scan_file_integrity_once()
+    assert [item.change_type for item in events] == ["deleted"]
+    assert service.storage.status == "healthy"
+
+
+async def test_surrogate_file_present_when_folder_is_added(tmp_path):
+    service = TelemetryService(Database(tmp_path / "db" / "synthetic.db"))
+    assert await service.initialize_storage()
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    try:
+        (watched / "evasive\ud800.txt").write_text("one")
+    except (OSError, UnicodeError):
+        pytest.skip("Filesystem does not accept lone surrogates")
+
+    folder = await service.add_monitored_folder(str(watched))
+
+    assert list(service.database.load_file_baseline(folder.id)) == ["evasive\\ud800.txt"]
+    assert service.storage.status == "healthy"
+
+
+def surrogate_process():
+    return SimpleNamespace(
+        pid=7,
+        info={"pid": 7, "name": "evasive\ud800.exe"},
+        name=lambda: "evasive\ud800.exe",
+        oneshot=lambda: nullcontext(),
+        cpu_percent=lambda interval=None: 1.0,
+        memory_percent=lambda: 1.0,
+        memory_info=lambda: SimpleNamespace(rss=1),
+        status=lambda: "running",
+        ppid=lambda: 1,
+        exe=lambda: "C:\\synthetic\\evasive\ud800.exe",
+        username=lambda: "synthetic\ud800",
+        create_time=lambda: 1.0,
+    )
+
+
+def test_surrogate_process_identity_stays_serializable():
+    module = SimpleNamespace(
+        process_iter=lambda *args, **kwargs: [surrogate_process()],
+        cpu_count=lambda: 1,
+        NoSuchProcess=psutil.NoSuchProcess,
+        AccessDenied=psutil.AccessDenied,
+    )
+    processes = ProcessCollector(module, identity_budget=1).collect([])
+    assert [item.name for item in processes] == ["evasive\\ud800.exe"]
+    assert processes[0].executable == "C:\\synthetic\\evasive\\ud800.exe"
+    assert processes[0].username == "synthetic\\ud800"
+    assert "evasive" in processes[0].model_dump_json()
+
+
+def test_surrogate_connection_process_name_stays_serializable():
+    module = SimpleNamespace(Process=lambda pid: surrogate_process())
+    collector = NetworkCollector(module)
+    assert collector._process_name(7, 0.0) == "evasive\\ud800.exe"
 
 
 def test_database_calls_close_their_connections(tmp_path, monkeypatch):

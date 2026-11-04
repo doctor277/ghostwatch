@@ -26,8 +26,10 @@ from app.models import (
     AlertUpdate,
     DetectionSettings,
     EventRecord,
+    FileBaselineEntry,
     FileIntegrityEvent,
     FileIntegritySettings,
+    FileScanResult,
     HistoricalConnectionSummary,
     HistoricalIntelligence,
     HistoricalProcessObservation,
@@ -406,12 +408,7 @@ class TelemetryService:
                 baseline = await asyncio.to_thread(
                     self.database.load_file_baseline, folder.id
                 )
-                result = await asyncio.to_thread(
-                    self.file_integrity_collector.scan,
-                    folder,
-                    baseline,
-                    self.file_integrity_settings,
-                )
+                result = await self._scan_folder(folder, baseline)
                 inserted = set(
                     await asyncio.to_thread(
                         self.database.save_file_scan,
@@ -422,7 +419,7 @@ class TelemetryService:
                 )
             except Exception as exc:
                 self._mark_storage_failure(exc)
-                continue
+                return accepted
             for event in result.events:
                 if event.id not in inserted or event.id in self._file_integrity_seen:
                     continue
@@ -432,8 +429,28 @@ class TelemetryService:
                 self.live_file_integrity_events.appendleft(event)
                 accepted.append(event)
                 await self._correlate_file_integrity_event(event)
-        self._mark_storage_success()
+        if self.storage.persistence_available:
+            self._mark_storage_success()
         return accepted
+
+    async def _scan_folder(
+        self, folder: MonitoredFolder, baseline: dict[str, FileBaselineEntry]
+    ) -> FileScanResult:
+        try:
+            return await asyncio.to_thread(
+                self.file_integrity_collector.scan,
+                folder,
+                baseline,
+                self.file_integrity_settings,
+            )
+        except Exception as exc:
+            # A collector defect is not a storage outage and must not blind other folders.
+            LOGGER.warning("File integrity scan failed (%s)", type(exc).__name__)
+            return FileScanResult(
+                entries=list(baseline.values()),
+                status="unavailable",
+                status_detail=f"Folder scan failed ({type(exc).__name__})",
+            )
 
     async def _correlate_file_integrity_event(
         self, event: FileIntegrityEvent

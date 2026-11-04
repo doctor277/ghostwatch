@@ -13,6 +13,7 @@ import psutil
 
 from app.config import MAX_CONNECTIONS
 from app.models import ConnectionAggregate, ConnectionInfo, NetworkSample
+from app.text_utils import safe_text
 
 
 @dataclass(slots=True)
@@ -117,7 +118,7 @@ class NetworkCollector:
         if cached and cached[1] >= now:
             return cached[0]
         try:
-            name = str(self.psutil.Process(pid).name() or "Unknown")
+            name = safe_text(self.psutil.Process(pid).name() or "Unknown")
         except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError, OSError):
             name = "Unavailable"
         self._name_cache[pid] = (name, now + 60.0)
