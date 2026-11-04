@@ -19,7 +19,8 @@ No publication action is automated by this checklist. Checked items record facts
 - [x] Select MIT and add the exact approved `LICENSE` text - confirmed by Rafi Dahoui.
 - [x] Retain historical RC and V2 documents on the default branch, clearly labeled as historical engineering evidence.
 - [x] Review the project name, synthetic screenshot, local-beta wording, and portfolio claims.
-- [ ] Review and approve the `chore/portfolio-polish` diff before any push or merge.
+- [x] Review and approve the initial `chore/portfolio-polish` diff before its first push.
+- [ ] Review and approve the final pull-request diff before merge.
 
 ## Source and documentation
 
@@ -49,7 +50,7 @@ No publication action is automated by this checklist. Checked items record facts
 - [x] Ruff, Python compilation, JavaScript syntax, and PowerShell parsing passed.
 - [x] Synthetic Playwright suite passed on November 1, 2026: 15 passed with no unexpected page-console errors.
 - [x] Screenshot contains synthetic data only.
-- [ ] Verify the new GitHub Actions workflow on GitHub after publication; local review is not a hosted CI run.
+- [x] Verify the new GitHub Actions workflow in the first hosted pull-request run: [successful run](https://github.com/doctor277/ghostwatch/actions/runs/41774858301), with Python 3.11 and 3.13 each reporting 222 passed and 1 warning, Playwright Chromium reporting 15 passed, and Ruff, Python compilation, and JavaScript syntax passing.
 - [ ] Record a final sanitized archive SHA-256 if a separate release archive is published.
 
 ## Publication wording

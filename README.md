@@ -114,7 +114,7 @@ The accepted Windows closeout on **October 27, 2026** reported 222 Python tests 
 
 The portfolio-preparation rerun on **November 1, 2026** reproduced 222 Python passes, 15 Playwright passes, and 77 focused release-security passes. These are dated Windows results, not a claim that every future commit or platform has passed. See [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md) for exact commands, timings, warnings, and scope.
 
-The local portfolio-upgrade branch was revalidated on **November 3, 2026**: 222 Python tests, 77 focused release-security tests, and 15 synthetic Playwright tests passed with no failures or skips. The hosted GitHub Actions workflow has not run yet.
+The local portfolio-upgrade branch was revalidated on **November 3, 2026**: 222 Python tests, 77 focused release-security tests, and 15 synthetic Playwright tests passed with no failures or skips. The first hosted [GitHub Actions run](https://github.com/doctor277/ghostwatch/actions/runs/41774858301) also completed successfully: the Python 3.11 and 3.13 jobs each reported 222 passed with one warning, the synthetic Playwright Chromium job reported 15 passed, and Ruff, Python compilation, and JavaScript syntax passed.
 
 ## Security and privacy boundaries
 
@@ -133,7 +133,7 @@ Report suspected vulnerabilities privately as described in [SECURITY.md](SECURIT
 - This local beta supports one Windows user on one computer and has no multi-user authentication or remote deployment model.
 - Windows permissions can make process details, socket ownership, or Event Log data partial or unavailable; GhostWatch reports gaps instead of inferring values.
 - Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
-- Python 3.11 is verified locally. Python 3.13 dependency wheels were checked, but that CI leg remains unverified until the first hosted workflow run.
+- Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI but was not executed locally for this portfolio upgrade.
 - The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification.
 - Historical RC2-RC5 and V2 documents are retained for engineering traceability and do not describe the current beta state.
 

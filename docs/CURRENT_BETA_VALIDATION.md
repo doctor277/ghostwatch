@@ -94,9 +94,20 @@ Executed on Windows from the local `chore/portfolio-polish` branch after adding 
 
 The first full pytest attempt in the managed execution environment reported `97 passed, 125 setup errors` because its default user temp directory was not writable. No test assertion failed. The unchanged suite was rerun with `TEMP` and `TMP` pointed to the repository's ignored `.tmp` directory; the authoritative JUnit result records all 222 tests passing.
 
-Python 3.13 Windows wheels were available for all resolved pinned requirements, but the Python 3.13 test matrix was not executed locally. It remains a hosted-CI verification item. A Python 3.14 dependency-install experiment did not complete and was removed from the proposed CI matrix rather than publishing an unreliable job.
+Python 3.13 Windows wheels were available for all resolved pinned requirements, but the Python 3.13 test matrix was not executed locally. At that point, it remained a hosted-CI verification item. A Python 3.14 dependency-install experiment did not complete and was removed from the proposed CI matrix rather than publishing an unreliable job.
 
-The GitHub Actions workflow has been validated locally but has not run on GitHub. No CI badge is shown until a hosted run exists.
+### First hosted GitHub Actions run
+
+The first hosted [GitHub Actions run](https://github.com/doctor277/ghostwatch/actions/runs/41774858301) for pull request #1 completed successfully:
+
+- Python 3.11: `222 passed, 0 failed, 0 skipped, 1 warning`
+- Python 3.13: `222 passed, 0 failed, 0 skipped, 1 warning`
+- Synthetic Playwright Chromium: `15 passed, 0 failed, 0 skipped`
+- Ruff: passed in both Python matrix jobs
+- Python compilation: passed in both Python matrix jobs
+- JavaScript syntax: passed in the browser job
+
+These hosted results close the previously open workflow-execution and Python 3.13 verification items. Python 3.13 was not executed locally for the portfolio upgrade; its test evidence is from the hosted Windows runner. The dated local results above remain separate and unchanged.
 
 ## MIT license finalization — November 2, 2026
 
