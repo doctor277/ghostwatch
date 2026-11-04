@@ -5,7 +5,8 @@ import logging
 import shutil
 import sqlite3
 import tempfile
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -557,11 +558,17 @@ class Database:
                 [(int(row["source_rowid"]),) for row in members],
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=2.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            # sqlite3's own context manager ends the transaction but stays open.
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _decode_json_list(value: object, fallback: list | None = None) -> list:
@@ -1098,7 +1105,7 @@ class Database:
             result = connection.execute(
                 "DELETE FROM monitored_folders WHERE id = ?", (folder_id,)
             )
-        return bool(result.rowcount)
+            return bool(result.rowcount)
 
     def load_file_baseline(self, folder_id: str) -> dict[str, FileBaselineEntry]:
         with self._lock, self._connect() as connection:
@@ -1938,6 +1945,9 @@ class Database:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            with sqlite3.connect(self.path) as source, sqlite3.connect(destination) as target:
+            with (
+                closing(sqlite3.connect(self.path)) as source,
+                closing(sqlite3.connect(destination)) as target,
+            ):
                 source.backup(target)
         return destination
