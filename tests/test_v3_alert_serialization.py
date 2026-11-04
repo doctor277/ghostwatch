@@ -154,8 +154,7 @@ def test_excessively_nested_evidence_is_bounded():
     for _ in range(5000):
         value["next"] = {}
         value = value["next"]
-    assert MARKER in json.dumps(alert(evidence=evidence).evidence)
-
+    assert "[TRUNCATED]" in json.dumps(alert(evidence=evidence).evidence)
 
 def test_valid_alert_contract_is_unchanged(application):
     app, client = application

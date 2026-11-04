@@ -27,6 +27,9 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: alert serialization hardening below, Python 3.11.9 on Windows:
   295 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff and
   compilation passed. Hosted CI has not run on this change.
+- VERIFIED LOCALLY: alert bounds and write rejection below, Python 3.11.9 on Windows:
+  339 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff and
+  compilation passed. Hosted CI has not run on this change.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -132,18 +135,68 @@ Removing cycle detection made the branching-cycle test run until the 110 second 
 `tests/test_v3_snapshot_serialization.py` now assigns malformed text after construction,
 because the constructor would otherwise repair it before reaching that boundary.
 
+## Alert bounds
+
+Originally an open finding: an explanation over 2,000 characters failed `EventRecord`
+validation in `_alert_event` and aborted the collection cycle. Reproducing it at
+`98a7de6` showed `Alert` had no limits at all, while `EventRecord` did. Reviewing the
+sanitizer added in that commit found further defects. All were reproduced with synthetic
+data, and no current source is known to produce these values.
+
+| Input at `98a7de6` | Effect |
+| --- | --- |
+| Explanation of 2,001 or 1,000,000 characters | Every collection cycle aborted |
+| 1,999 characters plus one lone surrogate | Aborted: escaping grew the text past the limit |
+| Metric or identifier of 201 characters | Aborted through `title` or `related_id` |
+| 8 MB of evidence | Collection continued, but the snapshot was unavailable |
+| Integer of 5,001 digits, or a count of `2**70` | Storage degraded and the write was queued for good |
+| Unwritable record queued ahead of a valid one | Storage stayed degraded and the valid record was never stored |
+| Shared references, not cycles | Work doubled per level, about 1.3 s at depth 18, on the event loop |
+| Generator | Fully consumed, so an endless one would never finish |
+| `str` enum | Stored as `E.RED` instead of `red` |
+| 33 levels of nesting | Valid JSON labeled `[UNSERIALIZABLE]` |
+
+The fix keeps `EventRecord` validation unchanged and normalizes at the earliest boundary:
+
+- `Alert` bounds the explanation to 2,000 characters and `source`, `metric` and `rule_id`
+  to 200, after escaping. Any cut ends in `[TRUNCATED]`. Text within the limits is
+  unchanged.
+- An `id` or `incident_id` over 200 characters becomes `truncated-sha256-<hex>`. Cutting
+  would break relationships, and the digest is stable for the same input.
+- `safe_structure` has a budget of 10,000 nodes, refuses iterators without consuming
+  them, marks integers over 1,024 bits, and keeps the value of `str` subclasses. Depth
+  and budget limits report `[TRUNCATED]`. Cycles stay `[UNSERIALIZABLE]`.
+- Evidence over 16 KiB is replaced whole by a `[TRUNCATED]` entry, not cut partway.
+- `collect_once` catches `ValidationError` per alert, for alerts that bypass the model.
+  The alert stays live and is persisted without an event.
+- `TypeError`, `ValueError` and `OverflowError` from a write reject that one record. It
+  is not queued, the queue continues, storage stays healthy and `/api/health` reports
+  `rejected_writes`. Storage outages still queue and retry as before.
+
+Severity, source, timestamps, rule and incident relationships are preserved. After the
+fix, every case above completes with storage healthy, and the shared-reference case took
+0.35 s at depth 22 with a 1 MB peak.
+
+Regression tests are in `tests/test_v3_alert_bounds.py`. 34 of the 42 run before the fix
+failed, and the other 8 are guards for behavior that must not change. The remaining 2
+were excluded because they hang on the old code. Mutation checks: removing the
+explanation limit failed 13 tests, the label limit 3, the identifier digest 1, the
+evidence limit 3, the integer limit 2, the collection guard 1 and record rejection 6.
+Refusing no generators and removing the node budget each ran until the timeout, while
+the unmodified code passed both tests in 1.2 s.
+
+`test_excessively_nested_evidence_is_bounded` in `tests/test_v3_alert_serialization.py`
+now expects `[TRUNCATED]`, because over-deep JSON is not unserializable.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
 
-- Reproduced with synthetic data: an alert explanation over 2,000 characters fails
-  `EventRecord` validation in `_alert_event` and aborts the collection cycle. No current
-  source is known to produce text that long.
 - Reproduced: unencodable input to `POST /api/incidents` and
   `POST /api/file-integrity/folders` returns 503. A 422 would describe it better.
-- A permanently failing queued write can keep storage degraded, because
-  `_flush_pending` stops at the first failure. The reproduced causes are fixed, but no
-  general limit on retries exists.
+- A write failing with a `sqlite3.Error` that is really about the record, not the
+  database, is still treated as an outage and retried. Other than `Alert` and
+  `EventRecord`, models such as `WindowsEventRecord` have no equivalent normalization.
 - `broadcast` can send directly to a client that is registered but not yet accepted,
   then close it. The window is narrow.
 - `unregister_client` suppresses `CancelledError`, including the caller's own.
@@ -161,6 +214,10 @@ These come from code review and have not been reproduced, unless noted.
   History is dropped while degraded, but Windows events are still collected into
   bounded memory even if saved settings disable them.
 - An escaped name is a display form. Only the on-disk path is authoritative.
+- A rejected record stays in the live view but is not stored. `rejected_writes` counts
+  rejections since the last start and does not identify them.
+- Text cut at a limit is not recoverable, and truncated evidence is dropped whole.
+- Rows stored with longer text are bounded when read. The stored row is not rewritten.
 - Evidence mutated after construction bypasses the model boundary, and one such alert
   makes the whole `/api/alerts` response a 503. No application code does this.
 - `telemetry_degraded` covers snapshots that exist but cannot be served. The dashboard

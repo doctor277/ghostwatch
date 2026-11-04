@@ -73,6 +73,7 @@ async def health(request: Request) -> dict[str, object]:
         "monitoring": "active" if service.latest is not None else "warming-up",
         "snapshot": snapshot,
         "storage": service.storage.model_dump(mode="json"),
+        "rejected_writes": service.rejected_writes,
         "websocket_clients": len(service.clients),
     }
 

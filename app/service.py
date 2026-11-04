@@ -11,6 +11,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi import WebSocket
+from pydantic import ValidationError
 
 from app.analytics.baseline import BaselineEngine
 from app.config import (
@@ -62,6 +63,8 @@ LOGGER = logging.getLogger(__name__)
 MAX_PENDING_WRITES = 500
 MAX_LIVE_EVENTS = 1000
 SNAPSHOT_DEGRADED_FRAME = '{"type":"telemetry_degraded","reason":"snapshot_unavailable"}'
+# These describe one record that can never be written, not a storage outage.
+RECORD_WRITE_ERRORS = (TypeError, ValueError, OverflowError)
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,7 @@ class TelemetryService:
             maxsize=1000
         )
         self.history_dropped_samples = 0
+        self.rejected_writes = 0
         self._history_writes = 0
         self._windows_cursors: dict[str, int] = {}
         self._windows_seen: OrderedDict[str, None] = OrderedDict()
@@ -778,10 +782,18 @@ class TelemetryService:
             )
             for alert in new_alerts:
                 self._remember_live_alert(alert)
-                self._remember_event(self._alert_event(alert))
+                try:
+                    event = self._alert_event(alert)
+                except ValidationError as exc:
+                    # One alert must not cost the rest of this telemetry cycle.
+                    LOGGER.warning("Alert event could not be created (%s)", type(exc).__name__)
+                    event = None
+                if event is not None:
+                    self._remember_event(event)
                 if self.settings.event_logging_enabled:
                     await self._persist_alert(alert)
-                    await self._persist_event(self._alert_event(alert))
+                    if event is not None:
+                        await self._persist_event(event)
 
             alerts = await self.list_alerts(50)
             self._sequence += 1
@@ -972,6 +984,9 @@ class TelemetryService:
             stored = await asyncio.to_thread(
                 self.database.add_alert, alert, self.settings.alert_retention
             )
+        except RECORD_WRITE_ERRORS as exc:
+            self._reject_write(exc)
+            return False
         except Exception as exc:
             pending = alert.model_copy(update={"persistence_pending": True})
             current = next(
@@ -994,12 +1009,26 @@ class TelemetryService:
             return False
         try:
             await asyncio.to_thread(self.database.add_event, event)
+        except RECORD_WRITE_ERRORS as exc:
+            self._reject_write(exc)
+            return False
         except Exception as exc:
             self._queue_pending(self._pending_events, event.id, event)
             self._mark_storage_failure(exc)
             return False
         self._mark_storage_success()
         return True
+
+    def _reject_write(self, exc: Exception) -> None:
+        self.rejected_writes += 1
+        LOGGER.warning("A record could not be persisted (%s)", type(exc).__name__)
+
+    def _reject_queued_alert(self, alert_id: str, exc: Exception) -> None:
+        self._pending_alerts.pop(alert_id, None)
+        self._reject_write(exc)
+        for index, alert in enumerate(self.live_alerts):
+            if alert.id == alert_id:
+                self.live_alerts[index] = alert.model_copy(update={"persistence_pending": False})
 
     async def _maybe_recover_storage(self) -> None:
         # A direct write can restore health without passing through recovery.
@@ -1049,6 +1078,9 @@ class TelemetryService:
                 stored = await asyncio.to_thread(
                     self.database.add_alert, clean, self.settings.alert_retention
                 )
+            except RECORD_WRITE_ERRORS as exc:
+                self._reject_queued_alert(alert_id, exc)
+                continue
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 return
@@ -1060,6 +1092,10 @@ class TelemetryService:
         for event_id, event in list(self._pending_events.items()):
             try:
                 await asyncio.to_thread(self.database.add_event, event)
+            except RECORD_WRITE_ERRORS as exc:
+                self._pending_events.pop(event_id, None)
+                self._reject_write(exc)
+                continue
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 return
