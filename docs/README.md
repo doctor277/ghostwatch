@@ -14,6 +14,9 @@ This index separates current V3 beta documentation from historical release-candi
 - [`browser-demo-network-graph.png`](browser-demo-network-graph.png) — current V3 interface screenshot captured from Demo Mode with synthetic data only.
 - [`V3_FINAL_BINARY_ALLOWLIST_HARDENING.md`](V3_FINAL_BINARY_ALLOWLIST_HARDENING.md) and [`V3_FINAL_BINARY_ALLOWLIST_TEST_RESULTS.md`](V3_FINAL_BINARY_ALLOWLIST_TEST_RESULTS.md) — final default-deny release-packaging boundary and its focused evidence.
 
+- [`../SECURITY.md`](../SECURITY.md) - supported security scope and private vulnerability-reporting guidance.
+- [`../CONTRIBUTING.md`](../CONTRIBUTING.md) - focused contribution, testing, and privacy expectations.
+
 ## Historical V3 release-candidate records
 
 These files are preserved for traceability. Their version labels, test counts, risks, and release decisions apply only to the named historical candidate.

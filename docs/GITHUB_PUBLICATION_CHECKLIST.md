@@ -1,48 +1,62 @@
 # GitHub Publication Checklist
 
-No publication action is automated by this checklist.
+No publication action is automated by this checklist. Checked items record facts that were directly verified; open items still require owner action or evidence.
 
-## Owner decisions
+## Confirmed public repository state - November 2, 2026
 
-- [x] Select a license from [`LICENSE_OPTIONS.md`](LICENSE_OPTIONS.md) and add the exact approved `LICENSE` text — MIT, confirmed by Rafi Dahoui.
-- [ ] Choose the public repository name and description.
-- [ ] Decide whether historical RC and V2 documents should remain on the default branch or move to a clearly labeled archive branch/directory in a future, reviewed change.
-- [ ] Review the project name, screenshots, and descriptive claims for portfolio use.
+- [x] Public repository created at `doctor277/ghostwatch` with `main` as the default branch.
+- [x] The two original commits were verified unchanged: `fda9810c91d2fdefe0cb5d6dcdfbeabb3651d4ee` and `6499c012d21763b8407d7520967f171d22b54294`.
+- [x] Both original commits use a GitHub `noreply` author email; no personal author email is exposed in the published history.
+- [x] The baseline public tree at `6499c012d21763b8407d7520967f171d22b54294` contains exactly 99 approved tracked files.
+- [x] GitHub recognizes the root `LICENSE` as MIT.
+- [x] The synthetic V3 Demo Mode screenshot is published at `docs/browser-demo-network-graph.png`.
+- [x] `docs/design-concept.png` and `docs/ghostwatch-v2-concept.png` are absent from the public tree.
+- [x] The repository description identifies the local-first Windows monitoring dashboard and its Python, FastAPI, SQLite, and JavaScript stack.
+- [x] The eight requested repository topics were applied and read back on November 3, 2026.
+
+## Owner and portfolio decisions
+
+- [x] Select MIT and add the exact approved `LICENSE` text - confirmed by Rafi Dahoui.
+- [x] Retain historical RC and V2 documents on the default branch, clearly labeled as historical engineering evidence.
+- [x] Review the project name, synthetic screenshot, local-beta wording, and portfolio claims.
+- [x] Review and approve the initial `chore/portfolio-polish` diff before its first push.
+- [ ] Review and approve the final pull-request diff before merge.
 
 ## Source and documentation
 
-- [x] Confirm `README.md` identifies the build as a local beta with limitations.
-- [x] Confirm current beta evidence is separate from historical RC2–RC5 records.
-- [x] Confirm the two private concept images are documented and excluded from public archives.
-- [x] Confirm the current screenshot visibly says V3 and Demo Mode, Synthetic Data, Not Saved.
-- [ ] Confirm installation and test commands work from a clean extraction.
-- [ ] Confirm no generated cache, environment, runtime database, or Playwright report is committed.
+- [x] `README.md` identifies V3 as a local beta with explicit limitations.
+- [x] Current beta evidence is separated from historical RC2-RC5 and V2 records.
+- [x] The two private concept images are documented and excluded from public archives.
+- [x] The published screenshot visibly identifies V3, Demo Mode, synthetic data, and the not-saved boundary.
+- [x] No generated cache, environment, runtime database, Playwright report, or test result is committed in the 99-file baseline.
+- [ ] Confirm the revised installation and test commands from a clean clone after the portfolio branch is published.
 
-## Privacy and security
+## Privacy and release security
 
-- [x] Run the default-deny release packager against the exact source intended for upload.
+- [x] Run the default-deny release packager against the exact 99-file baseline source.
 - [x] Verify ZIP integrity and exact payload inventory.
 - [x] Confirm the archive contains no `data/`, `.venv/`, `node_modules/`, cache, log, database, WAL/SHM, test-result, or live-telemetry files.
-- [x] Confirm the privacy scan finds no usernames, profile paths, SIDs, credentials, API keys, bearer tokens, or private keys.
+- [x] Confirm the baseline privacy scan finds no usernames, profile paths, SIDs, credentials, API keys, bearer tokens, or private keys.
 - [x] Confirm the only public binary asset is explicitly allowlisted by its complete archive path.
-- [ ] Review Git history before publication; deleting a secret only from the latest tree does not remove it from history.
-- [ ] Enable GitHub secret scanning and dependency alerts if available for the repository.
+- [x] Review both original commits for author privacy and sensitive-content exposure before portfolio changes.
+- [x] Verify GitHub secret scanning, push protection, and private vulnerability reporting are enabled.
+- [ ] Enable GitHub Dependabot alerts and Dependabot security updates in repository settings.
+- [ ] Decide whether to add CodeQL after CI is stable; no code-scanning analysis is currently configured.
 
-## Validation
+## Validation evidence
 
-- [x] Full Python suite passes: 222 passed, 1 warning.
-- [x] Focused release-security suite passes: 77 passed.
-- [x] Ruff and Python compilation pass.
-- [x] JavaScript syntax and PowerShell parsing pass.
-- [ ] Synthetic Playwright suite passes with no unexpected console errors.
+- [x] Full Python suite passed on the accepted Windows closeout: 222 passed, 1 warning.
+- [x] Focused release-security suite passed: 77 passed.
+- [x] Ruff, Python compilation, JavaScript syntax, and PowerShell parsing passed.
+- [x] Synthetic Playwright suite passed on November 1, 2026: 15 passed with no unexpected page-console errors.
 - [x] Screenshot contains synthetic data only.
-- [ ] Final sanitized archive SHA-256 is recorded in the release notes or publication description.
+- [x] Verify the new GitHub Actions workflow in the first hosted pull-request run: [successful run](https://github.com/doctor277/ghostwatch/actions/runs/41774858301), with Python 3.11 and 3.13 each reporting 222 passed and 1 warning, Playwright Chromium reporting 15 passed, and Ruff, Python compilation, and JavaScript syntax passing.
+- [ ] Record a final sanitized archive SHA-256 if a separate release archive is published.
 
 ## Publication wording
 
-- [x] Do not claim penetration-testing certification, malware-free status, public-release readiness, or protection equivalent to an EDR/antivirus product.
-- [x] Attribute Windows test figures to the Windows closeout run.
-- [x] Describe Linux review conclusions separately and do not merge its counts with Windows execution results.
-- [x] State that Windows permissions can limit visibility and that unavailable values are not inferred.
+- [x] Do not claim penetration-testing certification, malware-free status, production readiness, or protection equivalent to an EDR/antivirus product.
+- [x] Attribute Windows test figures to dated Windows runs.
+- [x] Keep independent Linux review conclusions separate from Windows execution counts.
+- [x] State that Windows permissions can limit visibility and unavailable values are not inferred.
 - [x] State the local-user trust boundary and loopback-only deployment model.
-

@@ -72,6 +72,43 @@ Current-source packaging is intentionally executed after this document is finali
 - Optional local AI output is not a security verdict.
 - No Git metadata is present in this source snapshot, so an archive SHA-256 is the publication snapshot identity.
 
+## GitHub portfolio upgrade verification - November 3, 2026
+
+Executed on Windows from the local `chore/portfolio-polish` branch after adding repository documentation, CI, and dependency automation. No application, frontend, database, V2, or historical RC implementation file changed.
+
+- Full Python suite on Python 3.11.9: `222 passed, 0 failed, 0 skipped`
+- Focused release-security suite: `77 passed, 0 failed, 0 skipped in 13.81s`
+- Synthetic Playwright Chromium suite: `15 passed, 0 failed, 0 skipped` in approximately 94 seconds
+- Ruff: `All checks passed!`
+- Python compilation: passed for `app`, `scripts`, and `tests`
+- JavaScript syntax: `8 passed, 0 failed`
+- PowerShell parser: `0 errors`
+- npm lockfile audit: `0 vulnerabilities`
+- Python advisory audit: 30 resolved dependencies checked, `0 vulnerabilities`
+- GitHub Actions workflow: actionlint passed using `rhysd/actionlint:1.7.12`
+- Dependabot YAML: parsed and validated for pip, npm, and GitHub Actions
+- Local Markdown links: `53 checked, 0 broken`
+- Default-deny release scan: 99 selected files, `0 sensitive findings`
+- Approved screenshot SHA-256 and visual synthetic-data markers: verified
+- Excluded concept-image paths: absent from the public source tree
+
+The first full pytest attempt in the managed execution environment reported `97 passed, 125 setup errors` because its default user temp directory was not writable. No test assertion failed. The unchanged suite was rerun with `TEMP` and `TMP` pointed to the repository's ignored `.tmp` directory; the authoritative JUnit result records all 222 tests passing.
+
+Python 3.13 Windows wheels were available for all resolved pinned requirements, but the Python 3.13 test matrix was not executed locally. At that point, it remained a hosted-CI verification item. A Python 3.14 dependency-install experiment did not complete and was removed from the proposed CI matrix rather than publishing an unreliable job.
+
+### First hosted GitHub Actions run
+
+The first hosted [GitHub Actions run](https://github.com/doctor277/ghostwatch/actions/runs/41774858301) for pull request #1 completed successfully:
+
+- Python 3.11: `222 passed, 0 failed, 0 skipped, 1 warning`
+- Python 3.13: `222 passed, 0 failed, 0 skipped, 1 warning`
+- Synthetic Playwright Chromium: `15 passed, 0 failed, 0 skipped`
+- Ruff: passed in both Python matrix jobs
+- Python compilation: passed in both Python matrix jobs
+- JavaScript syntax: passed in the browser job
+
+These hosted results close the previously open workflow-execution and Python 3.13 verification items. Python 3.13 was not executed locally for the portfolio upgrade; its test evidence is from the hosted Windows runner. The dated local results above remain separate and unchanged.
+
 ## MIT license finalization — November 2, 2026
 
 The owner confirmed the legal name `Rafi Dahoui` and confirmed ownership or permission to release the GhostWatch-authored source, current V3 interface, and synthetic Demo Mode screenshot under MIT.
