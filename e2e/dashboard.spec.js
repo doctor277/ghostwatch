@@ -172,6 +172,15 @@ test("WebSocket recovers from a repeated synthetic restart storm", async ({ page
   }
 });
 
+test("degraded telemetry replaces CONNECTED and clears on a valid snapshot", async ({ page }) => {
+  const socketCount = backend.state.sockets.length;
+  backend.sendDegraded();
+  await expect(page.locator("#socket-status")).toHaveText("TELEMETRY DEGRADED");
+  backend.sendSnapshot();
+  await expect(page.locator("#socket-status")).toHaveText("CONNECTED");
+  expect(backend.state.sockets.length).toBe(socketCount);
+});
+
 test("frontend presents a safe settings persistence failure", async ({ page }) => {
   await page.locator('[data-view="settings"]').click();
   backend.failNext("PUT", "/api/settings");

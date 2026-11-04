@@ -16,6 +16,7 @@ from app.analytics.baseline import BaselineEngine
 from app.config import (
     MAX_HISTORY_SAMPLES,
     MAX_LIVE_ALERTS,
+    MAX_SNAPSHOT_BYTES,
     MAX_WEBSOCKET_CLIENTS,
     WEBSOCKET_SEND_TIMEOUT_SECONDS,
 )
@@ -60,6 +61,7 @@ from app.time_utils import as_utc
 LOGGER = logging.getLogger(__name__)
 MAX_PENDING_WRITES = 500
 MAX_LIVE_EVENTS = 1000
+SNAPSHOT_DEGRADED_FRAME = '{"type":"telemetry_degraded","reason":"snapshot_unavailable"}'
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,8 @@ class TelemetryService:
         self._client_queues: dict[WebSocket, asyncio.Queue[TelemetrySnapshot]] = {}
         self._sender_tasks: dict[WebSocket, asyncio.Task[None]] = {}
         self._clients_lock = asyncio.Lock()
+        self._encoded_snapshot: tuple[TelemetrySnapshot, str | None] | None = None
+        self._snapshot_encoding_failed = False
         self._task: asyncio.Task[None] | None = None
         self._history_task: asyncio.Task[None] | None = None
         self._windows_task: asyncio.Task[None] | None = None
@@ -1129,13 +1133,34 @@ class TelemetryService:
         selected = snapshot or self.latest
         if selected is None:
             return True
+        # A frame that cannot be encoded says nothing about this client's socket.
+        payload = self.encode_snapshot(selected) or SNAPSHOT_DEGRADED_FRAME
         try:
-            await asyncio.wait_for(
-                client.send_text(selected.model_dump_json()), timeout=self.send_timeout
-            )
+            await asyncio.wait_for(client.send_text(payload), timeout=self.send_timeout)
             return True
         except Exception:
             return False
+
+    def encode_snapshot(self, snapshot: TelemetrySnapshot) -> str | None:
+        """Return the shared JSON for a snapshot, or None if it cannot be served safely."""
+        if self._encoded_snapshot is not None and self._encoded_snapshot[0] is snapshot:
+            return self._encoded_snapshot[1]
+        payload: str | None = None
+        failure: str | None = None
+        try:
+            payload = snapshot.model_dump_json()
+            if len(payload.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+                payload = None
+                failure = "size limit exceeded"
+        except Exception as exc:
+            failure = type(exc).__name__
+        if failure is not None and not self._snapshot_encoding_failed:
+            LOGGER.warning("Telemetry snapshot could not be encoded (%s)", failure)
+        elif failure is None and self._snapshot_encoding_failed:
+            LOGGER.info("Telemetry snapshot encoding recovered")
+        self._snapshot_encoding_failed = failure is not None
+        self._encoded_snapshot = (snapshot, payload)
+        return payload
 
     async def broadcast(self, snapshot: TelemetrySnapshot) -> None:
         async with self._clients_lock:

@@ -6,6 +6,12 @@ export class TelemetrySocket {
     this.retry = 0;
     this.timer = null;
     this.closed = false;
+    this.degraded = false;
+  }
+
+  setDegraded(status) {
+    this.degraded = true;
+    this.onStatus(status);
   }
 
   connect() {
@@ -14,10 +20,24 @@ export class TelemetrySocket {
     this.socket = new WebSocket(`${protocol}//${location.host}/ws/telemetry`);
     this.socket.addEventListener("open", () => {
       this.retry = 0;
+      this.degraded = false;
       this.onStatus("CONNECTED");
     });
     this.socket.addEventListener("message", (event) => {
-      try { this.onData(JSON.parse(event.data)); } catch { this.onStatus("DATA ERROR"); }
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "telemetry_degraded") {
+          this.setDegraded("TELEMETRY DEGRADED");
+          return;
+        }
+        this.onData(message);
+        if (this.degraded) {
+          this.degraded = false;
+          this.onStatus("CONNECTED");
+        }
+      } catch {
+        this.setDegraded("DATA ERROR");
+      }
     });
     this.socket.addEventListener("close", () => {
       this.onStatus("RECONNECTING");

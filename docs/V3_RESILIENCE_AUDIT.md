@@ -18,6 +18,9 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: lifecycle, persistence and collector fixes below, Python 3.11.9
   on Windows only. Local commits only. Hosted CI has not run on these changes and
   Python 3.13 is not installed locally.
+- VERIFIED LOCALLY: snapshot serialization hardening below, Python 3.11.9 on Windows:
+  265 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff
+  and compilation passed. Hosted CI has not run on these changes.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -51,13 +54,41 @@ The surrogate process path was reproduced with a real process for psutil's behav
 and with `ProcessInfo` for the serialization failure. The full broadcast path was
 not exercised end to end with a live process.
 
+## Snapshot serialization
+
+Originally an open review finding. Later reproduced at `9e4f29d` through the real
+routes, with a lone surrogate and with an unserializable object in alert evidence:
+
+| Path | Before | After |
+| --- | --- | --- |
+| WebSocket broadcast | All 3 healthy clients closed with `1011`, labeled as a send timeout | Clients stay connected and receive `telemetry_degraded` |
+| New WebSocket client | Closed with `1011` | Stays connected and receives `telemetry_degraded` |
+| `GET /api/overview` | Plain-text 500 | JSON 503 with a fixed message |
+| `NaN` or infinite values | Encoded as `null` | Unchanged: not a failure |
+
+Root cause: both paths serialized inside handling meant for something else. The
+WebSocket `try` treated an encoding error as a dead socket, and REST left it unhandled.
+
+`TelemetryService.encode_snapshot` is now the shared boundary. It uses only the native
+encoder, has no fallback encoder, and encodes each snapshot once. It keeps one entry
+and refuses payloads over `MAX_SNAPSHOT_BYTES` (4 MiB, against about 315 KB measured for
+a synthetic near-limit snapshot). Failures are logged once by exception type until
+recovery, and snapshot contents are never logged or sent.
+
+The dashboard shows `TELEMETRY DEGRADED` instead of `CONNECTED` and clears it on the
+next valid snapshot, which also clears `DATA ERROR`. `/api/health` reports `snapshot` as
+`warming-up`, `available` or `unavailable`. Valid `/api/overview` bodies are
+byte-identical to those at `9e4f29d`.
+
+Regression tests are in `tests/test_v3_snapshot_serialization.py`. Restoring the old
+WebSocket path fails 7 of its 17 tests, and restoring the old REST path fails 4.
+
 ## Open findings
 
-These come from code review. None has been reproduced or fixed.
+These come from code review and have not been reproduced, unless noted.
 
-- `send_snapshot` reports serialization errors as client failures, so any future
-  unserializable field would disconnect every client.
-- `model_dump_json()` runs once per client on the event loop. Cost is unmeasured.
+- Reproduced: `/api/alerts` returns a plain-text 500 for a malformed live alert. Report
+  and AI routes also read `latest` directly and were not tested with malformed data.
 - `broadcast` can send directly to a client that is registered but not yet accepted,
   then close it. The window is narrow.
 - `unregister_client` suppresses `CancelledError`, including the caller's own.
@@ -75,3 +106,8 @@ These come from code review. None has been reproduced or fixed.
   History is dropped while degraded, but Windows events are still collected into
   bounded memory even if saved settings disable them.
 - An escaped name is a display form. Only the on-disk path is authoritative.
+- `telemetry_degraded` covers snapshots that exist but cannot be served. The dashboard
+  has no watchdog for frames that stop arriving while the socket stays open, so it can
+  still show `CONNECTED` if collection itself stops.
+- During a serialization failure the dashboard keeps the last rendered values under the
+  degraded status. Playwright covers this path with synthetic frames only.

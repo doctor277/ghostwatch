@@ -149,6 +149,12 @@ export async function installSyntheticBackend(page) {
     disconnectLatest() {
       state.sockets.at(-1)?.close({ code: 1012, reason: "Synthetic restart" });
     },
+    sendDegraded() {
+      state.sockets.at(-1)?.send(JSON.stringify({ type: "telemetry_degraded", reason: "snapshot_unavailable" }));
+    },
+    sendSnapshot() {
+      state.sockets.at(-1)?.send(JSON.stringify(state.snapshot));
+    },
     failNext(method, path, status = 503) {
       state.failures.set(`${method} ${path}`, status);
     },
