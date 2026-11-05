@@ -960,7 +960,8 @@ class TelemetryService:
                 summary="Queued bounded alert and event writes are being reconciled.",
             )
             self._remember_event(event)
-            self._queue_pending(self._pending_events, event.id, event)
+            if self.settings.event_logging_enabled:
+                self._queue_pending(self._pending_events, event.id, event)
 
     @staticmethod
     def _queue_pending(
@@ -977,6 +978,12 @@ class TelemetryService:
     def _queue_with_operator_state(self, alert: Alert) -> None:
         # The live copy holds any acknowledge or dismiss that arrived during a write.
         current = self._live_alert(alert.id) or alert
+        if not self.settings.event_logging_enabled:
+            self._remember_live_alert(
+                current.model_copy(update={"persistence_pending": False}),
+                authoritative=True,
+            )
+            return
         pending = alert.model_copy(
             update={
                 "acknowledged": current.acknowledged,
@@ -1109,7 +1116,10 @@ class TelemetryService:
                 continue
             self._pending_alerts.pop(alert_id, None)
             self._remember_live_alert(stored, authoritative=True)
-        for event_id, event in list(self._pending_events.items()):
+        for event_id in list(self._pending_events):
+            event = self._pending_events.get(event_id)
+            if event is None:
+                continue
             try:
                 await asyncio.to_thread(self.database.add_event, event)
             except InvalidRecordError as exc:
@@ -1161,7 +1171,7 @@ class TelemetryService:
                 self._mark_storage_success()
             except Exception as exc:
                 self._mark_storage_failure(exc)
-                if memory_result:
+                if memory_result and self.settings.event_logging_enabled:
                     memory_result = memory_result.model_copy(
                         update={"persistence_pending": True}
                     )
@@ -1251,6 +1261,8 @@ class TelemetryService:
             await asyncio.to_thread(self.database.save_settings, settings)
             # A saved opt-out takes effect even if the maintenance below fails.
             self.settings = settings
+            if not settings.event_logging_enabled:
+                self._discard_pending_writes()
             await asyncio.to_thread(
                 self.database.enforce_retention, settings.alert_retention
             )
