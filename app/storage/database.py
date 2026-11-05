@@ -72,12 +72,53 @@ NORMALIZED_UNIQUE_KEYS = {
 }
 
 
+SQLITE_INTEGER_BITS = 63
+
+
 class UnsupportedSchemaVersionError(RuntimeError):
     """Raised before writes when a database requires a newer GhostWatch schema."""
 
 
 class TimestampNormalizationCollisionError(RuntimeError):
     """Raised before migration when canonical UTC keys would collide."""
+
+
+class InvalidRecordError(ValueError):
+    """A record that can never be written, whatever the state of the database."""
+
+
+def _record_time(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        raise InvalidRecordError(f"{label} is not a timestamp")
+    try:
+        return utc_iso(value, label=label)
+    except (ValueError, OverflowError) as exc:
+        raise InvalidRecordError(f"{label} has no UTC form") from exc
+
+
+def _record_json(value: object) -> str:
+    try:
+        return json.dumps(value, separators=(",", ":"), default=str)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise InvalidRecordError("Evidence has no JSON form") from exc
+
+
+def _record_values(*values: object) -> tuple[object, ...]:
+    """Refuse what SQLite would, so an error from SQLite is never about the record."""
+    for value in values:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise InvalidRecordError("Text cannot be encoded") from exc
+        elif isinstance(value, int):
+            if value.bit_length() > SQLITE_INTEGER_BITS:
+                raise InvalidRecordError("Integer is outside the storable range")
+        elif value is not None and not isinstance(value, float):
+            raise InvalidRecordError("Value has an unsupported type")
+    return values
 
 
 class Database:
@@ -725,9 +766,9 @@ class Database:
                     occurrence_count=excluded.occurrence_count,
                     condition_active=excluded.condition_active,
                     last_recovery=excluded.last_recovery""",
-                (
+                _record_values(
                     stored.id,
-                    utc_iso(stored.timestamp, label="alert timestamp"),
+                    _record_time(stored.timestamp, "alert timestamp"),
                     stored.severity,
                     stored.source,
                     stored.metric,
@@ -735,29 +776,17 @@ class Database:
                     int(stored.acknowledged),
                     int(stored.dismissed),
                     stored.rule_id,
-                    json.dumps(stored.evidence, separators=(",", ":"), default=str),
+                    _record_json(stored.evidence),
                     stored.incident_id,
-                    (
-                        utc_iso(stored.first_occurrence, label="alert first occurrence")
-                        if stored.first_occurrence
-                        else None
-                    ),
-                    (
-                        utc_iso(stored.last_occurrence, label="alert last occurrence")
-                        if stored.last_occurrence
-                        else None
-                    ),
+                    _record_time(stored.first_occurrence, "alert first occurrence"),
+                    _record_time(stored.last_occurrence, "alert last occurrence"),
                     stored.occurrence_count,
                     (
                         int(stored.condition_active)
                         if stored.condition_active is not None
                         else None
                     ),
-                    (
-                        utc_iso(stored.last_recovery, label="alert last recovery")
-                        if stored.last_recovery
-                        else None
-                    ),
+                    _record_time(stored.last_recovery, "alert last recovery"),
                 ),
             )
             self._enforce_retention(connection, retention)
@@ -864,15 +893,15 @@ class Database:
                 (id, timestamp, event_type, severity, title, summary, related_id, evidence)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING""",
-                (
+                _record_values(
                     event.id,
-                    utc_iso(event.timestamp, label="event timestamp"),
+                    _record_time(event.timestamp, "event timestamp"),
                     event.event_type,
                     event.severity,
                     event.title,
                     event.summary,
                     event.related_id,
-                    json.dumps(event.evidence, separators=(",", ":"), default=str),
+                    _record_json(event.evidence),
                 ),
             )
             connection.execute(

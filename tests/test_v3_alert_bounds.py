@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models import Alert, EventRecord
 from app.service import TelemetryService
-from app.storage.database import Database
+from app.storage.database import Database, InvalidRecordError
 
 TRUNCATED = "[TRUNCATED]"
 UNSERIALIZABLE = "[UNSERIALIZABLE]"
@@ -238,14 +238,13 @@ async def test_oversized_alert_queued_during_outage_flushes_after_recovery(
     assert len(service.database.list_alerts(10, True)[0].explanation) == 2000
 
 
-@pytest.mark.parametrize("error", [ValueError, TypeError, OverflowError])
 async def test_unwritable_record_is_rejected_without_degrading_storage(
-    collecting, monkeypatch, caplog, error
+    collecting, monkeypatch, caplog
 ):
     service = collecting
 
     def fail(*args):
-        raise error(PRIVATE)
+        raise InvalidRecordError(PRIVATE)
 
     monkeypatch.setattr(service.database, "add_alert", fail)
     with caplog.at_level(logging.DEBUG, logger="app.service"):
@@ -264,7 +263,7 @@ async def test_unwritable_queued_record_does_not_block_the_queue(collecting, mon
     def add_alert(item, retention):
         attempts.append(item.id)
         if item.id == "poison":
-            raise ValueError("synthetic record failure")
+            raise InvalidRecordError("synthetic record failure")
         return real_add_alert(item, retention)
 
     poison = alert(id="poison").model_copy(update={"persistence_pending": True})
@@ -290,7 +289,7 @@ async def test_unwritable_queued_event_does_not_block_the_queue(collecting, monk
 
     def add_event(event):
         if event.id == "poison":
-            raise ValueError("synthetic record failure")
+            raise InvalidRecordError("synthetic record failure")
         return real_add_event(event)
 
     for identifier in ("poison", "valid"):

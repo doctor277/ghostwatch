@@ -57,7 +57,7 @@ from app.monitoring.network import NetworkCollector
 from app.monitoring.processes import ProcessCollector
 from app.monitoring.system import SystemCollector
 from app.monitoring.windows_events import WindowsEventCollector
-from app.storage.database import Database
+from app.storage.database import Database, InvalidRecordError
 from app.text_utils import bounded_identifier
 from app.time_utils import as_utc
 
@@ -65,8 +65,6 @@ LOGGER = logging.getLogger(__name__)
 MAX_PENDING_WRITES = 500
 MAX_LIVE_EVENTS = 1000
 SNAPSHOT_DEGRADED_FRAME = '{"type":"telemetry_degraded","reason":"snapshot_unavailable"}'
-# These describe one record that can never be written, not a storage outage.
-RECORD_WRITE_ERRORS = (TypeError, ValueError, OverflowError)
 
 
 @dataclass(frozen=True)
@@ -986,7 +984,7 @@ class TelemetryService:
             stored = await asyncio.to_thread(
                 self.database.add_alert, alert, self.settings.alert_retention
             )
-        except RECORD_WRITE_ERRORS as exc:
+        except InvalidRecordError as exc:
             self._reject_write(exc)
             return False
         except Exception as exc:
@@ -1011,7 +1009,7 @@ class TelemetryService:
             return False
         try:
             await asyncio.to_thread(self.database.add_event, event)
-        except RECORD_WRITE_ERRORS as exc:
+        except InvalidRecordError as exc:
             self._reject_write(exc)
             return False
         except Exception as exc:
@@ -1080,7 +1078,7 @@ class TelemetryService:
                 stored = await asyncio.to_thread(
                     self.database.add_alert, clean, self.settings.alert_retention
                 )
-            except RECORD_WRITE_ERRORS as exc:
+            except InvalidRecordError as exc:
                 self._reject_queued_alert(alert_id, exc)
                 continue
             except Exception as exc:
@@ -1094,7 +1092,7 @@ class TelemetryService:
         for event_id, event in list(self._pending_events.items()):
             try:
                 await asyncio.to_thread(self.database.add_event, event)
-            except RECORD_WRITE_ERRORS as exc:
+            except InvalidRecordError as exc:
                 self._pending_events.pop(event_id, None)
                 self._reject_write(exc)
                 continue
