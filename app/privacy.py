@@ -7,6 +7,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
+from app.text_utils import TRUNCATED_SUFFIX
+
 RedactionLevel = Literal["standard", "strict"]
 
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
@@ -96,8 +98,18 @@ def _redact_ips(text: str) -> str:
     return _BARE_IPV6.sub(replace_ipv6, text)
 
 
+def _redact_cut_values(text: str) -> str:
+    """Drop the word beside a cut, because a partial value matches no pattern below."""
+    pieces = text.split(TRUNCATED_SUFFIX)
+    for index, piece in enumerate(pieces[:-1]):
+        if piece and not piece[-1].isspace():
+            word = piece.rsplit(None, 1)[-1]
+            pieces[index] = f"{piece[: -len(word)]}[REDACTED]"
+    return TRUNCATED_SUFFIX.join(pieces)
+
+
 def redact_text(value: str) -> str:
-    text = _EMAIL.sub("[REDACTED_EMAIL]", value)
+    text = _EMAIL.sub("[REDACTED_EMAIL]", _redact_cut_values(value))
     text = _WINDOWS_QUOTED_PATH.sub("[REDACTED_PATH]", text)
     text = _WINDOWS_SPACED_PATH.sub("[REDACTED_PATH]", text)
     text = _WINDOWS_PATH.sub("[REDACTED_PATH]", text)
