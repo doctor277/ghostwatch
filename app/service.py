@@ -920,6 +920,9 @@ class TelemetryService:
     def _remember_live_alert(self, alert: Alert, *, authoritative: bool = False) -> Alert:
         for index, existing in enumerate(self.live_alerts):
             if existing.id == alert.id:
+                if not authoritative:
+                    # An observation never owns the incident relationship.
+                    alert = alert.model_copy(update={"incident_id": existing.incident_id})
                 if (
                     not authoritative
                     and alert.rule_id == "collection_failure"
@@ -1082,7 +1085,7 @@ class TelemetryService:
             result = (
                 self._merge_grouped_alert(stored, pending)
                 if stored.rule_id == "collection_failure" else pending
-            )
+            ).model_copy(update={"incident_id": stored.incident_id})
         if current is not None:
             before_link = before.incident_id if before is not None else None
             changes: dict[str, Any] = {
@@ -1099,6 +1102,13 @@ class TelemetryService:
             result = result.model_copy(update=patch.model_dump(exclude_none=True))
         self._remember_live_alert(result, authoritative=True)
         self._clear_pending_flag(stored.id)
+
+    async def _reconcile_written_link(self, alert_id: str, sequence: int) -> None:
+        # A refresh skips an alert that is not live, but accepting a write can
+        # restore one with a link older than the incident that overtook the write.
+        if sequence != self._incident_refresh_sequence:
+            with suppress(StorageUnavailableError):
+                await self._refresh_incident_links([alert_id])
 
     def _queue_with_operator_state(self, alert: Alert) -> None:
         # The live copy holds any acknowledge or dismiss that arrived during a write.
@@ -1170,6 +1180,7 @@ class TelemetryService:
             self._clear_pending_flag(alert.id)
             return False
         before = self._live_alert(alert.id)
+        sequence = self._incident_refresh_sequence
         try:
             stored = await asyncio.to_thread(
                 self.database.add_alert, alert, self.settings.alert_retention
@@ -1194,6 +1205,7 @@ class TelemetryService:
             return False
         self._accept_stored_alert(stored, before)
         self._mark_storage_success()
+        await self._reconcile_written_link(alert.id, sequence)
         return True
 
     async def _persist_event(self, event: EventRecord) -> bool:
@@ -1300,6 +1312,7 @@ class TelemetryService:
             self._writing_alert = alert_id
             before = self._live_alert(alert_id)
             generation = self._logging_generation
+            sequence = self._incident_refresh_sequence
             try:
                 clean = alert.model_copy(update={"persistence_pending": False})
                 stored = await asyncio.to_thread(
@@ -1327,9 +1340,11 @@ class TelemetryService:
                         "occurrence_count": newer.occurrence_count - alert.occurrence_count
                     })
                 self._accept_stored_alert(stored, before)
+                await self._reconcile_written_link(alert_id, sequence)
                 continue
             self._pending_alerts.pop(alert_id, None)
             self._accept_stored_alert(stored, before)
+            await self._reconcile_written_link(alert_id, sequence)
         for alert_id in list(self._pending_alert_updates):
             if not self.settings.event_logging_enabled:
                 self._discard_pending_writes()
@@ -1389,6 +1404,7 @@ class TelemetryService:
         ):
             return True
         before = self._live_alert(alert_id)
+        sequence = self._incident_refresh_sequence
         self._writing_alert_update = alert_id
         try:
             persisted = await asyncio.to_thread(self.database.update_alert, alert_id, patch)
@@ -1406,15 +1422,39 @@ class TelemetryService:
         else:
             self._clear_pending_flag(alert_id)
         self._mark_storage_success()
+        await self._reconcile_written_link(alert_id, sequence)
         return True
+
+    async def _read_alert(self, alert_id: str) -> Alert | None:
+        # An alert absent from live memory is skipped by incident refreshes, and
+        # a flush can move a queued one into SQLite. Discard a read that either
+        # overtook, instead of caching an older link or reporting a missing row.
+        # A queued copy outlasts the live list, but not its own incident link.
+        while True:
+            sequence = self._incident_refresh_sequence
+            queued = self._pending_alerts.get(alert_id)
+            persisted = await asyncio.to_thread(self.database.get_alert, alert_id)
+            if persisted is None and queued is not None:
+                links = await asyncio.to_thread(self.database.get_alert_incident_ids, [alert_id])
+                persisted = queued.model_copy(update={"incident_id": links[alert_id]})
+            if (
+                sequence == self._incident_refresh_sequence
+                and queued is self._pending_alerts.get(alert_id)
+            ):
+                return persisted
 
     async def update_alert(self, alert_id: str, update: AlertUpdate) -> Alert | None:
         generation = self._logging_generation
         changes = update.model_dump(exclude_none=True)
         current = self._live_alert(alert_id)
+        if current is not None and current.incident_id is None and alert_id in self._pending_alerts:
+            # An observation queued after eviction cannot know its stored link.
+            with suppress(StorageUnavailableError):
+                await self._refresh_incident_links([alert_id])
+            current = self._live_alert(alert_id)
         if current is None:
             try:
-                persisted = await asyncio.to_thread(self.database.get_alert, alert_id)
+                persisted = await self._read_alert(alert_id)
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 raise StorageUnavailableError("Alert lookup is unavailable") from exc

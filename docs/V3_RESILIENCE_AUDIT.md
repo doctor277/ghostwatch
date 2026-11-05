@@ -535,6 +535,156 @@ creation can create another incident. Large incident archives remain unbenchmark
 This follow-up is local only. PR #7 remains draft and unmerged by instruction; no
 remote operation, push, PR mutation or production V2 change is part of this work.
 
+## Merge-gate recheck, 2026-11-05
+
+Bounded local recheck of `d9f5843..c162eed`. `HEAD` was confirmed to be
+`c162eed9704bee6fe4d387f38f478f884c3d811d` with read-only Git commands and no fetch.
+Scope was the reviewed diff in `app/service.py`, `app/storage/database.py` and
+`app/api/routes.py`, plus directly related logic. All data was synthetic, and no crash
+or power-loss experiment was run.
+
+**Recommendation for code quality: APPROVE WITH FOLLOW-UPS.** This is not a GitHub
+approval. Hosted CI was not rerun, so its 601/17 results describe only the published
+SHA and not this tree. The state of PR #7 was not rechecked. The fixes below are
+uncommitted at the time of writing. Automatic review notes rejected two earlier
+revisions: the one with defects 1-3 only, because of defect 4, and the one with defects
+1-6, because of defect 7. Both notes were treated as unverified claims and reproduced
+with deterministic tests before any fix. Defects 4-6 were the second focused attempt on
+one schedule 3 gap. Defect 7 is a separate gap, write completion rather than lookup,
+fixed at its first attempt. Independent agent review is not part of this workflow
+(owner instruction, 2026-11-05), so the recommendation rests on the tests and evidence
+recorded here.
+
+Interpreter: Windows Python **3.11.9 only**, using an existing virtual environment from
+the sibling checkout, because the worktree has none. Nothing was installed, and
+bytecode writes were disabled for every pytest run. Python 3.13 was not run: `py -0` lists only
+3.11.9 and 3.14.3, and the installed 3.14 has no project dependencies. Playwright was
+not run; this task made no frontend change.
+
+### Results
+
+Every pytest run below used its own workspace-local `--basetemp` and
+`-p no:cacheprovider`. The right column ran under `.tmp/t01-r4/`. In the `c162eed`
+column, the persistence, full-suite, Ruff and compile rows come from the earlier run on
+a pristine `git archive` copy under `.tmp/t01-r2/`. The final-race cell's current
+figure ran the current test file against the `c162eed` `app/service.py`.
+
+| Check | At `c162eed` | With the seven fixes |
+| --- | --- | --- |
+| `python -m pytest tests/test_v3_final_races.py -q` | Original file: 26 passed, 0 failed, 0 skipped. Current file: 28 passed, 18 failed, 0 skipped | 46 passed, 0 failed, 0 skipped |
+| `python -m pytest tests/test_v3_persistence_races.py -q` | 60 passed, 0 failed, 0 skipped | 60 passed, 0 failed, 0 skipped |
+| `python -m pytest -q` | 601 passed, 0 failed, 0 skipped, 1 warning | 621 passed, 0 failed, 0 skipped, 1 warning |
+| `python -m ruff check .` | Passed | Passed |
+| `python -m compileall -q app scripts tests` | Passed | Passed |
+| `python -m pytest .tmp/t01-r3/test_probes.py .tmp/t01-r3/test_reobserve_probe.py .tmp/t01-r3/test_gap_probe.py -q --rootdir=. -c pyproject.toml` | Not rerun | 22 passed, 0 failed, 0 skipped, 1 warning |
+
+The warning is the known Starlette/httpx deprecation. The first probe run reported
+6 failures, 2 of them mistakes in the probes: a wrong `create_app` keyword, and a
+producer that re-fired on restart and so made a real second observation. The table
+counts the corrected probes. They live in the ignored `.tmp/t01-r3/` directory and
+are not part of the repository; the seven defects are covered in `tests/test_v3_final_races.py`.
+That file then passed two further repeat runs, 46 passed each.
+
+**`--basetemp` is required on this machine.** Without it, a run can report mass setup
+errors unrelated to the code. The orchestrator's
+`python -m pytest -q` gate reported 186 passed and 420 errors here, with no failed test in
+its captured log. `%LOCALAPPDATA%\Temp\pytest-of-<user>` denies access on this machine:
+rerunning `tests/test_websocket.py` that way gave 1 passed and 4 errors, each
+`PermissionError: [WinError 5]` on that directory. The table above is the valid result.
+
+### Schedule coverage
+
+Assertions were read, not inferred from test names.
+
+| Schedule | Direct coverage | Added independent probe | Outcome |
+| --- | --- | --- | --- |
+| 1. Slow recovery vs newer saved logging OFF, ON, OFF->ON | `test_settings_save_supersedes_older_recovery_read` asserts disk and memory equal the saved model and that a later event persists only when logging is on. `test_other_saved_configuration_survives_recovery` covers the other models. `test_opt_out_during_alert_lookup_cannot_revive_the_patch` covers the patch path. | `test_s1_queued_work_is_not_revived_by_slow_recovery` (queued alert and event stay discarded), `test_s1_save_commit_straddling_a_complete_recovery_read` | No defect |
+| 2. SQLite-only PATCH under a busy write, 404, sanitized 503 | `test_persisted_only_alert_patch_response`, `test_persisted_only_patch_while_logging_off_is_live_only`, `test_alert_lookup_failure_is_unavailable_not_missing`. The busy case holds the write outside the real `Database._lock`, so this is partly indirect. | `test_s2_real_database_lock_held_does_not_stall_loop_or_invent_a_record`, `test_s2_degraded_but_readable_store_returns_the_record_and_defers_the_write`, `test_s2_failure_leaves_no_phantom_state`, `test_s2_end_to_end_503_body_is_sanitized` | Defects 2 and 3 below, fixed |
+| 3. Concurrent incidents match the committed link, including after acknowledgement | `test_two_incident_completions_keep_the_committed_link`, `test_acknowledgement_reconciles_an_authoritative_link`, `test_delayed_incident_refresh_cannot_replace_a_newer_refresh` assert the committed link in database, live state and API response. | `test_s3_lookup_cannot_cache_a_link_older_than_a_committed_incident`, `test_s3_delayed_observation_cannot_restore_the_older_link`, `test_reobserved_linked_alert_while_degraded`, `test_gap`. The write-completion schedule of defect 7 is in the repository as `test_direct_write_cannot_restore_a_link_older_than_an_incident`, `test_flush_cannot_restore_a_link_older_than_an_incident` and `test_patch_write_cannot_restore_a_link_older_than_an_incident`. | Defects 1, 4, 5, 6 and 7 below, fixed |
+| 4. Cancelled grouped write across same-loop stop/start | `test_cancelled_recovery_counts_each_observation_once` asserts count 1, then exactly 2 after a new detection, for commit and rollback in both restart orders. `test_cancelled_first_write_keeps_a_genuinely_new_occurrence`, `test_cancelled_operator_patch_preserves_a_newer_reversal`. | `test_s4_direct_write_cancelled_by_stop` covers the direct write path, which the first test does not | No defect |
+
+### Reproduced defects
+
+Each new test failed before the fix and passes after it, except two guards: 18 failed
+and 28 passed in `tests/test_v3_final_races.py` against the `c162eed` service. Defect 3
+also failed with the fix for defect 2 alone. The tests for defects 4 and 5 and for the
+first form of defect 6 failed with defects 1-3 fixed: 6 failed and 32 passed. The
+`patch-logging-on` case already passed, because the patch write returns the committed
+row. `test_unreadable_link_does_not_block_a_live_alert_patch` already passed, because
+it pins existing behavior that the defect 6 fix must keep. The 4 tests for defect 7
+failed on the stale link with defects 1-6 fixed. With only that fix disabled in a
+disposable copy, its 5 tests failed and the other 41 passed.
+
+| Defect | Reproduction | Fix |
+| --- | --- | --- |
+| 1, schedule 3: a lookup caches an older incident link | PATCH of an alert absent from live memory reads the row. An incident then commits and refreshes, and the refresh skips the alert because it is not live. The old read is then stored in live memory. With an empty PATCH, or with logging off, nothing reconciles it, and live state overrides SQLite in API responses until the alert leaves live memory. | `_read_alert` repeats a read that any incident refresh overtook. This needs no await between the check and caching. `test_persisted_only_lookup_cannot_cache_an_older_incident_link` |
+| 2, schedule 2: a queued alert is reported missing | `MAX_LIVE_ALERTS` is 200 and each queue holds 500. An outage queuing more than 200 distinct alerts evicts live copies, so a PATCH of one returned 404 and lost the operator action, though the alert was not truly missing. | `_read_alert` falls back to the pending alert when SQLite has no row. `test_alert_queued_beyond_live_capacity_is_not_missing` |
+| 3, schedule 2: a flush overtakes that lookup | With the same evicted alert, the SQLite read finds no row, then a flush commits the alert and removes it from the queue before the read resumes. Neither source had it, so a PATCH returned 404 for a stored alert and lost the action. | `_read_alert` also repeats a read if the queued entry changed. The repeat finds the committed row, and an alert discarded by an opt-out remains a true 404. `test_queued_alert_flushed_during_lookup_is_not_missing` |
+| 4, schedule 3: a restored queued alert loses its link | Found by review. While storage is degraded but readable, an incident commits for a queued alert with no row, and the refresh updates only the live copy. More queued alerts evict that copy. PATCH then restored the queued copy and returned and cached `incident_id=None`. The retry fence cannot help, because the incident finished before the lookup. | `_read_alert` applies the committed link to the queued copy. A failed link read is a sanitized 503 and restores nothing. `test_restored_queued_alert_keeps_the_committed_incident_link`, `test_link_lookup_failure_restores_no_queued_alert` |
+| 5, schedule 3: a write accepted under a newer queued copy | Same family, found by probe. `_accept_stored_alert` adopted the queued copy and its older link when the alert was not live. | The accepted result always takes the stored link. `test_write_accepted_under_a_newer_queued_copy_keeps_the_committed_link` |
+| 6, schedule 3: a re-observation hides the link | Same family, found by probe. While degraded, a new observation replaced the live copy and dropped its link until a flush. If the alert had been evicted, the observation had no link to inherit, and PATCH returned `incident_id=None` over a committed link. | Observations inherit the live link. PATCH of a queued, unlinked live alert first runs the existing `_refresh_incident_links`. If that read fails, the PATCH still applies to the live copy. `test_reobservation_while_degraded_keeps_the_committed_link`, `test_reobservation_after_eviction_reconciles_on_patch`, `test_unreadable_link_does_not_block_a_live_alert_patch` |
+| 7, schedule 3: a finishing write restores an older link | Found by review and reproduced on all three accept paths. A write commits link A and pauses. More alerts evict the live copy, and incident B commits, so SQLite holds B but the refresh skips the absent alert. Accepting the write then restored A. Live state overrides SQLite in API responses, and PATCH refreshes only an empty link, so an acknowledgement also returned A. The lookup fence for defect 1 does not cover write completions. | Each write records the refresh sequence before dispatch. `_reconcile_written_link` runs the existing `_refresh_incident_links` after accepting a write that a refresh overlapped, and does no read otherwise. A failed read degrades storage but leaves the committed write accepted. `test_direct_write_cannot_restore_a_link_older_than_an_incident`, `test_flush_cannot_restore_a_link_older_than_an_incident`, `test_patch_write_cannot_restore_a_link_older_than_an_incident`, `test_failed_link_reconcile_keeps_the_committed_write` |
+
+### Schedule 5 findings
+
+No deadlock, unbounded stop or privacy bypass was found. Confirmed by reading the code
+and by the `test_s5_*` probes, except where stated:
+
+- **Deadlock:** `_alert_persistence_lock` is taken only inside the owner task, and an
+  owner starts only when none is busy, so it is not contended. Every other path queues
+  instead of waiting. `Database._lock` is not re-entrant, but `_incident_for_alert`
+  takes no lock and `update_alert` calls `get_alert` after releasing it. An unexpected
+  owner exception releases the lock and degrades storage, including when the caller
+  was already cancelled.
+- **Stop:** `stop()` cancels producers, which await the owner through `asyncio.shield`,
+  so a held write does not delay it. A held patch returned from stop within the 1 s
+  probe limit. A blocked SQLite thread cannot be interrupted; connections use a 2 s
+  busy timeout, and the work queued meanwhile stays within the 500-entry limits.
+- **Privacy:** `_write_alert`, `_write_alert_update` and each flush iteration recheck
+  the setting or generation before dispatch. With an opt-out during a held flush, only
+  the already-dispatched alert was stored; later alerts and the queued event were not.
+  That dispatched write is the documented exception. The configuration fence covers
+  every assignment: outside `__init__`, the models are set only through
+  `_apply_saved_configuration` and `_load_configuration`.
+- **Revised fixes:** the link reads added for defects 4 and 6 hold no service lock, so
+  they add no lock order. A slow read delays only that PATCH, within the 2 s busy
+  timeout when another writer holds SQLite. The PATCH generation is taken before those
+  reads, so an opt-out during one still stops the patch from being queued. This item
+  rests on reading the code and on the full suite; no probe holds those reads.
+- **Defect 7 fix:** `_reconcile_written_link` only reads, so it cannot store anything
+  after an opt-out. It runs inside the owner task while `_alert_persistence_lock` is
+  held, but `_refresh_incident_links` never takes that lock, so it adds no wait cycle.
+  A slow read extends that owner's work by at most the 2 s busy timeout, and producers
+  meanwhile queue instead of waiting. `stop()` does not await it. Each write makes at
+  most one such read. This rests on reading the code and on the full suite; no probe
+  holds that read.
+
+### Follow-ups
+
+None blocks the local beta candidate. All are low severity.
+
+- Not reproduced: `_persist_event` is not routed through the owner. If its caller is
+  cancelled and the dispatched write then fails, the event is neither queued nor
+  counted. This can lose an audit event, but cannot breach an opt-out.
+- `_read_alert` has no fixed retry limit. Each retry needs an incident refresh or queue
+  change that overlaps the read, so it is limited by local activity, not by a constant.
+  It holds no lock while retrying and is not awaited by `stop()`.
+- A PATCH of a queued alert absent from live memory still returns the sanitized 503
+  while SQLite is unreadable, because the lookup fails first. This is honest, but the
+  patch is not queued.
+- A linked alert that was evicted and then re-observed during an outage shows no link
+  in alert lists until a PATCH of it or the next successful flush. Observations do not
+  read SQLite, which keeps them safe during an outage. SQLite holds the correct link
+  throughout. If SQLite is unreadable, a PATCH response has the same gap.
+- If the read after an overtaken write fails, storage degrades and the older link can
+  stay in the live copy until the next write of that alert or its eviction. SQLite
+  holds the correct link throughout. `test_failed_link_reconcile_keeps_the_committed_write`
+  checks the commit and the degraded state, not that live link.
+- A failed link read in PATCH goes through `_mark_storage_failure`, as the lookup path
+  does, which restarts the storage retry delay.
+- Persistence ownership is bound to one event loop. Stop/start on a different loop
+  remains unsupported.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.

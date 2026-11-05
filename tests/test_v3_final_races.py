@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.api.routes import update_alert as patch_alert
+from app.config import MAX_LIVE_ALERTS
 from app.models import Alert, AlertUpdate, IncidentCreate
 from app.service import TelemetryService
 from app.storage.database import Database
@@ -187,6 +188,41 @@ async def test_persisted_only_patch_while_logging_off_is_live_only(service):
     assert service.database.get_alert("synthetic").acknowledged is False
 
 
+# The write queue outlasts the bounded live list during an outage.
+async def test_alert_queued_beyond_live_capacity_is_not_missing(service):
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    for index in range(MAX_LIVE_ALERTS + 1):
+        await write(service, alert(f"queued-{index}"))
+    assert service._live_alert("queued-0") is None
+    response = await patch_alert("queued-0", AlertUpdate(acknowledged=True), request(service))
+    assert response.id == "queued-0"
+    assert response.acknowledged is True
+    assert response.persistence_pending is True
+    await settle(service)
+    assert service.database.get_alert("queued-0").acknowledged is True
+    assert not service._pending_alert_updates
+
+
+async def test_queued_alert_flushed_during_lookup_is_not_missing(service, monkeypatch):
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    for index in range(MAX_LIVE_ALERTS + 1):
+        await write(service, alert(f"queued-{index}"))
+    held = Gate(service.database.get_alert, after=True)
+    monkeypatch.setattr(service.database, "get_alert", held)
+    action = asyncio.create_task(service.update_alert("queued-0", AlertUpdate(acknowledged=True)))
+    try:
+        await held.wait()
+        await settle(service)
+        assert "queued-0" not in service._pending_alerts
+    finally:
+        held.release.set()
+        response = await asyncio.wait_for(action, timeout=5)
+    await settle(service)
+    assert response is not None
+    assert response.id == "queued-0"
+    assert service.database.get_alert("queued-0").acknowledged is True
+
+
 async def test_alert_lookup_failure_is_unavailable_not_missing(service, monkeypatch):
     def unavailable(*args):
         raise sqlite3.OperationalError("synthetic-private-marker")
@@ -278,6 +314,248 @@ async def test_delayed_incident_refresh_cannot_replace_a_newer_refresh(service, 
         assert service._live_alert(identifier).incident_id == link
         assert service.database.get_alert(identifier).incident_id == link
     assert not service._incident_refreshes
+
+
+@pytest.mark.parametrize("logging_enabled", [True, False], ids=["logging-on", "logging-off"])
+@pytest.mark.parametrize("changes", [{"acknowledged": True}, {}], ids=["patch", "empty"])
+async def test_persisted_only_lookup_cannot_cache_an_older_incident_link(
+    service, monkeypatch, logging_enabled, changes
+):
+    service.database.add_alert(alert(), 100)
+    await service.update_settings(service.settings.model_copy(update={
+        "event_logging_enabled": logging_enabled,
+    }))
+    held = Gate(service.database.get_alert, after=True)
+    monkeypatch.setattr(service.database, "get_alert", held)
+    action = asyncio.create_task(patch_alert("synthetic", AlertUpdate(**changes), request(service)))
+    try:
+        await held.wait()
+        incident = await service.create_incident(IncidentCreate(
+            title="synthetic", severity="WARNING", alert_ids=["synthetic"]
+        ))
+    finally:
+        held.release.set()
+        response = await asyncio.wait_for(action, timeout=5)
+    await settle(service)
+    assert service.database.get_alert("synthetic").incident_id == incident.id
+    assert response.incident_id == incident.id
+    assert (await service.list_alerts())[0].incident_id == incident.id
+
+
+# A queued copy predates any incident committed before its row exists, and a
+# refresh updates only the live copy, which more queued alerts can then evict.
+async def queue_linked_alert_then_evict(service):
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    await write(service, alert("linked"))
+    incident = await service.create_incident(IncidentCreate(
+        title="synthetic", severity="WARNING", alert_ids=["linked"]
+    ))
+    assert service._live_alert("linked").incident_id == incident.id
+    for index in range(MAX_LIVE_ALERTS):
+        await write(service, alert(f"queued-{index}"))
+    assert service._live_alert("linked") is None
+    assert service._pending_alerts["linked"].incident_id is None
+    return incident
+
+
+@pytest.mark.parametrize("changes", [{"acknowledged": True}, {}], ids=["patch", "empty"])
+async def test_restored_queued_alert_keeps_the_committed_incident_link(service, changes):
+    incident = await queue_linked_alert_then_evict(service)
+    response = await patch_alert("linked", AlertUpdate(**changes), request(service))
+    assert response.incident_id == incident.id
+    assert response.persistence_pending is True
+    assert service._live_alert("linked").incident_id == incident.id
+    await settle(service)
+    stored = service.database.get_alert("linked")
+    assert stored.incident_id == incident.id
+    assert stored.acknowledged is bool(changes)
+    listed = {item.id: item for item in await service.list_alerts(500)}
+    assert listed["linked"].incident_id == incident.id
+
+
+async def test_link_lookup_failure_restores_no_queued_alert(service, monkeypatch):
+    await queue_linked_alert_then_evict(service)
+
+    def unavailable(*args):
+        raise sqlite3.OperationalError("synthetic-private-marker")
+
+    monkeypatch.setattr(service.database, "get_alert_incident_ids", unavailable)
+    with pytest.raises(HTTPException) as error:
+        await patch_alert("linked", AlertUpdate(acknowledged=True), request(service))
+    assert error.value.status_code == 503
+    assert "synthetic-private-marker" not in str(error.value.detail)
+    assert service._live_alert("linked") is None
+    assert not service._pending_alert_updates
+
+
+async def test_write_accepted_under_a_newer_queued_copy_keeps_the_committed_link(service):
+    incident = await queue_linked_alert_then_evict(service)
+    queued = service._pending_alerts["linked"]
+    stored = await asyncio.to_thread(service.database.add_alert, queued, 100)
+    service._accept_stored_alert(stored, None)
+    assert service._live_alert("linked").incident_id == incident.id
+    assert service._pending_alerts["linked"] is queued
+
+
+@pytest.mark.parametrize("rule_id", [None, "collection_failure"], ids=["single", "grouped"])
+async def test_reobservation_while_degraded_keeps_the_committed_link(service, rule_id):
+    await write(service, alert(rule_id=rule_id))
+    incident = await service.create_incident(IncidentCreate(
+        title="synthetic", severity="WARNING", alert_ids=["synthetic"]
+    ))
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    await write(service, alert(rule_id=rule_id, explanation="newer"))
+    response = await patch_alert("synthetic", AlertUpdate(acknowledged=True), request(service))
+    assert response.incident_id == incident.id
+    await settle(service)
+    assert service.database.get_alert("synthetic").incident_id == incident.id
+    assert service._live_alert("synthetic").incident_id == incident.id
+
+
+async def linked_stored_alert_reobserved_after_eviction(service):
+    await write(service, alert("linked"))
+    incident = await service.create_incident(IncidentCreate(
+        title="synthetic", severity="WARNING", alert_ids=["linked"]
+    ))
+    for index in range(MAX_LIVE_ALERTS):
+        await write(service, alert(f"newer-{index}"))
+    assert service._live_alert("linked") is None
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    await write(service, alert("linked", explanation="newer"))
+    assert service._live_alert("linked").incident_id is None
+    return incident
+
+
+@pytest.mark.parametrize("changes", [{"acknowledged": True}, {}], ids=["patch", "empty"])
+async def test_reobservation_after_eviction_reconciles_on_patch(service, changes):
+    incident = await linked_stored_alert_reobserved_after_eviction(service)
+    response = await patch_alert("linked", AlertUpdate(**changes), request(service))
+    assert response.incident_id == incident.id
+    assert response.acknowledged is bool(changes)
+    assert service._live_alert("linked").incident_id == incident.id
+    await settle(service)
+    assert service.database.get_alert("linked").incident_id == incident.id
+
+
+async def test_unreadable_link_does_not_block_a_live_alert_patch(service, monkeypatch):
+    await linked_stored_alert_reobserved_after_eviction(service)
+
+    def unavailable(*args):
+        raise sqlite3.OperationalError("synthetic-private-marker")
+
+    monkeypatch.setattr(service.database, "get_alert_incident_ids", unavailable)
+    response = await patch_alert("linked", AlertUpdate(acknowledged=True), request(service))
+    assert response.acknowledged is True
+    assert response.persistence_pending is True
+    assert service._pending_alert_updates["linked"].acknowledged is True
+
+
+# A refresh skips an alert that is not live, so a write that committed before
+# the newer incident must not bring its older link back once that refresh passed.
+async def write_overtaken_by_an_incident(service, monkeypatch, operation, start, *, requeue=False):
+    await write(service, alert("linked"))
+    older = await service.create_incident(IncidentCreate(
+        title="older", severity="WARNING", alert_ids=["linked"]
+    ))
+    held = Gate(getattr(service.database, operation), after=True)
+    monkeypatch.setattr(service.database, operation, held)
+    action = asyncio.create_task(start())
+    try:
+        await held.wait()
+        if requeue:
+            await write(service, alert("linked", explanation="newer"))
+        for index in range(MAX_LIVE_ALERTS):
+            await write(service, alert(f"newer-{index}"))
+        assert service._live_alert("linked") is None
+        newer = await service.create_incident(IncidentCreate(
+            title="newer", severity="WARNING", alert_ids=["linked"]
+        ))
+    finally:
+        held.release.set()
+        await asyncio.wait_for(action, timeout=5)
+    assert service.database.get_alert("linked").incident_id == newer.id
+    assert newer.id != older.id
+    return newer
+
+
+@pytest.mark.parametrize("requeue", [False, True], ids=["evicted", "evicted-and-requeued"])
+async def test_direct_write_cannot_restore_a_link_older_than_an_incident(
+    service, monkeypatch, requeue
+):
+    async def start():
+        await write(service, alert("linked", explanation="in flight"))
+
+    newer = await write_overtaken_by_an_incident(
+        service, monkeypatch, "add_alert", start, requeue=requeue
+    )
+    assert service._live_alert("linked").incident_id == newer.id
+    listed = {item.id: item for item in await service.list_alerts(500)}
+    assert listed["linked"].incident_id == newer.id
+    response = await patch_alert("linked", AlertUpdate(acknowledged=True), request(service))
+    assert response.incident_id == newer.id
+    await settle(service)
+    stored = service.database.get_alert("linked")
+    assert stored.incident_id == newer.id
+    assert stored.acknowledged is True
+    listed = {item.id: item for item in await service.list_alerts(500)}
+    assert listed["linked"].incident_id == newer.id
+
+
+async def test_flush_cannot_restore_a_link_older_than_an_incident(service, monkeypatch):
+    await write(service, alert("linked"))
+    await service.create_incident(IncidentCreate(
+        title="older", severity="WARNING", alert_ids=["linked"]
+    ))
+    service._mark_storage_failure(sqlite3.OperationalError("synthetic"))
+    await write(service, alert("linked", explanation="queued"))
+    held = Gate(service.database.add_alert, after=True)
+    monkeypatch.setattr(service.database, "add_alert", held)
+    action = asyncio.create_task(settle(service))
+    try:
+        await held.wait()
+        # Flushing queued evictors would evict the restored copy too, hiding its link.
+        service.live_alerts.clear()
+        newer = await service.create_incident(IncidentCreate(
+            title="newer", severity="WARNING", alert_ids=["linked"]
+        ))
+    finally:
+        held.release.set()
+        await asyncio.wait_for(action, timeout=5)
+    assert service.database.get_alert("linked").incident_id == newer.id
+    assert service._live_alert("linked").incident_id == newer.id
+
+
+async def test_patch_write_cannot_restore_a_link_older_than_an_incident(service, monkeypatch):
+    async def start():
+        return await patch_alert("linked", AlertUpdate(acknowledged=True), request(service))
+
+    newer = await write_overtaken_by_an_incident(service, monkeypatch, "update_alert", start)
+    assert service._live_alert("linked").incident_id == newer.id
+    listed = {item.id: item for item in await service.list_alerts(500)}
+    assert listed["linked"].incident_id == newer.id
+
+
+async def test_failed_link_reconcile_keeps_the_committed_write(service, monkeypatch):
+    await write(service, alert("linked"))
+    held = Gate(service.database.add_alert, after=True)
+    monkeypatch.setattr(service.database, "add_alert", held)
+    action = asyncio.create_task(write(service, alert("linked", explanation="in flight")))
+    try:
+        await held.wait()
+        incident = await service.create_incident(IncidentCreate(
+            title="synthetic", severity="WARNING", alert_ids=["linked"]
+        ))
+
+        def unavailable(*args):
+            raise sqlite3.OperationalError("synthetic-private-marker")
+
+        monkeypatch.setattr(service.database, "get_alert_incident_ids", unavailable)
+    finally:
+        held.release.set()
+        await asyncio.wait_for(action, timeout=5)
+    assert service.storage.persistence_available is False
+    assert "linked" not in service._pending_alerts
+    assert service.database.get_alert("linked").incident_id == incident.id
 
 
 # F4: cancellation propagates to the caller, but must not abandon reconciliation.
