@@ -376,6 +376,92 @@ rule 2. The 14th, replacing the snapshot's refresh with `self.storage`, changed 
 because `self.storage` is now kept current. The line stays as the original source of
 `pending_writes`.
 
+## Persistence and privacy follow-up (F1-F4)
+
+Recovered the interrupted local session at `1efd488b4c75581ec4cc9d783df2e9bda06f238e`
+on `feat/v3-resilience-hardening`. The only uncommitted work was the 875-line
+`tests/test_v3_persistence_races.py`; there were no tracked implementation edits or
+untracked scratch scripts. Existing ignored artifacts included older pytest XML,
+test directories and environments; they were preserved. A fresh run of the original
+suite confirmed 515 passed, 0 failed and 0 skipped on Windows / Python 3.11.9.
+
+The first targeted run exposed an unbounded wait for operator replay, which did not
+exist yet. It was stopped; a run excluding that one case completed with 41 failed,
+12 passed and 1 deselected. The failures included missing patch-queue helpers that
+the interrupted test-first implementation had not supplied, as well as these
+observable defects, all using synthetic records:
+
+| Finding | Reproduction at the recovered HEAD | Root cause and correction |
+| --- | --- | --- |
+| F1, high: logging opt-out race | A held event write fails after a saved opt-out; recovery stores the event. A paired event also starts after its alert's in-flight write crosses the opt-out. | Persistence entry points and flushes did not enforce the setting themselves. They now check it before dispatch, discard queues when loading a saved opt-out, and use an opt-out generation to prevent failed writes or old operator audit events from reviving after an off/on toggle. Failures still degrade storage and report only the error category. |
+| F2, medium: incident relationship regression | An operator change overlaps the first alert write, an incident links the row, then reconciliation overwrites its `incident_id` with `None`. | Operator replay wrote a stale whole alert. State now replays through `Database.update_alert`, which only changes the requested booleans. Observation writes preserve the stored relationship, or recover a link from incident membership if the incident predates the alert row. Creating an incident also updates the live copy. |
+| F3, medium: grouped double count | Acknowledge or dismiss during one grouped write produces a stored count of 2 for one occurrence; an update to a queued occurrence can produce 3 instead of 2. | Operator reconciliation reused the additive observation path. Only observation deltas now reach `add_alert`. A delta committed during a flush is subtracted from any newer aggregate still queued, so the next pass writes only unwritten occurrences. Concurrent flushes and state patches share an async write lock. |
+| F4, medium: grouped boolean reversals | An explicit `False` update fails during an outage and returns as `True` after recovery. | Boolean OR merged stale records, and changes made while already degraded had no replay path. A bounded state-patch queue now preserves explicit `True` and `False`, merges partial changes in order, and removes only the patch version successfully attempted. Grouped observations retain stored operator state; reopening queues an explicit reset before later operator decisions. |
+
+`Database.add_alert` now uses `BEGIN IMMEDIATE` around the relationship lookup,
+grouped read, upsert and retention. A zero-timeout second connection demonstrated
+that the old grouped read allowed an intervening link write; the regression now
+requires the write lock. Exceptions roll back the transaction. Malformed incident
+membership JSON is ignored by this lookup without decoding unrelated incidents.
+No schema migration or REST/WebSocket model change was introduced.
+
+Additional deterministic regressions cover an observation queued during operator
+replay, chronological recovery after a failed first write, rejection with a live
+operator decision, and the existing empty-update lookup contract. History opt-outs
+also discard waiting batches and prevent baseline follow-up after an in-flight batch
+crosses the opt-out; enabling history again does not revive discarded samples.
+Already-dispatched database work is allowed to complete.
+
+All 54 recovered test cases were retained. Their event barriers now have bounded
+waits. One assertion incorrectly counted only the operator patch while audit and
+recovery events were also pending; it now includes those events. Older tests in
+`test_v3_operator_state.py` and `test_v3_queue_capacity.py` were updated to inspect
+partial state patches. Rejection-identity tests now supply an actual newer observation,
+because changing acknowledgement cannot repair an invalid observation. Their
+rejection, persisted-state and queue-capacity assertions remain; an added test checks
+that a rejected observation still keeps the operator decision in the live view.
+
+The new file has 60 passing cases: all 54 recovered cases plus six edge cases.
+The previous grouped-count limitation below is resolved for operator replay and
+normal transactional retries. These changes do not provide a durable retry journal:
+pending observations and patches are still bounded memory, and process termination
+can lose them. Patch evictions use the existing dropped-alert-write counter; each
+of the alert, event and operator-patch queues has its own 500-entry limit. Unlinked
+observations inspect incident membership lists; cost on very large incident archives
+has not been benchmarked. Historical counts or relationships corrupted before this
+fix are not rewritten automatically.
+
+Final local validation on Windows / Python 3.11.9:
+
+| Check | Result |
+| --- | --- |
+| Original suite, excluding the recovered test file | 515 passed, 0 failed, 0 skipped |
+| Targeted persistence/privacy races | 60 passed, 0 failed, 0 skipped |
+| Full Python suite | 575 passed, 0 failed, 0 skipped |
+| Explicit database/privacy regression subset | 124 passed, 0 failed, 0 skipped |
+| Desktop and mobile Chromium | 17 passed, 0 failed, 0 skipped |
+| Ruff (`python -m ruff check .`) | Passed |
+| Compilation (`python -m compileall -q app scripts tests`) | Passed |
+| JavaScript syntax (`node --check`) | 8 files passed |
+| Public inventory / existing sensitive-payload scanner | 114 files passed; MIT License and approved demo screenshot included; no historical concept images |
+| Whitespace validation (`git diff --check`) | Passed |
+
+All pytest runs used distinct workspace-local `--basetemp` directories, avoiding the
+previous system temporary-directory permission problem. The database/privacy subset
+ran `test_database`, `test_v3_history`, `test_v3_hardening`, `test_v3_p0`,
+`test_v3_redaction_cuts`, `test_v3_queue_opt_out`, `test_v3_write_classification`,
+`test_v3_file_integrity` and `test_websocket`. The full suite also covered migration,
+rollback, retention, integrity, release packaging and other privacy regressions.
+The full suite and subset each emitted one existing Starlette/httpx TestClient
+deprecation warning. Chromium used the existing loopback-only synthetic server;
+its 17 cases do not validate real system telemetry. Other Python versions and hosted
+CI were not run for this follow-up. No frontend source, production V2, license,
+network-binding, Host/Origin, WebSocket-origin or local-only AI configuration changed.
+
+These fixes are suitable for further review in draft PR #7, subject to the documented
+limitations and hosted CI after a separately approved push. This takeover made no
+remote requests, push, merge, release or PR-state changes.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -426,8 +512,9 @@ These come from code review and have not been reproduced, unless noted.
 - `history_dropped_samples` is counted but not shown by `/api/health`.
 - An update saved by the next pass after a first write is lost if the process stops
   first. The queue is memory only.
-- Writing a grouped alert again adds its count again, so a retry after a race or outage
-  can inflate `occurrence_count`.
+- `Database.add_alert` accepts observation deltas. Calling it again for an observation
+  that already committed counts another occurrence; callers must not replay committed
+  observations as operator updates. The service now keeps those paths separate.
 - An update to a record that was rejected stays in the live view only.
 - The storage failure alert keeps `persistence_pending` set although it is never queued.
 - An in-flight write finishes after an opt-out, and discarded queue entries are gone.
