@@ -462,6 +462,79 @@ These fixes are suitable for further review in draft PR #7, subject to the docum
 limitations and hosted CI after a separately approved push. This takeover made no
 remote requests, push, merge, release or PR-state changes.
 
+## Final reproduced race gaps
+
+Follow-up at `d9f58432ef0764707d96371dcb743650af0a4dc0`. A read-only review
+found schedules missing from the earlier 60-case persistence suite. These are the
+four findings numbered F1-F4 in the final review; their numbering differs from the
+earlier audit above. No existing regression tests were removed or weakened.
+
+`tests/test_v3_final_races.py` holds database operations before execution or after
+their real read/commit with bounded thread/async events. At the original HEAD, the
+first 20 valid cases produced **17 failed, 3 passed**, including all four reported
+defects. The passing cases protected ordinary idle/missing responses and rollback.
+An initial configuration test used an unknown model field; it was corrected to the
+validated `cooldown_seconds` field before recording that red result. Additional
+coverage brought the new file to 26 cases.
+
+| Finding | Reproduction before correction | Correction |
+| --- | --- | --- |
+| F1: stale settings recovery | Hold a recovery read of logging ON, save OFF, then release it. Runtime becomes ON while SQLite remains OFF, allowing new events. ON and OFF/ON schedules also restore stale unrelated thresholds. | Each settings model has a save generation. Recovery applies a whole loaded model only if no newer successful save occurred during its read. All six configuration models use this guard; failed saves do not advance it. There is no lock held across settings I/O. |
+| F2: false 404 for an existing alert | An alert exists only in SQLite. While an unrelated write owns the persistence lock, PATCH returns 404 although its queued change later persists. | Resolve an absent live record through SQLite before modifying/queuing it. Merge any newer live state and pending patch after the lookup, then return a real record with the requested state. Missing records remain 404 without a phantom patch. Lookup failures return a sanitized 503. With logging OFF, an existing stored record can be updated in live memory without persisting the change. |
+| F3: stale incident API relationship | Incident A commits but its completion is held. B commits and becomes the stored relationship; A then restores its older ID in live state. Acknowledgement continues returning that old link. | After incident creation, read committed alert relationships instead of publishing the operation's own ID. A transient per-alert refresh token prevents an older lookup from replacing a newer result, including overlapping refreshes for different alerts. Normal alert reconciliation accepts the database link unless live state actually changed during the write. Both incident history records remain intact. |
+| F4: cancelled recovery double count | A grouped write is dispatched, `stop()` cancels its producer, the thread commits, then `start()` retries the unreconciled delta: count 1 becomes 2 without another observation. | One service-owned task holds the existing alert persistence lock across the database operation and queue reconciliation. Callers await it through `asyncio.shield`; caller cancellation still propagates immediately. Stop/start cannot dispatch a competing retry while the owner is pending. Successful commits remove their delta; failures retain retryable work. |
+
+Cancellation coverage includes restart before and after the held operation finishes,
+both successful commit and rollback, a genuinely new occurrence, cancellation of a
+first write, and a newer explicit Boolean reversal during a cancelled operator patch.
+Workers and collection are synthetic, and stop remains bounded while the held write
+is unfinished. The owner task's callback retrieves unexpected errors and reports only
+their type through the existing storage-health path.
+
+Two additional tests protect concurrent incident refreshes, with overlapping and
+disjoint alert IDs. Lookup privacy coverage also caught an OFF/ON transition during
+the new persisted-alert lookup: an operator request started before opt-out must not
+queue its old patch after logging returns. That case failed before the generation
+check was added. No new event or alert contents are logged.
+
+The incident lookup reuses the existing membership fallback for incidents created
+before their alert row. Its batch read uses a single SQLite read transaction;
+`add_alert` retains its `BEGIN IMMEDIATE` transaction for grouped writes, links and
+retention. No schema migration, durable journal, frontend change or unrelated
+persistence subsystem was introduced.
+
+Final validation on Windows / Python 3.11.9:
+
+| Check | Result |
+| --- | --- |
+| New final-race regressions | 26 passed, 0 failed, 0 skipped |
+| Related persistence, lifecycle, service and storage regressions | 228 passed, 0 failed, 0 skipped |
+| Full Python suite | 601 passed, 0 failed, 0 skipped |
+| Explicit database/privacy regression subset | 124 passed, 0 failed, 0 skipped |
+| Desktop/mobile Chromium | 17 passed, 0 failed, 0 skipped |
+| Ruff | Passed |
+| Python compilation (`app scripts tests`) | Passed |
+| JavaScript syntax | 8 files passed |
+| Sensitive-payload scan / public inventory | 115 files passed; MIT License and approved demo screenshot retained |
+| Whitespace validation | Passed |
+
+All pytest runs used distinct accessible workspace-local `--basetemp` directories.
+The full suite, related suite and database/privacy subset each reported one existing
+Starlette/httpx TestClient deprecation warning. Chromium used the existing synthetic
+loopback server. Hosted CI and other Python versions have not run on these changes.
+
+Limits: queues and operation ownership remain in memory. Abrupt process termination
+can still lose queued work; this does not provide durable exactly-once ingestion.
+An already-dispatched transaction can finish after stop or opt-out. Stop does not wait
+indefinitely for it: reconciliation continues while the same event loop is alive,
+and a later start on that service respects the active owner. Historical incorrect
+counts/links are not repaired automatically. A failed post-commit incident refresh
+returns 503 explicitly stating that the incident was persisted; blindly retrying
+creation can create another incident. Large incident archives remain unbenchmarked.
+
+This follow-up is local only. PR #7 remains draft and unmerged by instruction; no
+remote operation, push, PR mutation or production V2 change is part of this work.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
