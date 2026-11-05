@@ -151,6 +151,8 @@ class TelemetryService:
         self._logging_generation = 0
         self._history_generation = 0
         self._configuration_generations: dict[str, int] = {}
+        self._incident_refresh_sequence = 0
+        self._incident_refreshes: dict[str, int] = {}
         self._storage_retry_seconds = storage_retry_seconds
         self._next_storage_retry = 0.0
         self._persisted_state_missing = False
@@ -1081,7 +1083,13 @@ class TelemetryService:
                 if stored.rule_id == "collection_failure" else pending
             )
         if current is not None:
-            changes: dict[str, Any] = {"incident_id": current.incident_id or stored.incident_id}
+            before_link = before.incident_id if before is not None else None
+            changes: dict[str, Any] = {
+                "incident_id": (
+                    current.incident_id if current.incident_id != before_link
+                    else stored.incident_id
+                )
+            }
             if current is not before:
                 changes.update(acknowledged=current.acknowledged, dismissed=current.dismissed)
             result = result.model_copy(update=changes)
@@ -1935,12 +1943,7 @@ class TelemetryService:
         except Exception as exc:
             self._mark_storage_failure(exc)
             raise StorageUnavailableError("Incident was not persisted") from exc
-        for alert_id in incident.related_alerts:
-            current = self._live_alert(alert_id)
-            if current is not None:
-                self._remember_live_alert(
-                    current.model_copy(update={"incident_id": incident.id}), authoritative=True
-                )
+        await self._refresh_incident_links(incident.related_alerts)
         await self.record_event(
             "incident_created",
             "HIGH" if incident.severity != "INFO" else "LOW",
@@ -1950,6 +1953,33 @@ class TelemetryService:
             {"alert_count": len(incident.related_alerts)},
         )
         return incident
+
+    async def _refresh_incident_links(self, alert_ids: list[str]) -> None:
+        # Completion order is not commit order. Read committed relationships,
+        # and fence each alert against a newer refresh while this read awaits.
+        self._incident_refresh_sequence += 1
+        sequence = self._incident_refresh_sequence
+        for alert_id in alert_ids:
+            self._incident_refreshes[alert_id] = sequence
+        try:
+            links = await asyncio.to_thread(self.database.get_alert_incident_ids, alert_ids)
+            for alert_id, incident_id in links.items():
+                if self._incident_refreshes.get(alert_id) != sequence:
+                    continue
+                current = self._live_alert(alert_id)
+                if current is not None:
+                    self._remember_live_alert(
+                        current.model_copy(update={"incident_id": incident_id}), authoritative=True
+                    )
+        except Exception as exc:
+            self._mark_storage_failure(exc)
+            raise StorageUnavailableError(
+                "Incident was persisted; alert relationships could not be refreshed"
+            ) from exc
+        finally:
+            for alert_id in alert_ids:
+                if self._incident_refreshes.get(alert_id) == sequence:
+                    del self._incident_refreshes[alert_id]
 
     async def list_incidents(self) -> list[Incident]:
         if not self.storage.persistence_available:

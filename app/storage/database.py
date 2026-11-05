@@ -720,18 +720,11 @@ class Database:
             ).fetchone()
             # Incident writes own this relationship. Observations can be stale,
             # or the incident may have been created before this row existed.
-            incident_id = row["incident_id"] if row is not None else None
+            incident_id = self._incident_for_alert(
+                connection, alert.id, row["incident_id"] if row is not None else None
+            )
             if incident_id is None:
-                incident = connection.execute(
-                    """SELECT id FROM incidents WHERE EXISTS (
-                        SELECT 1 FROM json_each(
-                            CASE WHEN json_valid(related_alerts)
-                            THEN related_alerts ELSE '[]' END
-                        ) WHERE value = ?
-                    ) ORDER BY rowid DESC LIMIT 1""",
-                    (alert.id,),
-                ).fetchone()
-                incident_id = incident["id"] if incident is not None else alert.incident_id
+                incident_id = alert.incident_id
             stored = alert.model_copy(update={"incident_id": incident_id})
             if alert.rule_id == "collection_failure":
                 if row is not None:
@@ -813,6 +806,36 @@ class Database:
             )
             self._enforce_retention(connection, retention)
         return stored
+
+    @staticmethod
+    def _incident_for_alert(
+        connection: sqlite3.Connection, alert_id: str, stored_id: str | None
+    ) -> str | None:
+        if stored_id is not None:
+            return stored_id
+        incident = connection.execute(
+            """SELECT id FROM incidents WHERE EXISTS (
+                SELECT 1 FROM json_each(
+                    CASE WHEN json_valid(related_alerts)
+                    THEN related_alerts ELSE '[]' END
+                ) WHERE value = ?
+            ) ORDER BY rowid DESC LIMIT 1""",
+            (alert_id,),
+        ).fetchone()
+        return incident["id"] if incident is not None else None
+
+    def get_alert_incident_ids(self, alert_ids: list[str]) -> dict[str, str | None]:
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN")
+            links = {}
+            for alert_id in alert_ids:
+                row = connection.execute(
+                    "SELECT incident_id FROM alerts WHERE id = ?", (alert_id,)
+                ).fetchone()
+                links[alert_id] = self._incident_for_alert(
+                    connection, alert_id, row["incident_id"] if row is not None else None
+                )
+        return links
 
     def enforce_retention(self, retention: int) -> None:
         with self._lock, self._connect() as connection:
