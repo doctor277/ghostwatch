@@ -498,8 +498,11 @@ function renderSnapshot(snapshot) {
   const unavailable = [...new Set([...(system.unavailable_metrics || []), ...(network.unavailable_metrics || [])])];
   text("#availability-note", unavailable.length ? `Unavailable: ${unavailable.join(", ")}` : "All primary metrics available.");
   const storage = snapshot.storage || {};
-  text("#storage-status", `STORAGE ${String(storage.status || "unknown").toUpperCase()}`);
-  $("#storage-status").className = storage.persistence_available ? "status-good" : "status-warning";
+  const droppedWrites = (storage.dropped_alert_writes || 0) + (storage.dropped_event_writes || 0);
+  const droppedNote = droppedWrites ? ` · ${droppedWrites} WRITES DROPPED` : "";
+  text("#storage-status", `STORAGE ${String(storage.status || "unknown").toUpperCase()}${droppedNote}`);
+  $("#storage-status").className = storage.persistence_available && !droppedWrites ? "status-good" : "status-warning";
+  $("#storage-status").title = droppedWrites ? "Queued writes dropped at capacity since GhostWatch started" : "";
 
   renderRanks(snapshot.connection_rankings);
   renderConnections();

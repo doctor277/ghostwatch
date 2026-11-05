@@ -181,6 +181,22 @@ test("degraded telemetry replaces CONNECTED and clears on a valid snapshot", asy
   expect(backend.state.sockets.length).toBe(socketCount);
 });
 
+test("dropped writes stay visible while storage is healthy", async ({ page }) => {
+  const status = page.locator("#storage-status");
+  await expect(status).toHaveText("STORAGE HEALTHY");
+  backend.state.snapshot.storage = {
+    ...backend.state.snapshot.storage,
+    status: "healthy",
+    persistence_available: true,
+    dropped_alert_writes: 2,
+    dropped_event_writes: 3,
+  };
+  backend.sendSnapshot();
+  await expect(status).toHaveText("STORAGE HEALTHY · 5 WRITES DROPPED");
+  await expect(status).toHaveClass("status-warning");
+  await expect(status).toHaveAttribute("title", /since GhostWatch started/);
+});
+
 test("frontend presents a safe settings persistence failure", async ({ page }) => {
   await page.locator('[data-view="settings"]').click();
   backend.failNext("PUT", "/api/settings");

@@ -42,6 +42,15 @@ for push. No changes to production V2.
   passed on three consecutive runs, 16 Playwright tests passed against the synthetic
   server, Ruff and compilation passed. Hosted CI has not run on this change, and
   Python 3.13 is not installed locally.
+- VERIFIED: hosted run
+  [41961326980](https://github.com/doctor277/ghostwatch/actions/runs/41961326980) at
+  `277571b`: Python 3.11.9 and 3.13.17 each 487 collected and 487 passed, Chromium 16
+  passed, 15 desktop and 1 mobile, with Ruff, compilation and JavaScript syntax passing.
+  Counts are from the job logs. This supersedes the note above that hosted CI had not
+  run on the data-integrity review.
+- VERIFIED LOCALLY: queue capacity below, Python 3.11.9 on Windows: 515 pytest passed,
+  17 Playwright tests passed against the synthetic server, Ruff, compilation and
+  JavaScript syntax passed. Hosted CI has not run on this change.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -317,6 +326,56 @@ Two mutation runs ended with exit code 1 and no pytest summary or stderr, and th
 was not found. Neither repeated: 8 unmodified runs and 8 runs of one affected mutant all
 completed with a summary, with `faulthandler` on.
 
+## Queue capacity
+
+`MAX_PENDING_WRITES` limits the alert queue and the event queue to 500 entries each.
+`_queue_pending` is the only path that evicts on capacity. It removed the oldest entry
+silently, so a long outage lost writes with no record. Reproduced at `277571b`:
+
+| Input at `277571b` | Effect |
+| --- | --- |
+| More than 500 queued alerts or events | Oldest entries dropped with no count or log |
+| Evicted alert | Live copy kept `persistence_pending` set for a write that would never run |
+| Entry evicted while its write was running | Could be stored after being treated as lost |
+| Storage recovery with a full event queue | The recovery notice evicted a queued telemetry event |
+| `pending_writes` in `/api/health` during an outage | Stale until the next storage transition |
+
+The fixes:
+
+- `StorageHealth` gains additive `dropped_alert_writes` and `dropped_event_writes`, shown
+  by `/api/health` and the telemetry snapshot. They survive storage transitions, so a
+  loss stays visible after recovery while `status` returns to `healthy`.
+- The dashboard adds the total to the storage status and shows it as a warning, so
+  `STORAGE HEALTHY` is not shown in green after data was lost.
+- Each eviction is counted once, per queue. Replacing a queued record is not an eviction.
+- The entry being written is never evicted. The next oldest entry goes instead, and the
+  500 entry limit still holds.
+- An evicted alert clears `persistence_pending` on its live copy.
+- The recovery notice is not queued into a full queue. It stays in live memory, so a
+  housekeeping event cannot cost telemetry.
+- `pending_writes` is refreshed whenever a queue changes or is discarded.
+- A warning is logged for the first drop and every 100th, per queue. It holds counts only,
+  never identifiers or record content.
+
+Counted separately: rejected records stay in `rejected_writes`. Writes discarded by a
+saved logging opt-out are not counted, because that is the operator's choice and not
+loss, and opted-out writes never reach the queue.
+
+The counts are held in memory and reset to 0 when the process starts. Earlier loss is not
+reported after a restart. They count evictions, not records that are permanently missing:
+an alert queued again after eviction is a new write, and it counts again if it is evicted.
+
+Regression tests are in `tests/test_v3_queue_capacity.py`, 28 tests, and one Playwright
+test covers the dashboard. All 24 tests in the first version failed before the fix, and
+the Playwright test failed against the old dashboard. Writes in progress are held open
+with events, not timing. Mutation checks reverted 14 changes: removing the alert count
+failed 15, the event count 7, the in-flight guard 2, the alert and event write slots 1
+each, clearing those slots 1 each, the pending flag 1, the queue refresh 11, the discard
+refresh 1, keeping counts across transitions 3, the log bound 1 and the recovery notice
+rule 2. The 14th, replacing the snapshot's refresh with `self.storage`, changed nothing,
+because `self.storage` is now kept current. The line stays as the original source of
+`pending_writes`.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -358,9 +417,13 @@ These come from code review and have not been reproduced, unless noted.
 - `Alert` construction in `app/detection/engine.py` is not covered by the per-alert guard
   in `collect_once`. Its values come from rule definitions.
 - One record that keeps failing with an unexpected error blocks the queue behind it.
-  Storage stays degraded and retries, so this is visible. The queue holds 500 entries,
-  and the oldest are evicted without a count, leaving `persistence_pending` set on the
-  evicted alert's live copy.
+  Storage stays degraded and retries, so this is visible. Past 500 entries the oldest
+  are evicted and counted, but which records were lost is not reported.
+- Dropped write counts reset on restart, and they are not stored, so an operator who
+  restarts during an outage loses that evidence.
+- An update to an evicted alert reaches the database only if its row already exists.
+- The storage recovery notice is not stored when the event queue is full.
+- `history_dropped_samples` is counted but not shown by `/api/health`.
 - An update saved by the next pass after a first write is lost if the process stops
   first. The queue is memory only.
 - Writing a grouped alert again adds its count again, so a retry after a race or outage

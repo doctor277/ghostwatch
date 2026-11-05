@@ -63,6 +63,7 @@ from app.time_utils import as_utc
 
 LOGGER = logging.getLogger(__name__)
 MAX_PENDING_WRITES = 500
+DROP_LOG_INTERVAL = 100
 MAX_LIVE_EVENTS = 1000
 SNAPSHOT_DEGRADED_FRAME = '{"type":"telemetry_degraded","reason":"snapshot_unavailable"}'
 
@@ -127,6 +128,10 @@ class TelemetryService:
         )
         self.history_dropped_samples = 0
         self.rejected_writes = 0
+        self.dropped_alert_writes = 0
+        self.dropped_event_writes = 0
+        self._writing_alert: str | None = None
+        self._writing_event: str | None = None
         self._history_writes = 0
         self._windows_cursors: dict[str, int] = {}
         self._windows_seen: OrderedDict[str, None] = OrderedDict()
@@ -812,12 +817,7 @@ class TelemetryService:
                     getattr(self.network_collector, "recently_closed", [])
                 )[:100],
                 baselines=baselines,
-                storage=self.storage.model_copy(
-                    update={
-                        "pending_writes": len(self._pending_alerts)
-                        + len(self._pending_events)
-                    }
-                ),
+                storage=self.storage.model_copy(update=self._queue_health()),
                 collection_duration_ms=round(duration_ms, 2),
                 process_collection_status=process_status,  # type: ignore[arg-type]
                 process_collection_detail=process_detail,
@@ -917,7 +917,7 @@ class TelemetryService:
         self.storage = StorageHealth(
             status="degraded",
             persistence_available=False,
-            pending_writes=len(self._pending_alerts) + len(self._pending_events),
+            **self._queue_health(),
             last_success=self.storage.last_success,
             last_error_type=error_type,
             schema_version=self.storage.schema_version,
@@ -945,7 +945,7 @@ class TelemetryService:
         self.storage = StorageHealth(
             status="healthy",
             persistence_available=True,
-            pending_writes=len(self._pending_alerts) + len(self._pending_events),
+            **self._queue_health(),
             last_success=datetime.now(UTC),
             last_error_type=None,
             schema_version=version or self.storage.schema_version,
@@ -960,17 +960,42 @@ class TelemetryService:
                 summary="Queued bounded alert and event writes are being reconciled.",
             )
             self._remember_event(event)
-            if self.settings.event_logging_enabled:
+            # A full queue keeps its telemetry, so this notice stays in live memory.
+            if self.settings.event_logging_enabled and len(self._pending_events) < MAX_PENDING_WRITES:
                 self._queue_pending(self._pending_events, event.id, event)
 
-    @staticmethod
+    def _queue_health(self) -> dict[str, int]:
+        return {
+            "pending_writes": len(self._pending_alerts) + len(self._pending_events),
+            "dropped_alert_writes": self.dropped_alert_writes,
+            "dropped_event_writes": self.dropped_event_writes,
+        }
+
     def _queue_pending(
-        queue: OrderedDict[str, Any], key: str, value: Any
+        self, queue: OrderedDict[str, Any], key: str, value: Any
     ) -> None:
         queue[key] = value
         queue.move_to_end(key)
         while len(queue) > MAX_PENDING_WRITES:
-            queue.popitem(last=False)
+            self._evict_oldest(queue)
+        self.storage = self.storage.model_copy(update=self._queue_health())
+
+    def _evict_oldest(self, queue: OrderedDict[str, Any]) -> None:
+        alerts = queue is self._pending_alerts
+        writing = self._writing_alert if alerts else self._writing_event
+        # A record being written may still be stored, so it is not lost yet.
+        key = next(item for item in queue if item != writing)
+        del queue[key]
+        if alerts:
+            self.dropped_alert_writes += 1
+            self._clear_pending_flag(key)
+            count = self.dropped_alert_writes
+        else:
+            self.dropped_event_writes += 1
+            count = self.dropped_event_writes
+        if count == 1 or count % DROP_LOG_INTERVAL == 0:
+            kind = "alert" if alerts else "event"
+            LOGGER.warning("Pending %s queue is full; %d writes dropped", kind, count)
 
     def _live_alert(self, alert_id: str) -> Alert | None:
         return next((item for item in self.live_alerts if item.id == alert_id), None)
@@ -1047,6 +1072,9 @@ class TelemetryService:
     def _reject_queued_alert(self, alert_id: str, exc: Exception) -> None:
         self._pending_alerts.pop(alert_id, None)
         self._reject_write(exc)
+        self._clear_pending_flag(alert_id)
+
+    def _clear_pending_flag(self, alert_id: str) -> None:
         for index, alert in enumerate(self.live_alerts):
             if alert.id == alert_id:
                 self.live_alerts[index] = alert.model_copy(update={"persistence_pending": False})
@@ -1089,6 +1117,7 @@ class TelemetryService:
                 self.live_alerts[index] = alert.model_copy(
                     update={"persistence_pending": False}
                 )
+        self.storage = self.storage.model_copy(update=self._queue_health())
 
     async def _flush_pending(self) -> None:
         if not self.storage.persistence_available:
@@ -1098,6 +1127,7 @@ class TelemetryService:
             alert = self._pending_alerts.get(alert_id)
             if alert is None:
                 continue
+            self._writing_alert = alert_id
             try:
                 clean = alert.model_copy(update={"persistence_pending": False})
                 stored = await asyncio.to_thread(
@@ -1111,6 +1141,8 @@ class TelemetryService:
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 return
+            finally:
+                self._writing_alert = None
             if self._pending_alerts.get(alert_id) is not alert:
                 # An operator update arrived during the write; the next pass saves it.
                 continue
@@ -1120,6 +1152,7 @@ class TelemetryService:
             event = self._pending_events.get(event_id)
             if event is None:
                 continue
+            self._writing_event = event_id
             try:
                 await asyncio.to_thread(self.database.add_event, event)
             except InvalidRecordError as exc:
@@ -1129,6 +1162,8 @@ class TelemetryService:
             except Exception as exc:
                 self._mark_storage_failure(exc)
                 return
+            finally:
+                self._writing_event = None
             self._pending_events.pop(event_id, None)
         self._mark_storage_success()
 

@@ -394,6 +394,9 @@ class StorageHealth(BaseModel):
     status: Literal["healthy", "degraded", "recovering"] = "healthy"
     persistence_available: bool = True
     pending_writes: int = 0
+    # Queued writes evicted at capacity since this process started.
+    dropped_alert_writes: int = 0
+    dropped_event_writes: int = 0
     last_success: datetime | None = None
     last_error_type: str | None = None
     schema_version: int | None = None
