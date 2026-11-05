@@ -33,6 +33,15 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: pre-push review fixes below, Python 3.11.9 on Windows: 403 pytest
   passed, 16 Playwright tests passed against the synthetic server, Ruff and compilation
   passed. Hosted CI has not run on this change.
+- VERIFIED: hosted run
+  [41956814091](https://github.com/doctor277/ghostwatch/actions/runs/41956814091) at
+  `8a233a4`: Python 3.11.9 and 3.13.17 each 403 collected and 403 passed, Chromium 16
+  passed, with Ruff, compilation and JavaScript syntax passing. Counts are from the job
+  logs.
+- VERIFIED LOCALLY: data-integrity review below, Python 3.11.9 on Windows: 487 pytest
+  passed on three consecutive runs, 16 Playwright tests passed against the synthetic
+  server, Ruff and compilation passed. Hosted CI has not run on this change, and
+  Python 3.13 is not installed locally.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -246,6 +255,68 @@ charging 1, the text budget 3, shallow dataclass reading 3, shallow model readin
 refusing other iterables 2, set sorting 1, failure isolation 2, the top-level mapping 2,
 cycle detection 1, the early cut 1 and the redaction rule 11.
 
+## Data-integrity review
+
+Reproduced at `8a233a4` with synthetic data. The rejection path above treated
+`TypeError`, `ValueError` and `OverflowError` from a write as a bad record, and this
+section replaces that part of it.
+
+| Input at `8a233a4` | Effect |
+| --- | --- |
+| `TypeError` from `_enforce_retention`, three writes | 0 stored, 3 counted as rejected, storage `healthy` |
+| One corrupt stored `timestamp` on a grouped alert | New telemetry rejected as invalid, storage `healthy`. The `ValueError` came from reading the old row |
+| Newer update while an old queued version was rejected | Newer version deleted from the queue, so it never reached the database |
+| Update to a later record during a flush | A stale copy taken before the update was written first |
+| Update during a successful first write | Lost in memory and in the database after the API reported success |
+| Update during a failing first write | The retry wrote the old version over it, in memory and in the database |
+| Update to a grouped alert during an outage | Lost when the queued write ran, because grouped writes ignored its state |
+| Queued writes when logging was saved as off | Stored on the next pass |
+| Storage recovery after logging was saved as off | Recovery event stored |
+| Failed alert update after logging was saved as off | Whole alert queued for storage |
+
+The fixes:
+
+- `add_alert` and `add_event` check a record before it reaches SQLite. A timestamp, text,
+  integer, evidence value or column type that can never be stored raises
+  `InvalidRecordError`, and its message holds no record content.
+- Only `InvalidRecordError` rejects a record. Every other exception degrades storage and
+  keeps the record queued, so an unexpected failure is visible and loses nothing. An
+  invalid record queued during an outage is rejected once, and the queue continues.
+- A flush reads each entry when it reaches it, and rejects only the version it attempted.
+- A first write detects an update that arrived during it and queues the result for the
+  next pass. Failed writes queue the live acknowledge and dismiss state.
+- Grouped writes keep state carried by the incoming record. A reopened condition still
+  clears it.
+- A saved opt-out discards queued writes, even if follow-up maintenance fails. A flush in
+  progress stops at the next record, and later failures do not queue anything. The
+  recovery event stays in live memory.
+
+The Windows event and file integrity paths needed no change. `EventRecord` validation did
+not fail for any value their collectors can produce. A `ValidationError` needed a lone
+surrogate in a bounded `WindowsEventRecord` field, which the XML parser cannot return, and
+was raised building that record, not by the service. `uuid5` raises only for a surrogate
+in an ID, and IDs come from three fixed channel names and an integer, or from a UUID.
+Both workers already survive a failed pass, and tests now pin this.
+
+Regression tests are in `tests/test_v3_write_classification.py`,
+`tests/test_v3_operator_state.py`, `tests/test_v3_queue_opt_out.py` and
+`tests/test_v3_worker_alerts.py`. Races are held open with events around the database
+write, not timing. Three tests in `tests/test_v3_alert_bounds.py` asserted the old
+classification by raising built-in errors, so they now raise `InvalidRecordError`. One
+of them covered three error types, which is why the 403 cases became 401 before the 86
+new ones.
+
+Mutation checks reverted 18 changes and at least one test failed for each: restoring the
+broad catch failed 11, and the integer, text, column type, timestamp type, timestamp
+value and evidence checks failed 5, 7, 3, 3, 8 and 7. The rejection identity check failed
+3, reading the newest alert 2, keeping acknowledge 2 and dismiss 2, detecting an update 3,
+grouped acknowledge 1 and dismiss 1, the saved opt-out 4, the recovery event 1, the late
+queue 2 and reading the newest event 1. The update guard failed its test before the fix.
+
+Two mutation runs ended with exit code 1 and no pytest summary or stderr, and the cause
+was not found. Neither repeated: 8 unmodified runs and 8 runs of one affected mutant all
+completed with a summary, with `faulthandler` on.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -284,13 +355,21 @@ These come from code review and have not been reproduced, unless noted.
   known to pass these.
 - A long identifier is still escaped and hashed in full. Its digest is unsalted, so a
   redacted report does not hide a guessable identifier.
-- `TypeError` and `ValueError` from a write are treated as record errors, so a bug in
-  the storage layer would reject records while health stays green. Only
-  `rejected_writes` would show it. `_reject_queued_alert` can also drop a newer version
-  that arrived during a rejected write.
-- `Alert` construction in `app/detection/engine.py` and the guard-free `_alert_event`
-  calls in the Windows event and file integrity paths are not covered by the per-alert
-  guard in `collect_once`.
+- `Alert` construction in `app/detection/engine.py` is not covered by the per-alert guard
+  in `collect_once`. Its values come from rule definitions.
+- One record that keeps failing with an unexpected error blocks the queue behind it.
+  Storage stays degraded and retries, so this is visible. The queue holds 500 entries,
+  and the oldest are evicted without a count, leaving `persistence_pending` set on the
+  evicted alert's live copy.
+- An update saved by the next pass after a first write is lost if the process stops
+  first. The queue is memory only.
+- Writing a grouped alert again adds its count again, so a retry after a race or outage
+  can inflate `occurrence_count`.
+- An update to a record that was rejected stays in the live view only.
+- The storage failure alert keeps `persistence_pending` set although it is never queued.
+- An in-flight write finishes after an opt-out, and discarded queue entries are gone.
+- The three worker loops log with `LOGGER.exception`, so a traceback could carry
+  exception text. No path reviewed here reaches them with record content.
 - Rows stored with longer text are bounded when read. The stored row is not rewritten.
 - Evidence mutated after construction bypasses the model boundary, and one such alert
   makes the whole `/api/alerts` response a 503. No application code does this.
