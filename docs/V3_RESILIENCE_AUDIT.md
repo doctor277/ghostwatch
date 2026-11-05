@@ -30,6 +30,9 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: alert bounds and write rejection below, Python 3.11.9 on Windows:
   339 pytest passed, 16 Playwright tests passed against the synthetic server, Ruff and
   compilation passed. Hosted CI has not run on this change.
+- VERIFIED LOCALLY: pre-push review fixes below, Python 3.11.9 on Windows: 403 pytest
+  passed, 16 Playwright tests passed against the synthetic server, Ruff and compilation
+  passed. Hosted CI has not run on this change.
 - PENDING: open findings below, synthetic performance and memory measurements,
   supply-chain review, and release documentation.
 
@@ -188,6 +191,61 @@ the unmodified code passed both tests in 1.2 s.
 `test_excessively_nested_evidence_is_bounded` in `tests/test_v3_alert_serialization.py`
 now expects `[TRUNCATED]`, because over-deep JSON is not unserializable.
 
+## Pre-push review
+
+A review of `98a7de6` and `d79c2ab` before pushing them found the following. All of it
+was reproduced with synthetic data, and no current collector is known to produce these
+values. The comparison with `55ca2cb` used the same probes on an export of that commit.
+
+| Finding at `d79c2ab` | At `55ca2cb` |
+| --- | --- |
+| A stored alert ID over 200 characters was listed as a digest with no matching row, so acknowledge, dismiss and incident links missed it | Worked |
+| An iterator inside a dataclass hung `Alert` construction | Construction succeeded, serialization hung |
+| A late non-plain key made each visit scan every key for one node of budget. 20,000 keys shared 9,000 times took 69 s including serialization | 18 s, and 1.7 GB of JSON |
+| A 10 KB string shared 9,990 times peaked at 100.5 MB, because the budget counted nodes and not bytes | Not sanitized |
+| A cut left `someone@examp` or `203.0.113` in text, which no redaction pattern matched | Such alerts aborted collection |
+| Non-plain top-level keys raised `ValidationError` from the constructor | Not compared |
+
+The fixes:
+
+- `_row_to_alert` keeps the `id` and `incident_id` a row holds. The digest applies only
+  to new alerts, so the database and API agree without a migration. Events bound
+  `related_id` with the same digest, because `EventRecord` validation is unchanged.
+- Sanitizer work is charged to one budget for the whole structure: every key inspected
+  and every value visited against 10,000 nodes, and all text against 16 KiB before it is
+  escaped. Going over the text limit stops the walk at once.
+- Only an allowlist of leaf types reaches `to_jsonable_python`. Dataclasses and Pydantic
+  models are read one level at a time. Anything else is marked, not iterated.
+- Sets are sorted on their encoded form, because set order varies between processes.
+- A failing container is marked without hiding other values, and a top-level mapping
+  always stays a mapping.
+- `bounded_text` escapes only the part of the input that can reach the result.
+- `redact_text` replaces the word beside a `[TRUNCATED]` marker. The local view keeps it,
+  and the rule applies to rows that are already stored.
+
+`safe_structure` was folded into `safe_evidence`, which owns the budget.
+
+Measured once with `tracemalloc` on, Python 3.11.9 on Windows. The first row was 69 s
+with serialization before the fix, so those two numbers are not directly comparable:
+
+| Input | Time | Peak |
+| --- | --- | --- |
+| 20,000 keys shared 9,000 times | 29.5 ms | 0.01 MB |
+| Endless generator in a dataclass | 0.2 ms | under 0.01 MB |
+| 10 KB string shared 9,990 times | 0.1 ms | 0.02 MB |
+| 1 MB string shared 9,990 times | 0.1 ms | under 0.01 MB |
+| Shared lists 40 levels deep | 387.5 ms | 1.01 MB |
+| 9,999 integers of 1,024 bits | 81.8 ms | 6.93 MB |
+
+Regression tests are in `tests/test_v3_alert_identity.py`,
+`tests/test_v3_evidence_budget.py` and `tests/test_v3_redaction_cuts.py`. 29 of the first
+62 failed before the fixes, and the rest are guards for behavior that must not change.
+Their workloads are bounded: endless inputs are replaced by a counter that raises.
+Mutation checks: restoring stored IDs failed 5, the `update_alert` event bound 1, key
+charging 1, the text budget 3, shallow dataclass reading 3, shallow model reading 1,
+refusing other iterables 2, set sorting 1, failure isolation 2, the top-level mapping 2,
+cycle detection 1, the early cut 1 and the redaction rule 11.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -216,7 +274,23 @@ These come from code review and have not been reproduced, unless noted.
 - An escaped name is a display form. Only the on-disk path is authoritative.
 - A rejected record stays in the live view but is not stored. `rejected_writes` counts
   rejections since the last start and does not identify them.
-- Text cut at a limit is not recoverable, and truncated evidence is dropped whole.
+- Text cut at a limit is not recoverable, and truncated evidence is dropped whole. An
+  incident built from such an alert has no `related_processes` for it, without notice.
+- The redaction rule removes the one word beside a cut. It depends on the existing
+  patterns for any earlier part of a value split by spaces, and reports already
+  exported are not changed.
+- Model computed fields and custom serializers no longer appear in evidence, and types
+  outside the allowlist, such as `pydantic_core.Url`, are marked. No alert source is
+  known to pass these.
+- A long identifier is still escaped and hashed in full. Its digest is unsalted, so a
+  redacted report does not hide a guessable identifier.
+- `TypeError` and `ValueError` from a write are treated as record errors, so a bug in
+  the storage layer would reject records while health stays green. Only
+  `rejected_writes` would show it. `_reject_queued_alert` can also drop a newer version
+  that arrived during a rejected write.
+- `Alert` construction in `app/detection/engine.py` and the guard-free `_alert_event`
+  calls in the Windows event and file integrity paths are not covered by the per-alert
+  guard in `collect_once`.
 - Rows stored with longer text are bounded when read. The stored row is not rewritten.
 - Evidence mutated after construction bypasses the model boundary, and one such alert
   makes the whole `/api/alerts` response a 503. No application code does this.
