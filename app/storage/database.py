@@ -815,7 +815,8 @@ class Database:
             evidence = json.loads(row["evidence"]) if "evidence" in keys else {}
         except (json.JSONDecodeError, TypeError):
             evidence = {}
-        return Alert(
+        incident_id = row["incident_id"] if "incident_id" in keys else None
+        alert = Alert(
             id=row["id"],
             timestamp=parse_utc(row["timestamp"], label="alerts.timestamp"),
             severity=row["severity"],
@@ -826,7 +827,7 @@ class Database:
             dismissed=bool(row["dismissed"]),
             rule_id=row["rule_id"] if "rule_id" in keys else None,
             evidence=evidence,
-            incident_id=row["incident_id"] if "incident_id" in keys else None,
+            incident_id=incident_id,
             first_occurrence=(
                 parse_utc(row["first_occurrence"], label="alerts.first_occurrence")
                 if "first_occurrence" in keys and row["first_occurrence"]
@@ -853,6 +854,8 @@ class Database:
                 else None
             ),
         )
+        # Digests are for new alerts. A stored row is addressed by what it holds.
+        return alert.model_copy(update={"id": row["id"], "incident_id": incident_id})
 
     def add_event(self, event: EventRecord, retention: int = 10_000) -> None:
         with self._lock, self._connect() as connection:

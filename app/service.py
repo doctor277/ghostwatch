@@ -23,6 +23,7 @@ from app.config import (
 )
 from app.detection.engine import DetectionEngine
 from app.models import (
+    MAX_ALERT_LABEL,
     AISettings,
     Alert,
     AlertUpdate,
@@ -57,6 +58,7 @@ from app.monitoring.processes import ProcessCollector
 from app.monitoring.system import SystemCollector
 from app.monitoring.windows_events import WindowsEventCollector
 from app.storage.database import Database
+from app.text_utils import bounded_identifier
 from app.time_utils import as_utc
 
 LOGGER = logging.getLogger(__name__)
@@ -908,7 +910,7 @@ class TelemetryService:
             severity=severity,  # type: ignore[arg-type]
             title=alert.metric,
             summary=alert.explanation,
-            related_id=alert.id,
+            related_id=bounded_identifier(alert.id, MAX_ALERT_LABEL),
             evidence=alert.evidence,
         )
 
@@ -1155,7 +1157,7 @@ class TelemetryService:
                 severity="LOW",
                 title="Alert state changed",
                 summary="An alert was acknowledged or dismissed by the local operator.",
-                related_id=alert_id,
+                related_id=bounded_identifier(alert_id, MAX_ALERT_LABEL),
                 evidence=changes,
             )
             self._remember_event(event)
