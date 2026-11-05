@@ -971,15 +971,29 @@ class TelemetryService:
         while len(queue) > MAX_PENDING_WRITES:
             queue.popitem(last=False)
 
+    def _live_alert(self, alert_id: str) -> Alert | None:
+        return next((item for item in self.live_alerts if item.id == alert_id), None)
+
+    def _queue_with_operator_state(self, alert: Alert) -> None:
+        # The live copy holds any acknowledge or dismiss that arrived during a write.
+        current = self._live_alert(alert.id) or alert
+        pending = alert.model_copy(
+            update={
+                "acknowledged": current.acknowledged,
+                "dismissed": current.dismissed,
+                "persistence_pending": True,
+            }
+        )
+        self._remember_live_alert(
+            current.model_copy(update={"persistence_pending": True}), authoritative=True
+        )
+        self._queue_pending_alert(pending)
+
     async def _persist_alert(self, alert: Alert) -> bool:
         if not self.storage.persistence_available:
-            pending = alert.model_copy(update={"persistence_pending": True})
-            current = next(
-                (item for item in self.live_alerts if item.id == alert.id), pending
-            ).model_copy(update={"persistence_pending": True})
-            self._remember_live_alert(current, authoritative=True)
-            self._queue_pending_alert(pending)
+            self._queue_with_operator_state(alert)
             return False
+        before = self._live_alert(alert.id)
         try:
             stored = await asyncio.to_thread(
                 self.database.add_alert, alert, self.settings.alert_retention
@@ -988,18 +1002,18 @@ class TelemetryService:
             self._reject_write(exc)
             return False
         except Exception as exc:
-            pending = alert.model_copy(update={"persistence_pending": True})
-            current = next(
-                (item for item in self.live_alerts if item.id == alert.id), pending
-            ).model_copy(update={"persistence_pending": True})
-            self._remember_live_alert(current, authoritative=True)
-            self._queue_pending_alert(pending)
+            self._queue_with_operator_state(alert)
             self._mark_storage_failure(exc)
             return False
-        self._remember_live_alert(
-            stored.model_copy(update={"persistence_pending": False}),
-            authoritative=True,
-        )
+        current = self._live_alert(alert.id)
+        if current is not None and current is not before:
+            # The write may have replaced an update, so the next pass saves it again.
+            self._queue_with_operator_state(stored)
+        else:
+            self._remember_live_alert(
+                stored.model_copy(update={"persistence_pending": False}),
+                authoritative=True,
+            )
         self._mark_storage_success()
         return True
 
@@ -1072,14 +1086,20 @@ class TelemetryService:
     async def _flush_pending(self) -> None:
         if not self.storage.persistence_available:
             return
-        for alert_id, alert in list(self._pending_alerts.items()):
+        for alert_id in list(self._pending_alerts):
+            # Read each entry now, because an update can replace it during a write.
+            alert = self._pending_alerts.get(alert_id)
+            if alert is None:
+                continue
             try:
                 clean = alert.model_copy(update={"persistence_pending": False})
                 stored = await asyncio.to_thread(
                     self.database.add_alert, clean, self.settings.alert_retention
                 )
             except InvalidRecordError as exc:
-                self._reject_queued_alert(alert_id, exc)
+                # A newer version is judged on its own by the next pass.
+                if self._pending_alerts.get(alert_id) is alert:
+                    self._reject_queued_alert(alert_id, exc)
                 continue
             except Exception as exc:
                 self._mark_storage_failure(exc)

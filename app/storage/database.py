@@ -739,9 +739,13 @@ class Database:
                                 alert.last_recovery or existing.last_recovery
                             ),
                             "acknowledged": (
-                                False if reopened else existing.acknowledged
+                                False
+                                if reopened
+                                else existing.acknowledged or alert.acknowledged
                             ),
-                            "dismissed": False if reopened else existing.dismissed,
+                            "dismissed": (
+                                False if reopened else existing.dismissed or alert.dismissed
+                            ),
                         }
                     )
             connection.execute(
