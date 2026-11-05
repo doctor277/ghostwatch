@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -149,6 +150,7 @@ class TelemetryService:
         self._alert_persistence_lock = asyncio.Lock()
         self._logging_generation = 0
         self._history_generation = 0
+        self._configuration_generations: dict[str, int] = {}
         self._storage_retry_seconds = storage_retry_seconds
         self._next_storage_retry = 0.0
         self._persisted_state_missing = False
@@ -170,25 +172,39 @@ class TelemetryService:
         await self._flush_pending()
         return True
 
+    def _apply_saved_configuration(self, attribute: str, settings: Any) -> None:
+        self._configuration_generations[attribute] = (
+            self._configuration_generations.get(attribute, 0) + 1
+        )
+        setattr(self, attribute, settings)
+
+    async def _load_configuration(self, attribute: str, load: Callable[[], Any]) -> None:
+        generation = self._configuration_generations.get(attribute, 0)
+        settings = await asyncio.to_thread(load)
+        # A successful save owns the entire settings model. A recovery read
+        # started before that save cannot restore older fields or preferences.
+        if generation == self._configuration_generations.get(attribute, 0):
+            setattr(self, attribute, settings)
+
     async def _load_persisted_state(self) -> None:
-        self.settings = await asyncio.to_thread(self.database.load_settings)
+        await self._load_configuration("settings", self.database.load_settings)
         if not self.settings.event_logging_enabled:
             self._logging_generation += 1
             self._discard_pending_writes()
-        self.detection_settings = await asyncio.to_thread(
-            self.database.load_detection_settings
+        await self._load_configuration(
+            "detection_settings", self.database.load_detection_settings
         )
-        self.ai_settings = await asyncio.to_thread(self.database.load_ai_settings)
-        self.history_settings = await asyncio.to_thread(
-            self.database.load_history_settings
+        await self._load_configuration("ai_settings", self.database.load_ai_settings)
+        await self._load_configuration(
+            "history_settings", self.database.load_history_settings
         )
         if not self.history_settings.enabled:
             self._discard_pending_history()
-        self.windows_event_settings = await asyncio.to_thread(
-            self.database.load_windows_event_settings
+        await self._load_configuration(
+            "windows_event_settings", self.database.load_windows_event_settings
         )
-        self.file_integrity_settings = await asyncio.to_thread(
-            self.database.load_file_integrity_settings
+        await self._load_configuration(
+            "file_integrity_settings", self.database.load_file_integrity_settings
         )
         self._windows_cursors = await asyncio.to_thread(
             self.database.load_windows_event_cursors
@@ -1462,7 +1478,7 @@ class TelemetryService:
         try:
             await asyncio.to_thread(self.database.save_settings, settings)
             # A saved opt-out takes effect even if the maintenance below fails.
-            self.settings = settings
+            self._apply_saved_configuration("settings", settings)
             if not settings.event_logging_enabled:
                 self._logging_generation += 1
                 self._discard_pending_writes()
@@ -1491,7 +1507,7 @@ class TelemetryService:
         except Exception as exc:
             self._mark_storage_failure(exc)
             raise StorageUnavailableError("Detection settings were not persisted") from exc
-        self.detection_settings = settings
+        self._apply_saved_configuration("detection_settings", settings)
         self._mark_storage_success()
         return settings
 
@@ -1501,7 +1517,7 @@ class TelemetryService:
         except Exception as exc:
             self._mark_storage_failure(exc)
             raise StorageUnavailableError("AI settings were not persisted") from exc
-        self.ai_settings = settings
+        self._apply_saved_configuration("ai_settings", settings)
         self._mark_storage_success()
         return settings
 
@@ -1513,7 +1529,7 @@ class TelemetryService:
                 self.database.save_history_settings, settings
             )
             # A saved opt-out takes effect even if the maintenance below fails.
-            self.history_settings = settings
+            self._apply_saved_configuration("history_settings", settings)
             if not settings.enabled:
                 self._discard_pending_history()
             await asyncio.to_thread(
@@ -1546,7 +1562,7 @@ class TelemetryService:
             raise StorageUnavailableError(
                 "Windows event settings were not persisted"
             ) from exc
-        self.windows_event_settings = settings
+        self._apply_saved_configuration("windows_event_settings", settings)
         self._mark_storage_success()
         return settings
 
@@ -1624,7 +1640,7 @@ class TelemetryService:
             raise StorageUnavailableError(
                 "File integrity settings were not persisted"
             ) from exc
-        self.file_integrity_settings = settings
+        self._apply_saved_configuration("file_integrity_settings", settings)
         self._mark_storage_success()
         return settings
 
