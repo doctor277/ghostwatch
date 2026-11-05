@@ -440,7 +440,10 @@ async def get_alerts(request: Request, include_dismissed: bool = False) -> list[
 
 @router.patch("/alerts/{alert_id}", response_model=Alert)
 async def update_alert(alert_id: str, update: AlertUpdate, request: Request) -> Alert:
-    result = await request.app.state.telemetry.update_alert(alert_id, update)
+    try:
+        result = await request.app.state.telemetry.update_alert(alert_id, update)
+    except StorageUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="Alert not found")
     return result

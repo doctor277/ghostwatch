@@ -1367,22 +1367,31 @@ class TelemetryService:
     async def update_alert(self, alert_id: str, update: AlertUpdate) -> Alert | None:
         generation = self._logging_generation
         changes = update.model_dump(exclude_none=True)
-        if not changes:
-            current = self._live_alert(alert_id)
-            if current is not None or not self.storage.persistence_available:
-                return current
+        current = self._live_alert(alert_id)
+        if current is None:
             try:
-                return await asyncio.to_thread(self.database.get_alert, alert_id)
+                persisted = await asyncio.to_thread(self.database.get_alert, alert_id)
             except Exception as exc:
                 self._mark_storage_failure(exc)
+                raise StorageUnavailableError("Alert lookup is unavailable") from exc
+            # Another action may have populated live state during the lookup.
+            current = self._live_alert(alert_id) or persisted
+            if current is None:
                 return None
+            pending = self._pending_alert_updates.get(alert_id)
+            if pending is not None:
+                current = current.model_copy(update=pending.model_dump(exclude_none=True))
+            self._remember_live_alert(current, authoritative=True)
+        if not changes:
+            return current
         memory_result: Alert | None = None
         for index, alert in enumerate(self.live_alerts):
             if alert.id == alert_id:
                 memory_result = alert.model_copy(update=changes)
                 self.live_alerts[index] = memory_result
                 break
-        self._queue_alert_update(alert_id, changes)
+        if generation == self._logging_generation:
+            self._queue_alert_update(alert_id, changes)
         patch = self._pending_alert_updates.get(alert_id)
         if (
             patch is not None and self.storage.persistence_available
