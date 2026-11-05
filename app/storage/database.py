@@ -711,18 +711,36 @@ class Database:
 
     def add_alert(self, alert: Alert, retention: int) -> Alert:
         with self._lock, self._connect() as connection:
+            # The authoritative relationship and grouped count must be read in
+            # the same write transaction, including across Database instances.
+            connection.execute("BEGIN IMMEDIATE")
             stored = alert
-            if alert.rule_id == "collection_failure":
-                row = connection.execute(
-                    "SELECT * FROM alerts WHERE id = ?", (alert.id,)
+            row = connection.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert.id,)
+            ).fetchone()
+            # Incident writes own this relationship. Observations can be stale,
+            # or the incident may have been created before this row existed.
+            incident_id = row["incident_id"] if row is not None else None
+            if incident_id is None:
+                incident = connection.execute(
+                    """SELECT id FROM incidents WHERE EXISTS (
+                        SELECT 1 FROM json_each(
+                            CASE WHEN json_valid(related_alerts)
+                            THEN related_alerts ELSE '[]' END
+                        ) WHERE value = ?
+                    ) ORDER BY rowid DESC LIMIT 1""",
+                    (alert.id,),
                 ).fetchone()
+                incident_id = incident["id"] if incident is not None else alert.incident_id
+            stored = alert.model_copy(update={"incident_id": incident_id})
+            if alert.rule_id == "collection_failure":
                 if row is not None:
                     existing = self._row_to_alert(row)
                     reopened = (
                         alert.condition_active is True
                         and existing.condition_active is False
                     )
-                    stored = alert.model_copy(
+                    stored = stored.model_copy(
                         update={
                             "first_occurrence": (
                                 existing.first_occurrence
@@ -741,10 +759,10 @@ class Database:
                             "acknowledged": (
                                 False
                                 if reopened
-                                else existing.acknowledged or alert.acknowledged
+                                else existing.acknowledged
                             ),
                             "dismissed": (
-                                False if reopened else existing.dismissed or alert.dismissed
+                                False if reopened else existing.dismissed
                             ),
                         }
                     )
