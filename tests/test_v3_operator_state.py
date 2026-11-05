@@ -83,6 +83,15 @@ def update(service, change, identifier="synthetic-alert"):
     return lambda: service.update_alert(identifier, AlertUpdate(**{change: True}))
 
 
+def replace_and_update(service, change, identifier="synthetic-alert"):
+    async def action():
+        await service.update_alert(identifier, AlertUpdate(**{change: True}))
+        # A state patch cannot repair a rejected observation. Supply a genuinely
+        # newer observation to exercise the queue's rejection identity guard.
+        await service._persist_alert(alert(id=identifier))
+    return action
+
+
 # An old rejection
 
 
@@ -91,7 +100,7 @@ async def test_old_rejection_keeps_a_newer_update(service, change):
     real_add_alert = service.database.add_alert
     queue(service)
 
-    await while_held(service, reject, update(service, change), service._flush_pending())
+    await while_held(service, reject, replace_and_update(service, change), service._flush_pending())
 
     assert service.rejected_writes == 0
     assert getattr(service._pending_alerts["synthetic-alert"], change) is True
@@ -109,7 +118,7 @@ async def test_newer_version_that_is_also_invalid_is_rejected_once(service):
     queue(service)
 
     await while_held(
-        service, reject, update(service, "acknowledged"), service._flush_pending()
+        service, reject, replace_and_update(service, "acknowledged"), service._flush_pending()
     )
     await service._maybe_recover_storage()
     await service._maybe_recover_storage()
@@ -134,7 +143,7 @@ async def test_old_rejection_does_not_stop_other_queued_records(service):
     await while_held(
         service,
         first_is_rejected,
-        update(service, "acknowledged", "first"),
+        replace_and_update(service, "acknowledged", "first"),
         service._flush_pending(),
     )
 
@@ -147,7 +156,7 @@ async def test_old_rejection_does_not_stop_other_queued_records(service):
 # A retry
 
 
-async def test_flush_writes_the_newest_version_of_a_later_record(service):
+async def test_flush_applies_a_patch_without_replacing_a_later_observation(service):
     real_add_alert = service.database.add_alert
     written = []
 
@@ -165,7 +174,10 @@ async def test_flush_writes_the_newest_version_of_a_later_record(service):
         service._flush_pending(),
     )
 
-    assert written == [("first", False), ("second", True)]
+    assert written == [("first", False), ("second", False)]
+    stored = service.database.get_alert("second")
+    assert stored.acknowledged is True
+    assert stored.occurrence_count == 1
 
 
 @pytest.mark.parametrize("change", CHANGES)
@@ -189,7 +201,7 @@ async def test_update_during_a_failing_flush_survives_the_outage(service, change
 
     await while_held(service, outage, update(service, change), service._flush_pending())
     assert service.storage.status == "degraded"
-    assert getattr(service._pending_alerts["synthetic-alert"], change) is True
+    assert getattr(service._pending_alert_updates["synthetic-alert"], change) is True
 
     service.database.add_alert = real_add_alert
     await service._maybe_recover_storage()

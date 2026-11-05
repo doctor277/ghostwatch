@@ -157,7 +157,7 @@ async def test_update_to_a_queued_alert_is_not_an_eviction(service, small_queue,
     monkeypatch.setattr(service.database, "update_alert", outage)
     await service.update_alert("alert-1", AlertUpdate(acknowledged=True))
 
-    assert service._pending_alerts["alert-1"].acknowledged is True
+    assert service._pending_alert_updates["alert-1"].acknowledged is True
     assert service.storage.dropped_alert_writes == 0
 
 

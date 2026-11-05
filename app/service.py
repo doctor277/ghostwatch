@@ -131,6 +131,7 @@ class TelemetryService:
         self.dropped_alert_writes = 0
         self.dropped_event_writes = 0
         self._writing_alert: str | None = None
+        self._writing_alert_update: str | None = None
         self._writing_event: str | None = None
         self._history_writes = 0
         self._windows_cursors: dict[str, int] = {}
@@ -142,6 +143,12 @@ class TelemetryService:
         self._sequence = 0
         self._pending_alerts: OrderedDict[str, Alert] = OrderedDict()
         self._pending_events: OrderedDict[str, EventRecord] = OrderedDict()
+        self._pending_alert_updates: OrderedDict[str, AlertUpdate] = OrderedDict()
+        # Serialize observation writes and state patches without blocking an
+        # operator action behind a held database write: actions queue their patch.
+        self._alert_persistence_lock = asyncio.Lock()
+        self._logging_generation = 0
+        self._history_generation = 0
         self._storage_retry_seconds = storage_retry_seconds
         self._next_storage_retry = 0.0
         self._persisted_state_missing = False
@@ -165,6 +172,9 @@ class TelemetryService:
 
     async def _load_persisted_state(self) -> None:
         self.settings = await asyncio.to_thread(self.database.load_settings)
+        if not self.settings.event_logging_enabled:
+            self._logging_generation += 1
+            self._discard_pending_writes()
         self.detection_settings = await asyncio.to_thread(
             self.database.load_detection_settings
         )
@@ -172,6 +182,8 @@ class TelemetryService:
         self.history_settings = await asyncio.to_thread(
             self.database.load_history_settings
         )
+        if not self.history_settings.enabled:
+            self._discard_pending_history()
         self.windows_event_settings = await asyncio.to_thread(
             self.database.load_windows_event_settings
         )
@@ -509,6 +521,7 @@ class TelemetryService:
                     and self.storage.persistence_available
                     and not self._persisted_state_missing
                 ):
+                    generation = self._history_generation
                     await asyncio.to_thread(
                         self.database.add_history_batch,
                         batch.sample,
@@ -518,11 +531,20 @@ class TelemetryService:
                         self.history_settings.max_samples,
                     )
                     self._history_writes += 1
+                    if (
+                        not self.history_settings.enabled
+                        or generation != self._history_generation
+                    ):
+                        continue
                     await asyncio.to_thread(
                         self.database.save_baseline_state,
                         self.baseline_engine.export_state(),
                     )
-                    if self._history_writes % 300 == 0:
+                    if (
+                        self._history_writes % 300 == 0
+                        and self.history_settings.enabled
+                        and generation == self._history_generation
+                    ):
                         await asyncio.to_thread(
                             self.database.compact_history,
                             self.history_settings.compact_after_hours,
@@ -535,6 +557,12 @@ class TelemetryService:
                 self._mark_storage_failure(exc)
             finally:
                 self._history_queue.task_done()
+
+    def _discard_pending_history(self) -> None:
+        self._history_generation += 1
+        while not self._history_queue.empty():
+            self._history_queue.get_nowait()
+            self._history_queue.task_done()
 
     def _queue_history_sample(self, snapshot: TelemetrySnapshot) -> None:
         if not self.history_settings.enabled:
@@ -873,6 +901,15 @@ class TelemetryService:
     def _remember_live_alert(self, alert: Alert, *, authoritative: bool = False) -> Alert:
         for index, existing in enumerate(self.live_alerts):
             if existing.id == alert.id:
+                if (
+                    not authoritative
+                    and alert.rule_id == "collection_failure"
+                    and alert.condition_active is True
+                    and existing.condition_active is False
+                ):
+                    self._queue_alert_update(
+                        alert.id, {"acknowledged": False, "dismissed": False}
+                    )
                 remembered = (
                     alert
                     if authoritative or alert.rule_id != "collection_failure"
@@ -966,7 +1003,10 @@ class TelemetryService:
 
     def _queue_health(self) -> dict[str, int]:
         return {
-            "pending_writes": len(self._pending_alerts) + len(self._pending_events),
+            "pending_writes": (
+                len(self._pending_alerts) + len(self._pending_events)
+                + len(self._pending_alert_updates)
+            ),
             "dropped_alert_writes": self.dropped_alert_writes,
             "dropped_event_writes": self.dropped_event_writes,
         }
@@ -981,8 +1021,11 @@ class TelemetryService:
         self.storage = self.storage.model_copy(update=self._queue_health())
 
     def _evict_oldest(self, queue: OrderedDict[str, Any]) -> None:
-        alerts = queue is self._pending_alerts
-        writing = self._writing_alert if alerts else self._writing_event
+        alerts = queue is self._pending_alerts or queue is self._pending_alert_updates
+        writing = (
+            self._writing_alert_update if queue is self._pending_alert_updates
+            else self._writing_alert if alerts else self._writing_event
+        )
         # A record being written may still be stored, so it is not lost yet.
         key = next(item for item in queue if item != writing)
         del queue[key]
@@ -999,6 +1042,38 @@ class TelemetryService:
 
     def _live_alert(self, alert_id: str) -> Alert | None:
         return next((item for item in self.live_alerts if item.id == alert_id), None)
+
+    def _queue_alert_update(self, alert_id: str, changes: dict[str, bool]) -> None:
+        if not changes or not self.settings.event_logging_enabled:
+            return
+        existing = self._pending_alert_updates.get(alert_id, AlertUpdate())
+        patch = AlertUpdate(**(existing.model_dump(exclude_none=True) | changes))
+        self._queue_pending(self._pending_alert_updates, alert_id, patch)
+        current = self._live_alert(alert_id)
+        if current is not None:
+            self._remember_live_alert(
+                current.model_copy(update={"persistence_pending": True}), authoritative=True
+            )
+
+    def _accept_stored_alert(self, stored: Alert, before: Alert | None) -> None:
+        current = self._live_alert(stored.id)
+        pending = self._pending_alerts.get(stored.id)
+        result = stored
+        if pending is not None:
+            result = (
+                self._merge_grouped_alert(stored, pending)
+                if stored.rule_id == "collection_failure" else pending
+            )
+        if current is not None:
+            changes: dict[str, Any] = {"incident_id": current.incident_id or stored.incident_id}
+            if current is not before:
+                changes.update(acknowledged=current.acknowledged, dismissed=current.dismissed)
+            result = result.model_copy(update=changes)
+        patch = self._pending_alert_updates.get(stored.id)
+        if patch is not None:
+            result = result.model_copy(update=patch.model_dump(exclude_none=True))
+        self._remember_live_alert(result, authoritative=True)
+        self._clear_pending_flag(stored.id)
 
     def _queue_with_operator_state(self, alert: Alert) -> None:
         # The live copy holds any acknowledge or dismiss that arrived during a write.
@@ -1022,9 +1097,22 @@ class TelemetryService:
         self._queue_pending_alert(pending)
 
     async def _persist_alert(self, alert: Alert) -> bool:
-        if not self.storage.persistence_available:
+        if not self.settings.event_logging_enabled:
+            self._clear_pending_flag(alert.id)
+            return False
+        generation = self._logging_generation
+        if (
+            not self.storage.persistence_available
+            or self._persisted_state_missing
+            or self._alert_persistence_lock.locked()
+            or alert.id in self._pending_alerts
+        ):
             self._queue_with_operator_state(alert)
             return False
+        async with self._alert_persistence_lock:
+            return await self._write_alert(alert, generation)
+
+    async def _write_alert(self, alert: Alert, generation: int) -> bool:
         before = self._live_alert(alert.id)
         try:
             stored = await asyncio.to_thread(
@@ -1034,23 +1122,29 @@ class TelemetryService:
             self._reject_write(exc)
             return False
         except Exception as exc:
-            self._queue_with_operator_state(alert)
+            if generation == self._logging_generation:
+                newer = self._pending_alerts.get(alert.id)
+                if newer is None:
+                    self._queue_with_operator_state(alert)
+                else:
+                    # The attempted observation predates anything queued while
+                    # it was in flight. Keep recovery/reopening in that order.
+                    pending = (
+                        self._merge_grouped_alert(alert, newer)
+                        if alert.rule_id == "collection_failure" else newer
+                    )
+                    self._queue_pending(self._pending_alerts, alert.id, pending)
             self._mark_storage_failure(exc)
             return False
-        current = self._live_alert(alert.id)
-        if current is not None and current is not before:
-            # The write may have replaced an update, so the next pass saves it again.
-            self._queue_with_operator_state(stored)
-        else:
-            self._remember_live_alert(
-                stored.model_copy(update={"persistence_pending": False}),
-                authoritative=True,
-            )
+        self._accept_stored_alert(stored, before)
         self._mark_storage_success()
         return True
 
     async def _persist_event(self, event: EventRecord) -> bool:
-        if not self.storage.persistence_available:
+        if not self.settings.event_logging_enabled:
+            return False
+        generation = self._logging_generation
+        if not self.storage.persistence_available or self._persisted_state_missing:
             self._queue_pending(self._pending_events, event.id, event)
             return False
         try:
@@ -1059,7 +1153,11 @@ class TelemetryService:
             self._reject_write(exc)
             return False
         except Exception as exc:
-            self._queue_pending(self._pending_events, event.id, event)
+            if (
+                self.settings.event_logging_enabled
+                and generation == self._logging_generation
+            ):
+                self._queue_pending(self._pending_events, event.id, event)
             self._mark_storage_failure(exc)
             return False
         self._mark_storage_success()
@@ -1077,7 +1175,11 @@ class TelemetryService:
     def _clear_pending_flag(self, alert_id: str) -> None:
         for index, alert in enumerate(self.live_alerts):
             if alert.id == alert_id:
-                self.live_alerts[index] = alert.model_copy(update={"persistence_pending": False})
+                self.live_alerts[index] = alert.model_copy(update={
+                    "persistence_pending": (
+                        alert_id in self._pending_alerts or alert_id in self._pending_alert_updates
+                    )
+                })
 
     async def _maybe_recover_storage(self) -> None:
         # A direct write can restore health without passing through recovery.
@@ -1096,7 +1198,7 @@ class TelemetryService:
             return
         if recovering:
             self._mark_storage_success(version)
-        if self._pending_alerts or self._pending_events:
+        if self._pending_alerts or self._pending_events or self._pending_alert_updates:
             await self._flush_pending()
 
     async def _load_missed_state(self) -> None:
@@ -1112,6 +1214,7 @@ class TelemetryService:
     def _discard_pending_writes(self) -> None:
         self._pending_alerts.clear()
         self._pending_events.clear()
+        self._pending_alert_updates.clear()
         for index, alert in enumerate(self.live_alerts):
             if alert.persistence_pending:
                 self.live_alerts[index] = alert.model_copy(
@@ -1120,14 +1223,28 @@ class TelemetryService:
         self.storage = self.storage.model_copy(update=self._queue_health())
 
     async def _flush_pending(self) -> None:
-        if not self.storage.persistence_available:
+        if self._alert_persistence_lock.locked():
+            return
+        async with self._alert_persistence_lock:
+            await self._flush_pending_locked()
+
+    async def _flush_pending_locked(self) -> None:
+        if not self.settings.event_logging_enabled:
+            self._discard_pending_writes()
+            return
+        if not self.storage.persistence_available or self._persisted_state_missing:
             return
         for alert_id in list(self._pending_alerts):
+            if not self.settings.event_logging_enabled:
+                self._discard_pending_writes()
+                return
             # Read each entry now, because an update can replace it during a write.
             alert = self._pending_alerts.get(alert_id)
             if alert is None:
                 continue
             self._writing_alert = alert_id
+            before = self._live_alert(alert_id)
+            generation = self._logging_generation
             try:
                 clean = alert.model_copy(update={"persistence_pending": False})
                 stored = await asyncio.to_thread(
@@ -1144,11 +1261,34 @@ class TelemetryService:
             finally:
                 self._writing_alert = None
             if self._pending_alerts.get(alert_id) is not alert:
-                # An operator update arrived during the write; the next pass saves it.
+                # A new observation arrived while this delta was being written.
+                # Retain only the unwritten count, never replay the committed delta.
+                newer = self._pending_alerts.get(alert_id)
+                if (
+                    newer is not None and alert.rule_id == "collection_failure"
+                    and generation == self._logging_generation
+                ):
+                    self._pending_alerts[alert_id] = newer.model_copy(update={
+                        "occurrence_count": newer.occurrence_count - alert.occurrence_count
+                    })
+                self._accept_stored_alert(stored, before)
                 continue
             self._pending_alerts.pop(alert_id, None)
-            self._remember_live_alert(stored, authoritative=True)
+            self._accept_stored_alert(stored, before)
+        for alert_id in list(self._pending_alert_updates):
+            if not self.settings.event_logging_enabled:
+                self._discard_pending_writes()
+                return
+            # Apply state only after all observations for this alert are written.
+            if alert_id in self._pending_alerts:
+                continue
+            patch = self._pending_alert_updates.get(alert_id)
+            if patch is not None and not await self._write_alert_update(alert_id, patch):
+                return
         for event_id in list(self._pending_events):
+            if not self.settings.event_logging_enabled:
+                self._discard_pending_writes()
+                return
             event = self._pending_events.get(event_id)
             if event is None:
                 continue
@@ -1187,31 +1327,55 @@ class TelemetryService:
             alerts = [alert for alert in alerts if not alert.dismissed]
         return alerts[:limit]
 
+    async def _write_alert_update(self, alert_id: str, patch: AlertUpdate) -> bool:
+        before = self._live_alert(alert_id)
+        self._writing_alert_update = alert_id
+        try:
+            persisted = await asyncio.to_thread(self.database.update_alert, alert_id, patch)
+        except Exception as exc:
+            # The patch was queued before starting the write. An opt-out may
+            # already have discarded it; never put that discarded work back.
+            self._mark_storage_failure(exc)
+            return False
+        finally:
+            self._writing_alert_update = None
+        if self._pending_alert_updates.get(alert_id) is patch:
+            self._pending_alert_updates.pop(alert_id, None)
+        if persisted is not None:
+            self._accept_stored_alert(persisted, before)
+        else:
+            self._clear_pending_flag(alert_id)
+        self._mark_storage_success()
+        return True
+
     async def update_alert(self, alert_id: str, update: AlertUpdate) -> Alert | None:
+        generation = self._logging_generation
         changes = update.model_dump(exclude_none=True)
+        if not changes:
+            current = self._live_alert(alert_id)
+            if current is not None or not self.storage.persistence_available:
+                return current
+            try:
+                return await asyncio.to_thread(self.database.get_alert, alert_id)
+            except Exception as exc:
+                self._mark_storage_failure(exc)
+                return None
         memory_result: Alert | None = None
         for index, alert in enumerate(self.live_alerts):
             if alert.id == alert_id:
                 memory_result = alert.model_copy(update=changes)
                 self.live_alerts[index] = memory_result
-                if alert_id in self._pending_alerts:
-                    self._pending_alerts[alert_id] = memory_result
                 break
-        persisted: Alert | None = None
-        if self.storage.persistence_available:
-            try:
-                persisted = await asyncio.to_thread(
-                    self.database.update_alert, alert_id, update
-                )
-                self._mark_storage_success()
-            except Exception as exc:
-                self._mark_storage_failure(exc)
-                if memory_result and self.settings.event_logging_enabled:
-                    memory_result = memory_result.model_copy(
-                        update={"persistence_pending": True}
-                    )
-                    self._remember_live_alert(memory_result)
-                    self._queue_pending(self._pending_alerts, alert_id, memory_result)
+        self._queue_alert_update(alert_id, changes)
+        patch = self._pending_alert_updates.get(alert_id)
+        if (
+            patch is not None and self.storage.persistence_available
+            and not self._persisted_state_missing
+            and not self._alert_persistence_lock.locked()
+            and alert_id not in self._pending_alerts
+        ):
+            async with self._alert_persistence_lock:
+                await self._write_alert_update(alert_id, patch)
         if memory_result:
             event = EventRecord(
                 id=str(uuid4()),
@@ -1224,9 +1388,12 @@ class TelemetryService:
                 evidence=changes,
             )
             self._remember_event(event)
-            if self.settings.event_logging_enabled:
+            if (
+                self.settings.event_logging_enabled
+                and generation == self._logging_generation
+            ):
                 await self._persist_event(event)
-        return memory_result or persisted
+        return self._live_alert(alert_id) or memory_result
 
     async def send_snapshot(
         self, client: WebSocket, snapshot: TelemetrySnapshot | None = None
@@ -1297,6 +1464,7 @@ class TelemetryService:
             # A saved opt-out takes effect even if the maintenance below fails.
             self.settings = settings
             if not settings.event_logging_enabled:
+                self._logging_generation += 1
                 self._discard_pending_writes()
             await asyncio.to_thread(
                 self.database.enforce_retention, settings.alert_retention
@@ -1346,6 +1514,8 @@ class TelemetryService:
             )
             # A saved opt-out takes effect even if the maintenance below fails.
             self.history_settings = settings
+            if not settings.enabled:
+                self._discard_pending_history()
             await asyncio.to_thread(
                 self.database.prune_telemetry,
                 settings.retention_hours,
@@ -1740,6 +1910,12 @@ class TelemetryService:
         except Exception as exc:
             self._mark_storage_failure(exc)
             raise StorageUnavailableError("Incident was not persisted") from exc
+        for alert_id in incident.related_alerts:
+            current = self._live_alert(alert_id)
+            if current is not None:
+                self._remember_live_alert(
+                    current.model_copy(update={"incident_id": incident.id}), authoritative=True
+                )
         await self.record_event(
             "incident_created",
             "HIGH" if incident.severity != "INFO" else "LOW",
