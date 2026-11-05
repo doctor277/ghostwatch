@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -148,6 +148,7 @@ class TelemetryService:
         # Serialize observation writes and state patches without blocking an
         # operator action behind a held database write: actions queue their patch.
         self._alert_persistence_lock = asyncio.Lock()
+        self._alert_persistence_task: asyncio.Task[bool | None] | None = None
         self._logging_generation = 0
         self._history_generation = 0
         self._configuration_generations: dict[str, int] = {}
@@ -1120,6 +1121,35 @@ class TelemetryService:
         )
         self._queue_pending_alert(pending)
 
+    def _alert_persistence_busy(self) -> bool:
+        return self._alert_persistence_lock.locked() or (
+            self._alert_persistence_task is not None
+            and not self._alert_persistence_task.done()
+        )
+
+    async def _run_alert_persistence(
+        self, operation: Callable[[], Awaitable[bool | None]]
+    ) -> bool | None:
+        async def run() -> bool | None:
+            async with self._alert_persistence_lock:
+                return await operation()
+
+        # Cancellation of a producer does not cancel a database thread. Own the
+        # write AND its queue reconciliation until completion, retaining the lock
+        # across stop/start. The caller still receives CancelledError immediately.
+        task = asyncio.create_task(run(), name="ghostwatch-alert-persistence")
+        self._alert_persistence_task = task
+        task.add_done_callback(self._alert_persistence_done)
+        return await asyncio.shield(task)
+
+    def _alert_persistence_done(self, task: asyncio.Task[bool | None]) -> None:
+        if self._alert_persistence_task is task:
+            self._alert_persistence_task = None
+        if not task.cancelled():
+            exception = task.exception()
+            if exception is not None:
+                self._mark_storage_failure(exception)
+
     async def _persist_alert(self, alert: Alert) -> bool:
         if not self.settings.event_logging_enabled:
             self._clear_pending_flag(alert.id)
@@ -1128,15 +1158,17 @@ class TelemetryService:
         if (
             not self.storage.persistence_available
             or self._persisted_state_missing
-            or self._alert_persistence_lock.locked()
+            or self._alert_persistence_busy()
             or alert.id in self._pending_alerts
         ):
             self._queue_with_operator_state(alert)
             return False
-        async with self._alert_persistence_lock:
-            return await self._write_alert(alert, generation)
+        return bool(await self._run_alert_persistence(lambda: self._write_alert(alert, generation)))
 
     async def _write_alert(self, alert: Alert, generation: int) -> bool:
+        if not self.settings.event_logging_enabled or generation != self._logging_generation:
+            self._clear_pending_flag(alert.id)
+            return False
         before = self._live_alert(alert.id)
         try:
             stored = await asyncio.to_thread(
@@ -1247,10 +1279,9 @@ class TelemetryService:
         self.storage = self.storage.model_copy(update=self._queue_health())
 
     async def _flush_pending(self) -> None:
-        if self._alert_persistence_lock.locked():
+        if self._alert_persistence_busy():
             return
-        async with self._alert_persistence_lock:
-            await self._flush_pending_locked()
+        await self._run_alert_persistence(self._flush_pending_locked)
 
     async def _flush_pending_locked(self) -> None:
         if not self.settings.event_logging_enabled:
@@ -1352,6 +1383,11 @@ class TelemetryService:
         return alerts[:limit]
 
     async def _write_alert_update(self, alert_id: str, patch: AlertUpdate) -> bool:
+        if (
+            not self.settings.event_logging_enabled
+            or self._pending_alert_updates.get(alert_id) is not patch
+        ):
+            return True
         before = self._live_alert(alert_id)
         self._writing_alert_update = alert_id
         try:
@@ -1404,11 +1440,10 @@ class TelemetryService:
         if (
             patch is not None and self.storage.persistence_available
             and not self._persisted_state_missing
-            and not self._alert_persistence_lock.locked()
+            and not self._alert_persistence_busy()
             and alert_id not in self._pending_alerts
         ):
-            async with self._alert_persistence_lock:
-                await self._write_alert_update(alert_id, patch)
+            await self._run_alert_persistence(lambda: self._write_alert_update(alert_id, patch))
         if memory_result:
             event = EventRecord(
                 id=str(uuid4()),
