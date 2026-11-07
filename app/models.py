@@ -5,6 +5,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.text_utils import bounded_identifier, bounded_text, escape_surrogates, safe_evidence
+
+MAX_ALERT_TEXT = 2000
+MAX_ALERT_LABEL = 200
+
+
+def _alert_text(value: Any) -> Any:
+    return bounded_text(value, MAX_ALERT_TEXT)
+
+
+def _alert_label(value: Any) -> Any:
+    return bounded_text(value, MAX_ALERT_LABEL)
+
+
+def _alert_identifier(value: Any) -> Any:
+    return bounded_identifier(value, MAX_ALERT_LABEL)
+
 
 class Settings(BaseModel):
     """Backward-compatible core settings persisted by GhostWatch 1.x."""
@@ -194,6 +211,11 @@ class Alert(BaseModel):
     last_occurrence: datetime | None = None
     occurrence_count: int = Field(default=1, ge=0)
     condition_active: bool | None = None
+
+    _bound_identifiers = field_validator("id", "incident_id", mode="before")(_alert_identifier)
+    _bound_labels = field_validator("source", "metric", "rule_id", mode="before")(_alert_label)
+    _bound_explanation = field_validator("explanation", mode="before")(_alert_text)
+    _sanitize_evidence = field_validator("evidence", mode="before")(safe_evidence)
     last_recovery: datetime | None = None
 
 
@@ -372,6 +394,9 @@ class StorageHealth(BaseModel):
     status: Literal["healthy", "degraded", "recovering"] = "healthy"
     persistence_available: bool = True
     pending_writes: int = 0
+    # Queued writes evicted at capacity since this process started.
+    dropped_alert_writes: int = 0
+    dropped_event_writes: int = 0
     last_success: datetime | None = None
     last_error_type: str | None = None
     schema_version: int | None = None
@@ -385,10 +410,15 @@ class EventRecord(BaseModel):
     timestamp: datetime
     event_type: str = Field(min_length=1, max_length=80)
     severity: EventSeverity = "LOW"
-    title: str = Field(min_length=1, max_length=200)
-    summary: str = Field(default="", max_length=2000)
-    related_id: str | None = Field(default=None, max_length=200)
+    title: str = Field(min_length=1, max_length=MAX_ALERT_LABEL)
+    summary: str = Field(default="", max_length=MAX_ALERT_TEXT)
+    related_id: str | None = Field(default=None, max_length=MAX_ALERT_LABEL)
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+    _escape_text = field_validator(
+        "id", "event_type", "title", "summary", "related_id", mode="before"
+    )(escape_surrogates)
+    _sanitize_evidence = field_validator("evidence", mode="before")(safe_evidence)
 
 
 class WindowsEventRecord(BaseModel):

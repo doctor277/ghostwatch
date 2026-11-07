@@ -61,21 +61,32 @@ def _history_window(
 @router.get("/health")
 async def health(request: Request) -> dict[str, object]:
     service = request.app.state.telemetry
+    if service.latest is None:
+        snapshot = "warming-up"
+    elif service.encode_snapshot(service.latest) is None:
+        snapshot = "unavailable"
+    else:
+        snapshot = "available"
     return {
         "status": "ok",
         "scope": "local-only",
         "monitoring": "active" if service.latest is not None else "warming-up",
+        "snapshot": snapshot,
         "storage": service.storage.model_dump(mode="json"),
+        "rejected_writes": service.rejected_writes,
         "websocket_clients": len(service.clients),
     }
 
 
 @router.get("/overview", response_model=TelemetrySnapshot)
-async def overview(request: Request) -> TelemetrySnapshot:
+async def overview(request: Request) -> Response:
     service = request.app.state.telemetry
     if service.latest is None:
         raise HTTPException(status_code=503, detail="Telemetry is warming up")
-    return service.latest
+    payload = service.encode_snapshot(service.latest)
+    if payload is None:
+        raise HTTPException(status_code=503, detail="Telemetry snapshot is unavailable")
+    return Response(content=payload, media_type="application/json")
 
 
 @router.get("/history")
@@ -429,7 +440,10 @@ async def get_alerts(request: Request, include_dismissed: bool = False) -> list[
 
 @router.patch("/alerts/{alert_id}", response_model=Alert)
 async def update_alert(alert_id: str, update: AlertUpdate, request: Request) -> Alert:
-    result = await request.app.state.telemetry.update_alert(alert_id, update)
+    try:
+        result = await request.app.state.telemetry.update_alert(alert_id, update)
+    except StorageUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="Alert not found")
     return result

@@ -10,6 +10,7 @@ import psutil
 
 from app.config import MAX_PROCESSES
 from app.models import ConnectionInfo, ProcessInfo
+from app.text_utils import safe_text
 
 
 @dataclass(slots=True)
@@ -108,7 +109,7 @@ class ProcessCollector:
             try:
                 info = process.info
                 pid = int(info["pid"])
-                name = str(info.get("name") or "Unknown")
+                name = safe_text(info.get("name") or "Unknown")
             except (
                 psutil.NoSuchProcess,
                 psutil.AccessDenied,
@@ -277,8 +278,8 @@ class ProcessCollector:
         calls = {
             "status": ("status", str),
             "parent_pid": ("ppid", int),
-            "executable": ("exe", str),
-            "username": ("username", str),
+            "executable": ("exe", safe_text),
+            "username": ("username", safe_text),
         }
         for field_name, (method_name, converter) in calls.items():
             try:

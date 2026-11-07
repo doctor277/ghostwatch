@@ -52,6 +52,8 @@ export async function installSyntheticBackend(page) {
     fileSettings: { enabled: false, scan_interval_seconds: 30, max_files_per_folder: 10000, max_file_size_bytes: 104857600, event_retention: 10000 },
     folders: [{ id: "synthetic-folder", path: "C:\\SYNTHETIC\\watched", enabled: true, created_at: now(), baseline_created_at: now(), status: "healthy", status_detail: "" }],
     sockets: [],
+    closedSockets: 0,
+    silent: false,
     failures: new Map(),
   };
   const samples = historicalSamples();
@@ -141,13 +143,23 @@ export async function installSyntheticBackend(page) {
 
   await page.routeWebSocket("**/ws/telemetry", (socket) => {
     state.sockets.push(socket);
-    setTimeout(() => socket.send(JSON.stringify(state.snapshot)), 25);
+    socket.onClose(() => { state.closedSockets += 1; });
+    if (!state.silent) setTimeout(() => socket.send(JSON.stringify(state.snapshot)), 25);
   });
 
   return {
     state,
     disconnectLatest() {
       state.sockets.at(-1)?.close({ code: 1012, reason: "Synthetic restart" });
+    },
+    sendDegraded() {
+      state.sockets.at(-1)?.send(JSON.stringify({ type: "telemetry_degraded", reason: "snapshot_unavailable" }));
+    },
+    sendSnapshot() {
+      state.sockets.at(-1)?.send(JSON.stringify(state.snapshot));
+    },
+    sendRaw(frame) {
+      state.sockets.at(-1)?.send(frame);
     },
     failNext(method, path, status = 503) {
       state.failures.set(`${method} ${path}`, status);

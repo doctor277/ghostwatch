@@ -88,6 +88,7 @@ jobs:
             "frontend/js/websocket.js"
             "e2e/dashboard.spec.js"
             "e2e/synthetic-backend.js"
+            "e2e/telemetry-freshness.spec.js"
             "playwright.config.js"
           )
           foreach ($file in $files) {

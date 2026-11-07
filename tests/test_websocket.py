@@ -33,6 +33,25 @@ def test_websocket_receives_telemetry(tmp_path, snapshot):
             assert payload["sequence"] == 1
 
 
+def test_websocket_frame_satisfies_the_dashboard_shape_check(tmp_path, snapshot):
+    # isTelemetrySnapshot in frontend/js/websocket.js rejects a frame without these.
+    app = create_app(tmp_path / "ws.db", start_background=False)
+    with TestClient(app) as client:
+        app.state.telemetry.latest = snapshot
+        with client.websocket_connect(
+            "/ws/telemetry", headers={"origin": "http://127.0.0.1:8765"}
+        ) as socket:
+            payload = socket.receive_json()
+    assert payload["type"] == "telemetry"
+    assert isinstance(payload["sequence"], int)
+    assert isinstance(payload["system"], dict)
+    assert isinstance(payload["system"]["timestamp"], str)
+    assert isinstance(payload["network"], dict)
+    assert isinstance(payload["connections"], list)
+    assert isinstance(payload["processes"], list)
+    assert isinstance(payload["alerts"], list)
+
+
 def test_websocket_rejects_remote_origin(tmp_path):
     app = create_app(tmp_path / "ws.db", start_background=False)
     with TestClient(app) as client:

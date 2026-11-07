@@ -54,7 +54,7 @@ button { color: inherit; }
 .topbar { height: 44px; position: sticky; top: 0; z-index: 15; display: flex; align-items: center; justify-content: space-between; padding: 0 26px; background: rgba(5,13,20,.93); backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); color: #8fa8b9; font: 10px ui-monospace, Consolas, monospace; letter-spacing: .7px; }
 .host-meta, .top-status { display: flex; align-items: center; gap: 11px; }
 .host-meta strong { color: #cbdce7; font-weight: 500; }.host-meta i { width: 1px; height: 12px; background: var(--line-bright); }
-.top-status { color: var(--green); }.top-status span { display: flex; align-items: center; gap: 7px; }.top-status .status-dot { width: 7px; height: 7px; }.live-wave { font-size: 20px; }
+.top-status { color: var(--green); }.top-status span { display: flex; align-items: center; gap: 7px; }.top-status .status-dot { width: 7px; height: 7px; }.live-wave { font-size: 20px; }#socket-status, #monitor-status, #mode-label, .top-status .live-wave { color: var(--amber); }
 .mobile-menu { display: none; background: none; border: 0; font-size: 20px; cursor: pointer; }
 .content { padding: 22px 24px 40px; max-width: 1700px; margin: 0 auto; }
 .view { display: none; animation: reveal .25s ease both; }.view.active { display: block; }

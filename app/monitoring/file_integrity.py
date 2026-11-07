@@ -13,6 +13,7 @@ from app.models import (
     FileScanResult,
     MonitoredFolder,
 )
+from app.text_utils import safe_text
 
 
 class FileIntegrityCollector:
@@ -86,7 +87,7 @@ class FileIntegrityCollector:
                     if self._is_link_like(path):
                         skipped += 1
                         continue
-                    relative = path.relative_to(root).as_posix()
+                    relative = safe_text(path.relative_to(root).as_posix())
                     seen.add(relative)
                     try:
                         before = path.stat()

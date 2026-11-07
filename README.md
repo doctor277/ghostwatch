@@ -101,6 +101,7 @@ node --check frontend\js\network-graph.js
 node --check frontend\js\websocket.js
 node --check e2e\dashboard.spec.js
 node --check e2e\synthetic-backend.js
+node --check e2e\telemetry-freshness.spec.js
 node --check playwright.config.js
 npx playwright install chromium
 npm run test:e2e
@@ -109,6 +110,18 @@ npm run test:e2e
 The Playwright suite starts a temporary loopback server and supplies synthetic REST/WebSocket data. Browser binaries are downloaded separately and are not committed or distributed with this repository.
 
 ## Verified results
+
+Evidence is kept in three groups, and each result applies only to the commit and date it names. No public beta release has been created. See [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#evidence-status) for the full record.
+
+### Latest published CI
+
+[Hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) at `c162eed`, the head of draft [PR #7](https://github.com/doctor277/ghostwatch/pull/7): Windows Python 3.11.9 and 3.13.17 each reported 601 passed, synthetic Chromium reported 17 passed, and Ruff, Python compilation, and JavaScript syntax passed. This covers that commit only. PR #7 was open and unmerged at the last check on November 5, 2026, so `main` does not contain this work.
+
+### Local-only results
+
+On **November 7, 2026**, the local commits after `c162eed` (`31b26bd`, `7779a4a`, `0332aa8`) plus this documentation change reported 626 passed with one warning on Windows Python 3.11.9 and 41 passed on synthetic Chromium. Ruff, Python compilation, JavaScript syntax, the PowerShell parser, and a local default-deny archive check also passed. Nothing was pushed. **Hosted CI and Python 3.13 were not run on these commits.** The watchdog commit depends on PR #7. Synthetic persistence measurements are in the [resilience audit](docs/V3_RESILIENCE_AUDIT.md#synthetic-persistence-benchmark-2026-11-07).
+
+### Dated historical snapshots
 
 The accepted Windows closeout on **October 27, 2026** reported 222 Python tests passed, 15 synthetic Playwright tests passed, and 77 focused release-security tests passed. Ruff, Python compilation, JavaScript syntax, PowerShell parsing, SQLite integrity, and live Host/Origin/WebSocket checks also passed.
 
@@ -132,9 +145,11 @@ Report suspected vulnerabilities privately as described in [SECURITY.md](SECURIT
 
 - This local beta supports one Windows user on one computer and has no multi-user authentication or remote deployment model.
 - Windows permissions can make process details, socket ownership, or Event Log data partial or unavailable; GhostWatch reports gaps instead of inferring values.
+- An open socket with no valid snapshot shows `TELEMETRY STALE` after `max(10 s, 3 x refresh interval + 5 s)`, and the last values stay on screen until the next valid snapshot. The watchdog is local work that depends on PR #7; see [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#telemetry-freshness-watchdog---november-5-2026).
 - Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
-- Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI but was not executed locally for this portfolio upgrade.
-- The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification.
+- Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI through `c162eed` only; it has not run on the later local commits.
+- Pending alert, event, and operator writes are held in bounded memory. Abrupt termination can lose them, so GhostWatch gives no durable exactly-once guarantee across a crash.
+- The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification. No 30-60 minute stability run or eight-hour soak has been executed.
 - Historical RC2-RC5 and V2 documents are retained for engineering traceability and do not describe the current beta state.
 
 ## Project documentation

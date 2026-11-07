@@ -5,7 +5,8 @@ import logging
 import shutil
 import sqlite3
 import tempfile
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -71,12 +72,53 @@ NORMALIZED_UNIQUE_KEYS = {
 }
 
 
+SQLITE_INTEGER_BITS = 63
+
+
 class UnsupportedSchemaVersionError(RuntimeError):
     """Raised before writes when a database requires a newer GhostWatch schema."""
 
 
 class TimestampNormalizationCollisionError(RuntimeError):
     """Raised before migration when canonical UTC keys would collide."""
+
+
+class InvalidRecordError(ValueError):
+    """A record that can never be written, whatever the state of the database."""
+
+
+def _record_time(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        raise InvalidRecordError(f"{label} is not a timestamp")
+    try:
+        return utc_iso(value, label=label)
+    except (ValueError, OverflowError) as exc:
+        raise InvalidRecordError(f"{label} has no UTC form") from exc
+
+
+def _record_json(value: object) -> str:
+    try:
+        return json.dumps(value, separators=(",", ":"), default=str)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise InvalidRecordError("Evidence has no JSON form") from exc
+
+
+def _record_values(*values: object) -> tuple[object, ...]:
+    """Refuse what SQLite would, so an error from SQLite is never about the record."""
+    for value in values:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise InvalidRecordError("Text cannot be encoded") from exc
+        elif isinstance(value, int):
+            if value.bit_length() > SQLITE_INTEGER_BITS:
+                raise InvalidRecordError("Integer is outside the storable range")
+        elif value is not None and not isinstance(value, float):
+            raise InvalidRecordError("Value has an unsupported type")
+    return values
 
 
 class Database:
@@ -557,11 +599,17 @@ class Database:
                 [(int(row["source_rowid"]),) for row in members],
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=2.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            # sqlite3's own context manager ends the transaction but stays open.
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _decode_json_list(value: object, fallback: list | None = None) -> list:
@@ -663,18 +711,29 @@ class Database:
 
     def add_alert(self, alert: Alert, retention: int) -> Alert:
         with self._lock, self._connect() as connection:
+            # The authoritative relationship and grouped count must be read in
+            # the same write transaction, including across Database instances.
+            connection.execute("BEGIN IMMEDIATE")
             stored = alert
+            row = connection.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert.id,)
+            ).fetchone()
+            # Incident writes own this relationship. Observations can be stale,
+            # or the incident may have been created before this row existed.
+            incident_id = self._incident_for_alert(
+                connection, alert.id, row["incident_id"] if row is not None else None
+            )
+            if incident_id is None:
+                incident_id = alert.incident_id
+            stored = alert.model_copy(update={"incident_id": incident_id})
             if alert.rule_id == "collection_failure":
-                row = connection.execute(
-                    "SELECT * FROM alerts WHERE id = ?", (alert.id,)
-                ).fetchone()
                 if row is not None:
                     existing = self._row_to_alert(row)
                     reopened = (
                         alert.condition_active is True
                         and existing.condition_active is False
                     )
-                    stored = alert.model_copy(
+                    stored = stored.model_copy(
                         update={
                             "first_occurrence": (
                                 existing.first_occurrence
@@ -691,9 +750,13 @@ class Database:
                                 alert.last_recovery or existing.last_recovery
                             ),
                             "acknowledged": (
-                                False if reopened else existing.acknowledged
+                                False
+                                if reopened
+                                else existing.acknowledged
                             ),
-                            "dismissed": False if reopened else existing.dismissed,
+                            "dismissed": (
+                                False if reopened else existing.dismissed
+                            ),
                         }
                     )
             connection.execute(
@@ -718,9 +781,9 @@ class Database:
                     occurrence_count=excluded.occurrence_count,
                     condition_active=excluded.condition_active,
                     last_recovery=excluded.last_recovery""",
-                (
+                _record_values(
                     stored.id,
-                    utc_iso(stored.timestamp, label="alert timestamp"),
+                    _record_time(stored.timestamp, "alert timestamp"),
                     stored.severity,
                     stored.source,
                     stored.metric,
@@ -728,33 +791,51 @@ class Database:
                     int(stored.acknowledged),
                     int(stored.dismissed),
                     stored.rule_id,
-                    json.dumps(stored.evidence, separators=(",", ":"), default=str),
+                    _record_json(stored.evidence),
                     stored.incident_id,
-                    (
-                        utc_iso(stored.first_occurrence, label="alert first occurrence")
-                        if stored.first_occurrence
-                        else None
-                    ),
-                    (
-                        utc_iso(stored.last_occurrence, label="alert last occurrence")
-                        if stored.last_occurrence
-                        else None
-                    ),
+                    _record_time(stored.first_occurrence, "alert first occurrence"),
+                    _record_time(stored.last_occurrence, "alert last occurrence"),
                     stored.occurrence_count,
                     (
                         int(stored.condition_active)
                         if stored.condition_active is not None
                         else None
                     ),
-                    (
-                        utc_iso(stored.last_recovery, label="alert last recovery")
-                        if stored.last_recovery
-                        else None
-                    ),
+                    _record_time(stored.last_recovery, "alert last recovery"),
                 ),
             )
             self._enforce_retention(connection, retention)
         return stored
+
+    @staticmethod
+    def _incident_for_alert(
+        connection: sqlite3.Connection, alert_id: str, stored_id: str | None
+    ) -> str | None:
+        if stored_id is not None:
+            return stored_id
+        incident = connection.execute(
+            """SELECT id FROM incidents WHERE EXISTS (
+                SELECT 1 FROM json_each(
+                    CASE WHEN json_valid(related_alerts)
+                    THEN related_alerts ELSE '[]' END
+                ) WHERE value = ?
+            ) ORDER BY rowid DESC LIMIT 1""",
+            (alert_id,),
+        ).fetchone()
+        return incident["id"] if incident is not None else None
+
+    def get_alert_incident_ids(self, alert_ids: list[str]) -> dict[str, str | None]:
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN")
+            links = {}
+            for alert_id in alert_ids:
+                row = connection.execute(
+                    "SELECT incident_id FROM alerts WHERE id = ?", (alert_id,)
+                ).fetchone()
+                links[alert_id] = self._incident_for_alert(
+                    connection, alert_id, row["incident_id"] if row is not None else None
+                )
+        return links
 
     def enforce_retention(self, retention: int) -> None:
         with self._lock, self._connect() as connection:
@@ -808,7 +889,8 @@ class Database:
             evidence = json.loads(row["evidence"]) if "evidence" in keys else {}
         except (json.JSONDecodeError, TypeError):
             evidence = {}
-        return Alert(
+        incident_id = row["incident_id"] if "incident_id" in keys else None
+        alert = Alert(
             id=row["id"],
             timestamp=parse_utc(row["timestamp"], label="alerts.timestamp"),
             severity=row["severity"],
@@ -819,7 +901,7 @@ class Database:
             dismissed=bool(row["dismissed"]),
             rule_id=row["rule_id"] if "rule_id" in keys else None,
             evidence=evidence,
-            incident_id=row["incident_id"] if "incident_id" in keys else None,
+            incident_id=incident_id,
             first_occurrence=(
                 parse_utc(row["first_occurrence"], label="alerts.first_occurrence")
                 if "first_occurrence" in keys and row["first_occurrence"]
@@ -846,6 +928,8 @@ class Database:
                 else None
             ),
         )
+        # Digests are for new alerts. A stored row is addressed by what it holds.
+        return alert.model_copy(update={"id": row["id"], "incident_id": incident_id})
 
     def add_event(self, event: EventRecord, retention: int = 10_000) -> None:
         with self._lock, self._connect() as connection:
@@ -854,15 +938,15 @@ class Database:
                 (id, timestamp, event_type, severity, title, summary, related_id, evidence)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING""",
-                (
+                _record_values(
                     event.id,
-                    utc_iso(event.timestamp, label="event timestamp"),
+                    _record_time(event.timestamp, "event timestamp"),
                     event.event_type,
                     event.severity,
                     event.title,
                     event.summary,
                     event.related_id,
-                    json.dumps(event.evidence, separators=(",", ":"), default=str),
+                    _record_json(event.evidence),
                 ),
             )
             connection.execute(
@@ -1098,7 +1182,7 @@ class Database:
             result = connection.execute(
                 "DELETE FROM monitored_folders WHERE id = ?", (folder_id,)
             )
-        return bool(result.rowcount)
+            return bool(result.rowcount)
 
     def load_file_baseline(self, folder_id: str) -> dict[str, FileBaselineEntry]:
         with self._lock, self._connect() as connection:
@@ -1938,6 +2022,9 @@ class Database:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            with sqlite3.connect(self.path) as source, sqlite3.connect(destination) as target:
+            with (
+                closing(sqlite3.connect(self.path)) as source,
+                closing(sqlite3.connect(destination)) as target,
+            ):
                 source.backup(target)
         return destination
