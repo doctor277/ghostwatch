@@ -2,7 +2,69 @@
 
 ## Scope
 
-This document records the accepted Windows local-beta closeout and the subsequent portfolio-documentation verification. It does not combine results from different operating systems or imply penetration-testing certification.
+This document records GhostWatch V3 local-beta evidence in three separate groups: the latest published CI, local-only results on later commits, and dated historical snapshots. A result applies only to the commit and date it names. This document does not combine results from different commits or operating systems, and it does not imply penetration-testing certification. No public beta release has been created.
+
+## Evidence status
+
+| Group | Applies to | Result | Does not cover |
+| --- | --- | --- | --- |
+| Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
+| Local-only results | `0332aa8` plus this documentation change; see [below](#local-only-results---november-7-2026) | 626 passed with one warning on Python 3.11.9. 41 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
+| Dated historical snapshots | The sections below dated October 27 to November 3, 2026 | 222 Python and 15 Playwright, as recorded on each date | The current tree |
+
+`c162eed` is the head of draft [PR #7](https://github.com/doctor277/ghostwatch/pull/7), which was open and unmerged at the last check on November 5, 2026. The merge decision belongs to the owner. The hosted figures above are carried over from that checkpoint and were not fetched again for the local run below.
+
+## Local-only results - November 7, 2026
+
+Status: local only, not pushed. **Hosted CI and Python 3.13 were not run on these changes.** These results describe local commits `31b26bd`, `7779a4a` and `0332aa8`, plus this uncommitted documentation change. They depend on PR #7 until that PR is merged.
+
+Environment: Windows 11, Python 3.11.9 from an existing virtual environment, Node 22.23.2, the installed Playwright Chromium, and synthetic fixtures only.
+
+| Command | Result |
+| --- | --- |
+| `python -m pytest -q --basetemp=<ignored scratch> -p no:cacheprovider` | `626 passed, 0 failed, 0 skipped, 1 warning` |
+| `python -m pytest tests/test_v3_final_packaging.py tests/test_v3_rc4_hardening.py tests/test_v3_rc5_release.py -q` (same options) | `77 passed, 0 failed, 0 skipped` |
+| `npm run test:e2e` | `41 passed, 0 failed, 0 skipped` |
+| `python -m ruff check .` | `All checks passed!` |
+| `python -m compileall -q app scripts tests` | Passed |
+| `node --check`, the nine JavaScript files listed in the [README](../README.md#testing) | `9 passed, 0 failed` |
+| PowerShell parser on `start.ps1` | `0 errors` |
+| `git diff --check` | Passed |
+
+`--basetemp` is required on this machine because the default user temp directory denies access. That is an environment limit, not a test failure. The published `601` and `17` figures are not results for this tree.
+
+### Local release archive
+
+`python scripts/package_release.py <ignored scratch>\ghostwatch-source.zip` built the archive under the ignored `.tmp/` directory. It was not published or uploaded, and the allowlist was not changed.
+
+- Members: 118 unique entries, which is the 115 recorded at `c162eed` plus `e2e/telemetry-freshness.spec.js`, `scripts/benchmark_persistence.py` and `tests/test_v3_benchmark_persistence.py`. Every member is a tracked file. The three additions fall under the existing `e2e`, `scripts` and `tests` directories and are included intentionally: they use only synthetic data and are the documented way to repeat these checks.
+- Tracked but excluded by the default-deny list: `.github/dependabot.yml`, `.github/workflows/ci.yml`, `AGENTS.md`, `CONTRIBUTING.md` and `SECURITY.md`.
+- Root MIT `LICENSE` included. `docs/browser-demo-network-graph.png` is the only binary member and matches the tree byte for byte. Both concept images and `docs/browser-desktop.png` are absent.
+- `verify_archive` passed, including the sensitive-payload scan. A separate scan of the members found no private key, API key, bearer token or local account name. Its SID, profile-path and email matches are all synthetic test fixtures. `docs/V3_RC3_TEST_RESULTS.md` keeps a historical repository folder name behind `<USER_HOME>`.
+- All local Markdown links in the archive resolve except four: `README.md` and `docs/README.md` each link to `SECURITY.md` and `CONTRIBUTING.md`, which the archive excludes. Those links work in the repository. The allowlist was left unchanged, so this needs an owner decision before any archive is distributed.
+
+The archive SHA-256 is reported with the local run, not here, because embedding it would change the archive it identifies.
+
+### Not run
+
+- Hosted CI, on any local commit: NOT RUN, because pushing needs owner approval.
+- Python 3.13: NOT RUN. Only Python 3.11.9 and 3.14.3 are installed locally, and 3.14 has no project dependencies.
+- Firefox, WebKit and native Edge: NOT RUN. Only Chromium assets are installed.
+- `start.ps1` launch: NOT RUN. It would create an environment, install packages over the network and start real collectors. Only its syntax was checked. The Playwright server covers the loopback path with synthetic data.
+- A 30-60 minute stability run and an eight-hour soak: NOT RUN. See the [audit](V3_RESILIENCE_AUDIT.md#stability-run).
+- A complete default `benchmark_persistence` run in its final order: NOT VERIFIED. See the [audit](V3_RESILIENCE_AUDIT.md#environment-and-commands), which also holds the [benchmark measurements](V3_RESILIENCE_AUDIT.md#synthetic-persistence-benchmark-2026-11-07).
+
+### Owner approval and manual checks
+
+Code-quality recommendation from the merge-gate recheck: **APPROVE WITH FOLLOW-UPS**. See the [audit](V3_RESILIENCE_AUDIT.md#merge-gate-recheck-2026-11-05). This is not a GitHub approval.
+
+1. Review the local commits, then decide whether to authorize any push.
+2. Decide whether and when to merge PR #7. The watchdog commit depends on it.
+3. After any authorized push, confirm hosted CI on the pushed commit, including Python 3.13.
+4. Decide whether Firefox, WebKit and native Edge coverage is needed.
+5. Decide whether to run a stability run or an eight-hour soak before claiming long-run behavior.
+6. Run `start.ps1` manually on the intended machine. Confirm that non-elevated gaps in process, socket-owner and Event Log data are shown as unavailable, and that real data stays visually distinct from Demo Mode.
+7. Decide how to handle the four archive links above, then rebuild and hash any archive from the exact commit being released.
 
 ## Accepted Windows closeout — October 27, 2026
 
@@ -70,11 +132,13 @@ Current-source packaging is intentionally executed after this document is finali
 - Windows permissions can make process, socket-owner, or Event Log metadata partial or unavailable.
 - Historic collection-failure records are preserved as evidence and are not silently rewritten.
 - Optional local AI output is not a security verdict.
-- No Git metadata is present in this source snapshot, so an archive SHA-256 is the publication snapshot identity.
+- Pending writes are held in bounded memory, so abrupt termination can lose them. There is no durable exactly-once guarantee across a crash.
+- Browser evidence uses synthetic fixtures. It does not show the dashboard running against real collectors.
+- Git commit SHAs now identify source states, and an archive SHA-256 identifies one generated archive. The earlier source snapshot had no Git metadata, so its archive SHA-256 was its only identity.
 
 ## Telemetry freshness watchdog - November 5, 2026
 
-Status: local only, not pushed, and not covered by hosted CI. These results describe this working-tree change before it was committed, on top of `31b26bd`, on Windows 11, Python 3.11.9, Node 22.23.2 and synthetic Chromium. Python 3.13 was NOT VERIFIED for this change. The feature depends on PR #7, which remains draft and unmerged, so it should not be published until that PR is resolved.
+Status: local only, not pushed, and not covered by hosted CI. These results describe this change before it was committed as `7779a4a`, on top of `31b26bd`, on Windows 11, Python 3.11.9, Node 22.23.2 and synthetic Chromium. Python 3.13 was NOT VERIFIED for this change. The feature depends on PR #7, which remains draft and unmerged, so it should not be published until that PR is resolved.
 
 `frontend/js/websocket.js` keeps one watchdog per `TelemetrySocket`:
 

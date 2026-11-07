@@ -5,7 +5,8 @@ This index separates current V3 beta documentation from historical release-candi
 ## Current V3 beta
 
 - [`../README.md`](../README.md) — portfolio overview, architecture, installation, safety boundaries, and current status.
-- [`CURRENT_BETA_VALIDATION.md`](CURRENT_BETA_VALIDATION.md) — current Windows closeout evidence and portfolio-preparation rerun.
+- [`CURRENT_BETA_VALIDATION.md`](CURRENT_BETA_VALIDATION.md) — evidence status: latest published CI, local-only results, and dated Windows closeout snapshots.
+- [`V3_RESILIENCE_AUDIT.md`](V3_RESILIENCE_AUDIT.md) — resilience findings, merge-gate recheck, synthetic persistence benchmark, and known limitations.
 - [`GITHUB_PUBLICATION_CHECKLIST.md`](GITHUB_PUBLICATION_CHECKLIST.md) — publication, privacy, and repository hygiene checklist.
 - [`../LICENSE`](../LICENSE) — authoritative MIT License for GhostWatch-authored source and documentation.
 - [`LICENSE_OPTIONS.md`](LICENSE_OPTIONS.md) — recorded MIT selection and alternatives considered.

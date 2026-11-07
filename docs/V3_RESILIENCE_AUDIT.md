@@ -1,8 +1,10 @@
 # V3 resilience audit
 
-Work in progress on the local `feat/v3-resilience-hardening` branch, based on
-`b97ab88fffe5bb50fdc26855e3ee8ce3bc4dc3a1`. No engineering changes are authorized
-for push. No changes to production V2.
+Engineering record for `feat/v3-resilience-hardening`, based on
+`b97ab88fffe5bb50fdc26855e3ee8ce3bc4dc3a1`. That branch is published as draft
+[PR #7](https://github.com/doctor277/ghostwatch/pull/7) at `c162eed`, which was open and
+unmerged at the last check on 2026-11-05. Sections dated after that commit describe
+local commits only, and no further push is authorized. No changes to production V2.
 
 ## Progress record
 
@@ -51,10 +53,19 @@ for push. No changes to production V2.
 - VERIFIED LOCALLY: queue capacity below, Python 3.11.9 on Windows: 515 pytest passed,
   17 Playwright tests passed against the synthetic server, Ruff, compilation and
   JavaScript syntax passed. Hosted CI has not run on this change.
-- PENDING: open findings below, synthetic performance and memory measurements,
-  supply-chain review, and release documentation.
+- VERIFIED: hosted run
+  [41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) at
+  `c162eed`: Python 3.11.9 and 3.13.17 each 601 passed, Chromium 17 passed, with Ruff,
+  compilation and JavaScript syntax passing. This is the latest published CI. It covers
+  that commit only, not the local commits below.
+- LOCAL ONLY: `31b26bd` merge-gate fixes, `7779a4a` telemetry freshness watchdog and
+  `0332aa8` synthetic persistence benchmark. None has run on hosted CI or Python 3.13.
+  Results are in the sections below and in
+  [Current Beta Validation](CURRENT_BETA_VALIDATION.md#local-only-results---november-7-2026).
+- PENDING: open findings below. A supply-chain review of these changes is not recorded
+  here.
 
-These hosted results describe the portfolio branch, not the engineering changes.
+Run 41888969539 above describes the portfolio branch, not the engineering changes.
 
 ## Fixed
 
@@ -428,7 +439,8 @@ pending observations and patches are still bounded memory, and process terminati
 can lose them. Patch evictions use the existing dropped-alert-write counter; each
 of the alert, event and operator-patch queues has its own 500-entry limit. Unlinked
 observations inspect incident membership lists; cost on very large incident archives
-has not been benchmarked. Historical counts or relationships corrupted before this
+was not benchmarked at this point. See
+[the later benchmark](#synthetic-persistence-benchmark-2026-11-07). Historical counts or relationships corrupted before this
 fix are not rewritten automatically.
 
 Final local validation on Windows / Python 3.11.9:
@@ -530,10 +542,12 @@ indefinitely for it: reconciliation continues while the same event loop is alive
 and a later start on that service respects the active owner. Historical incorrect
 counts/links are not repaired automatically. A failed post-commit incident refresh
 returns 503 explicitly stating that the incident was persisted; blindly retrying
-creation can create another incident. Large incident archives remain unbenchmarked.
+creation can create another incident. Large incident archives were unbenchmarked at
+this point; see [the later benchmark](#synthetic-persistence-benchmark-2026-11-07).
 
-This follow-up is local only. PR #7 remains draft and unmerged by instruction; no
-remote operation, push, PR mutation or production V2 change is part of this work.
+This follow-up was local when written and is now part of published `c162eed`, covered by
+hosted run 41974485263. PR #7 remained draft and unmerged by instruction; no production
+V2 change is part of this work.
 
 ## Merge-gate recheck, 2026-11-05
 
@@ -545,8 +559,8 @@ or power-loss experiment was run.
 
 **Recommendation for code quality: APPROVE WITH FOLLOW-UPS.** This is not a GitHub
 approval. Hosted CI was not rerun, so its 601/17 results describe only the published
-SHA and not this tree. The state of PR #7 was not rechecked. The fixes below are
-uncommitted at the time of writing. Automatic review notes rejected two earlier
+SHA and not this tree. The state of PR #7 was not rechecked. The fixes below were
+uncommitted at the time of writing and are now local commit `31b26bd`. Automatic review notes rejected two earlier
 revisions: the one with defects 1-3 only, because of defect 4, and the one with defects
 1-6, because of defect 7. Both notes were treated as unverified claims and reproduced
 with deterministic tests before any fix. Defects 4-6 were the second focused attempt on
@@ -687,8 +701,8 @@ None blocks the local beta candidate. All are low severity.
 
 ## Synthetic persistence benchmark, 2026-11-07
 
-New local measurements from this run, on `7779a4a` plus the uncommitted benchmark
-script. Nothing here is hosted CI, and nothing was reused from the older 10k-socket
+New local measurements from this run, on `7779a4a` plus the benchmark script, since
+committed as `0332aa8`. Nothing here is hosted CI, and nothing was reused from the older 10k-socket
 results. No application code, schema or index changed.
 
 **Decision: no index or schema change.** The JSON scan is real and grows with the
