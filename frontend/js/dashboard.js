@@ -1117,6 +1117,7 @@ function enterDemo() {
   if (state.demo) return;
   state.socket?.disconnect();
   state.demo = true;
+  showSocketStatus("DEMO DATA");
   const demo = createDemoData();
   state.history = [];
   state.events = demo.events;
@@ -1133,20 +1134,31 @@ async function exitDemo() {
   state.history = []; state.events = []; state.incidents = []; state.selectedIncident = null;
   $("#demo-banner").hidden = true;
   text("#mode-label", "LIVE");
+  showSocketStatus("CONNECTING");
   await loadInitialData();
   startSocket();
   showToast("Returned to live local monitoring");
 }
 
+function showSocketStatus(status) {
+  const color = status === "CONNECTED" ? "var(--green)" : "var(--amber)";
+  text("#socket-status", status);
+  [$("#socket-status"), $("#monitor-status"), $("#mode-label"), $(".live-wave")].forEach((node) => { node.style.color = color; });
+  if (status === "TELEMETRY STALE") {
+    $("#socket-status").title = "The socket is open but no valid telemetry is arriving. Values shown are the last received.";
+    if (state.snapshot) text("#last-update", `STALE · LAST UPDATE ${new Date(state.snapshot.system.timestamp).toLocaleTimeString()}`);
+  } else {
+    $("#socket-status").removeAttribute("title");
+  }
+}
+
 function startSocket() {
   state.socket?.disconnect();
+  if (state.demo) return;
   state.socket = new TelemetrySocket(
     (snapshot) => { if (!state.demo) renderSnapshot(snapshot); },
-    (status) => {
-      if (state.demo) return;
-      text("#socket-status", status);
-      $("#socket-status").style.color = status === "CONNECTED" ? "var(--green)" : "var(--amber)";
-    },
+    (status) => { if (!state.demo) showSocketStatus(status); },
+    () => state.settings?.refresh_interval,
   );
   state.socket.connect();
 }

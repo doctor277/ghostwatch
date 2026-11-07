@@ -72,6 +72,40 @@ Current-source packaging is intentionally executed after this document is finali
 - Optional local AI output is not a security verdict.
 - No Git metadata is present in this source snapshot, so an archive SHA-256 is the publication snapshot identity.
 
+## Telemetry freshness watchdog - November 5, 2026
+
+Status: local only, not pushed, and not covered by hosted CI. These results describe this working-tree change before it was committed, on top of `31b26bd`, on Windows 11, Python 3.11.9, Node 22.23.2 and synthetic Chromium. Python 3.13 was NOT VERIFIED for this change. The feature depends on PR #7, which remains draft and unmerged, so it should not be published until that PR is resolved.
+
+`frontend/js/websocket.js` keeps one watchdog per `TelemetrySocket`:
+
+- Timeout: `max(10 s, 3 x refresh_interval + 5 s)`. That is 11 s at the default 2 s, 10 s at 1 s, and 95 s at 30 s. The service waits a full interval and then collects, so three intervals plus the margin allow for collection time and scheduling delay.
+- If settings failed to load, or the interval is outside 1-30 s, the timeout uses 30 s (95 s). A late warning is preferred to a false one.
+- The interval is read when a socket opens and when a valid snapshot arrives. A saved interval therefore cannot shorten the wait for a frame the old interval is still due to deliver.
+- Only a snapshot that passes the shape check and renders without throwing refreshes the watchdog. Degraded frames, malformed JSON and other JSON do not.
+- Frames move a `performance.now()` stamp. One timer rechecks the elapsed time when it fires, so a delayed timer in a throttled tab does not misreport.
+
+| Status | Meaning |
+| --- | --- |
+| `CONNECTING`, `RECONNECTING` | No open socket |
+| `AWAITING TELEMETRY` | Socket open, no valid snapshot yet. This replaces the green `CONNECTED` previously shown on open |
+| `CONNECTED` | Valid snapshot received within the timeout. This is the only green status |
+| `TELEMETRY STALE` | Socket open, no valid snapshot within the timeout. The last values stay visible, and `#last-update` marks them stale |
+| `TELEMETRY DEGRADED`, `DATA ERROR` | The latest frame was unusable. These are not replaced by stale |
+| `DEMO DATA` | Demo Mode. No socket or watchdog runs |
+
+The `MONITORING` and `LIVE` labels follow the same colour. A collection slower than the timeout shows amber until its frame arrives, which is an accurate description of what the browser has received. Collection time itself has no hard limit in this change.
+
+Pre-fix evidence, with an extracted `31b26bd` tree plus the final `e2e/telemetry-freshness.spec.js` and `e2e/synthetic-backend.js`: 23 failed, 1 passed. The silent-socket test reported `Expected: "TELEMETRY STALE"`, `Received: "CONNECTED"`. The test that passed covers a snapshot that throws while rendering, which the earlier code already reported as `DATA ERROR`.
+
+Results after the change:
+
+- `npx playwright test e2e/telemetry-freshness.spec.js --repeat-each=3`: `72 passed`
+- `npm run test:e2e`: `41 passed, 0 failed, 0 skipped` (39 desktop Chromium, 2 Pixel 7 emulation, 24 of the 41 from the new spec)
+- `python -m pytest -q --basetemp=<ignored scratch>`: `622 passed, 0 failed, 0 skipped, 1 warning`
+- `python -m ruff check .`, `python -m compileall -q app scripts tests`, and `node --check` on all nine JavaScript files: passed
+
+Limits: a socket that connects receives the cached latest snapshot, so a reload or reconnect after collection has stopped shows `CONNECTED` for up to one timeout before `TELEMETRY STALE`. The watchdog measures frame arrival, not the age of the snapshot. Time is driven by Playwright's fake clock against the synthetic WebSocket harness. No real throttled background tab, real backend outage or browser other than Chromium was exercised.
+
 ## GitHub portfolio upgrade verification - November 3, 2026
 
 Executed on Windows from the local `chore/portfolio-polish` branch after adding repository documentation, CI, and dependency automation. No application, frontend, database, V2, or historical RC implementation file changed.

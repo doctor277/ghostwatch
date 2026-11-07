@@ -746,8 +746,9 @@ These come from code review and have not been reproduced, unless noted.
 - Rows stored with longer text are bounded when read. The stored row is not rewritten.
 - Evidence mutated after construction bypasses the model boundary, and one such alert
   makes the whole `/api/alerts` response a 503. No application code does this.
-- `telemetry_degraded` covers snapshots that exist but cannot be served. The dashboard
-  has no watchdog for frames that stop arriving while the socket stays open, so it can
-  still show `CONNECTED` if collection itself stops.
+- `telemetry_degraded` covers snapshots that exist but cannot be served. Frames that
+  stop arriving while the socket stays open now show `TELEMETRY STALE`. This is local
+  work that depends on PR #7; the timeout and evidence are in
+  [Current Beta Validation](CURRENT_BETA_VALIDATION.md#telemetry-freshness-watchdog---november-5-2026).
 - During a serialization failure the dashboard keeps the last rendered values under the
   degraded status. Playwright covers this path with synthetic frames only.

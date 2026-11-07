@@ -101,6 +101,7 @@ node --check frontend\js\network-graph.js
 node --check frontend\js\websocket.js
 node --check e2e\dashboard.spec.js
 node --check e2e\synthetic-backend.js
+node --check e2e\telemetry-freshness.spec.js
 node --check playwright.config.js
 npx playwright install chromium
 npm run test:e2e
@@ -132,6 +133,7 @@ Report suspected vulnerabilities privately as described in [SECURITY.md](SECURIT
 
 - This local beta supports one Windows user on one computer and has no multi-user authentication or remote deployment model.
 - Windows permissions can make process details, socket ownership, or Event Log data partial or unavailable; GhostWatch reports gaps instead of inferring values.
+- An open socket with no valid snapshot shows `TELEMETRY STALE` after `max(10 s, 3 x refresh interval + 5 s)`, and the last values stay on screen until the next valid snapshot. The watchdog is local work that depends on PR #7; see [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#telemetry-freshness-watchdog---november-5-2026).
 - Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
 - Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI but was not executed locally for this portfolio upgrade.
 - The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification.
