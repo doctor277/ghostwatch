@@ -685,6 +685,172 @@ None blocks the local beta candidate. All are low severity.
 - Persistence ownership is bound to one event loop. Stop/start on a different loop
   remains unsupported.
 
+## Synthetic persistence benchmark, 2026-11-07
+
+New local measurements from this run, on `7779a4a` plus the uncommitted benchmark
+script. Nothing here is hosted CI, and nothing was reused from the older 10k-socket
+results. No application code, schema or index changed.
+
+**Decision: no index or schema change.** The JSON scan is real and grows with the
+archive, but it stays within normal write cost at sizes a single operator can reach.
+Incidents come only from `POST /api/incidents`, one at a time. No path deletes them, so
+the archive only grows, and the finding stays open for a future review.
+
+### Environment and commands
+
+| Item | Value |
+| --- | --- |
+| Platform | Windows 11 Home 10.0.26300 (`platform` reports `Windows-10`), Intel i7-1360P, 12 cores, 16 logical, 16 GB RAM |
+| Runtime | Python 3.11.9, SQLite 3.45.1 |
+| Storage | Disposable directories under the ignored `.tmp/`, on a path inside a OneDrive folder. Latency includes file open and commit cost there, so compare rows rather than quoting absolute values |
+| Data | Synthetic rows only; no host data read and no real collector run |
+
+All commands ran from the repository root, with a hard outer `timeout`:
+
+```powershell
+python -m scripts.benchmark_endurance
+python -m scripts.benchmark_sockets
+python -m scripts.benchmark_persistence
+python -m scripts.benchmark_persistence --archive 3:1 --samples 5 --max-case-seconds 1
+```
+
+Both existing scripts need `python -m` from the root, because they import `app`. They
+were not changed. The third command is the one repeatable benchmark command. Allow 20
+minutes: it uses the default archives, 200 samples and a 5 second cap per case, except
+that every case takes at least 5 samples. That floor is why slow cases overrun the cap.
+
+**The archive figures and the outage figures come from separate runs.** The third
+command hit its 1,020 second `timeout` (exit 124) after all seven archives printed, when
+the outage still ran last. The fourth command then ran the outage alone, exit 0, in 22.8
+seconds. The script now runs the outage first and prints it at once, so a timeout cannot
+lose it again. That reorder was checked by the tests and the short command only. **A
+complete default run in the final order was NOT VERIFIED**, because it did not fit the
+remaining session time.
+
+### Existing socket benchmarks
+
+| Script | Input | Elapsed | Latency | Traced memory | Collector bounds |
+| --- | --- | --- | --- | --- | --- |
+| `benchmark_endurance` | 10,000 sockets, 20 repeats | 41.2 s | min 683.75, median 2,020.47, p95 and max 2,182.20 ms | peak 8,587,086 bytes, current 3,447,217, growth 159,360 | lifecycle 10,000, recently closed 100, details 250 |
+| `benchmark_sockets` | 500 / 1,000 / 5,000 / 10,000 sockets, one pass each | 1.9 s | 57.37 / 94.10 / 297.44 / 678.00 ms | peak 786,164 / 889,420 / 3,054,292 / 4,915,088 bytes | details 250 at every size |
+
+Both run under `tracemalloc`, which inflates latency. With 20 repeats, p95 is the maximum.
+An earlier pass on the same commit gave an endurance median of 2,137.53 ms and a maximum
+of 3,949.00 ms, so treat the maximum as noisy.
+
+### Incident lookups
+
+Each cell is p50 / p95 / max in ms, with the sample count in brackets. `stored_link` is
+an alert row that already holds its link. `member_newest` and `member_oldest` are not
+linked in `alerts` and sit in the first and last incidents scanned. `miss` is in no
+incident, the normal path for each new alert. With under 20 samples, p95 is the maximum.
+
+| Incidents x members | `add_alert/stored_link` | `add_alert/member_newest` | `add_alert/member_oldest` | `add_alert/miss` |
+| --- | --- | --- | --- | --- |
+| 100 x 2 | 11.667 / 21.641 / 25.269 (200) | 14.639 / 22.358 / 88.337 (174) | 14.66 / 22.346 / 101.354 (174) | 16.53 / 26.787 / 87.494 (148) |
+| 100 x 100 | 16.011 / 25.102 / 73.369 (200) | 13.999 / 23.632 / 147.133 (164) | 18.596 / 28.053 / 36.293 (149) | 19.002 / 29.117 / 35.844 (152) |
+| 1,000 x 2 | 16.021 / 24.066 / 109.238 (200) | 14.231 / 23.221 / 45.523 (170) | 18.989 / 30.92 / 130.918 (139) | 17.166 / 25.206 / 31.081 (160) |
+| 1,000 x 100 | 14.297 / 22.37 / 61.273 (200) | 14.694 / 27.426 / 69.699 (165) | 54.282 / 80.119 / 169.009 (70) | 54.618 / 78.035 / 96.36 (73) |
+| 10,000 x 2 | 13.996 / 22.547 / 45.128 (200) | 14.142 / 25.745 / 121.405 (168) | 35.733 / 50.804 / 135.995 (97) | 34.566 / 53.969 / 66.375 (99) |
+| 10,000 x 100 | 14.808 / 24.547 / 268.452 (200) | 15.309 / 20.82 / 26.463 (168) | 404.28 / 439.021 / 439.021 (12) | 391.396 / 433.754 / 433.754 (13) |
+| 100,000 x 2 | 9.275 / 21.448 / 51.33 (200) | 7.916 / 12.361 / 99.727 (200) | 205.681 / 273.39 / 298.651 (24) | 208.447 / 255.039 / 272.388 (22) |
+
+| Incidents x members | `get_alert_incident_ids[1]/stored_link` | `get_alert_incident_ids[1]/miss` | `get_alert_incident_ids[100]/stored_link` | `get_alert_incident_ids[100]/member_oldest` | `get_alert_incident_ids[100]/miss` |
+| --- | --- | --- | --- | --- | --- |
+| 100 x 2 | 4.423 / 9.291 / 13.287 (200) | 5.521 / 11.839 / 16.415 (200) | 6.446 / 13.898 / 33.984 (200) | 15.386 / 22.314 / 30.804 (200) | 18.626 / 28.364 / 35.507 (200) |
+| 100 x 100 | 4.596 / 8.545 / 12.007 (200) | 8.256 / 14.139 / 17.261 (200) | 5.455 / 9.989 / 12.629 (200) | 273.308 / 311.86 / 311.86 (19) | 264.848 / 323.085 / 323.085 (19) |
+| 1,000 x 2 | 5.071 / 12.68 / 14.87 (200) | 6.419 / 12.702 / 17.142 (200) | 5.299 / 10.346 / 15.315 (200) | 122.935 / 149.955 / 167.335 (40) | 124.259 / 155.808 / 158.743 (40) |
+| 1,000 x 100 | 4.591 / 7.507 / 12.741 (200) | 43.248 / 54.707 / 67.669 (111) | 5.399 / 9.347 / 15.548 (200) | 3831.647 / 4004.959 / 4004.959 (5) | 3797.776 / 4027.418 / 4027.418 (5) |
+| 10,000 x 2 | 4.635 / 6.014 / 11.805 (200) | 22.261 / 29.3 / 42.326 (200) | 5.375 / 9.453 / 14.756 (200) | 1814.485 / 1890.545 / 1890.545 (5) | 1762.86 / 1900.464 / 1900.464 (5) |
+| 10,000 x 100 | 4.647 / 8.485 / 11.895 (200) | 385.904 / 449.744 / 449.744 (13) | 5.895 / 11.42 / 94.63 (200) | 39356.572 / 44994.317 / 44994.317 (5) | 40241.756 / 45746.555 / 45746.555 (5) |
+| 100,000 x 2 | 5.514 / 11.231 / 19.538 (200) | 193.079 / 244.188 / 261.176 (26) | 5.776 / 11.266 / 27.88 (200) | 18225.597 / 18877.753 / 18877.753 (5) | 19035.443 / 19392.772 / 19392.772 (5) |
+
+| Incidents x members | `add_incident/hit` | `add_incident/miss` | `initialize` |
+| --- | --- | --- | --- |
+| 100 x 2 | 14.268 / 20.921 / 25.772 (115) | 11.777 / 26.754 / 59.307 (134) | 57.743 / 67.584 / 67.584 (5) |
+| 100 x 100 | 16.447 / 24.825 / 41.786 (106) | 11.49 / 18.869 / 32.122 (140) | 55.292 / 59.84 / 59.84 (5) |
+| 1,000 x 2 | 12.839 / 19.274 / 73.491 (127) | 11.443 / 17.058 / 100.805 (145) | 76.319 / 80.11 / 80.11 (5) |
+| 1,000 x 100 | 13.906 / 22.475 / 30.906 (118) | 11.084 / 15.553 / 21.979 (153) | 110.12 / 126.257 / 126.257 (5) |
+| 10,000 x 2 | 14.578 / 18.515 / 22.87 (120) | 11.97 / 18.785 / 124.298 (140) | 290.119 / 329.235 / 329.235 (5) |
+| 10,000 x 100 | 16.022 / 24.973 / 86.053 (104) | 11.845 / 20.555 / 115.402 (137) | 724.957 / 743.304 / 743.304 (5) |
+| 100,000 x 2 | 16.069 / 34.566 / 105.137 (99) | 11.425 / 19.613 / 143.793 (141) | 2840.478 / 2888.141 / 2888.141 (5) |
+
+`add_incident` does not scan: hit and miss stay flat across all sizes. `initialize` is
+measured because every storage recovery attempt repeats it, including
+`PRAGMA integrity_check`. Telemetry history was empty and alerts stopped at 1,000, so
+these databases understate a long-used one.
+
+| Archive | Database bytes after seeding | Traced peak, 100 misses | `PRAGMA integrity_check` |
+| --- | --- | --- | --- |
+| 100 x 2 | 430,080 | 31,484 | ok |
+| 100 x 100 | 819,200 | 31,484 | ok |
+| 1,000 x 2 | 679,936 | 31,484 | ok |
+| 1,000 x 100 | 4,579,328 | 31,484 | ok |
+| 10,000 x 2 | 3,112,960 | 31,484 | ok |
+| 10,000 x 100 | 42,115,072 | 31,484 | ok |
+| 100,000 x 2 | 27,627,520 | 31,788 | ok |
+
+Query plans, from `EXPLAIN QUERY PLAN` on the application's own SQL:
+
+| Statement | Plan |
+| --- | --- |
+| `_incident_for_alert`, no stored link | `SCAN incidents`; `CORRELATED SCALAR SUBQUERY 1`; `SCAN json_each VIRTUAL TABLE INDEX 1:` |
+| `_enforce_retention`, every `add_alert` | `SCAN alerts`; `LIST SUBQUERY 1`; `SCAN alerts USING INDEX alerts_timestamp_idx` |
+| Stored link read | `SEARCH alerts USING INDEX sqlite_autoindex_alerts_1 (id=?)` |
+| `add_incident` link update | `SEARCH alerts USING INDEX sqlite_autoindex_alerts_1 (id=?)` |
+
+What the data shows:
+
+- Cost tracks total stored memberships as well as incident count. Comparing p50 of
+  `miss` with `stored_link`, `add_alert` shows no clear cost at 1,000 x 2, then adds
+  about 40 ms at 1,000 x 100, 20 ms at 10,000 x 2, 200 ms at 100,000 x 2 and 375 ms at
+  10,000 x 100. Each write holds `BEGIN IMMEDIATE` and the `Database` lock for that time.
+- Against the default 2 second refresh interval, an alert write stays well inside one
+  cycle at every measured size.
+- The bad case is a batch of 100 unlinked IDs: about 3.8 s at 1,000 x 100, 19 s at
+  100,000 x 2 and 40 s at 10,000 x 100, with the lock held. Other database calls wait
+  for that time. This needs an incident citing 100 alerts with no stored link, such as
+  alerts already pruned, in an archive far beyond normal manual use. At 1,000 x 2 it is
+  about 125 ms. `get_alert_incident_ids[100]/stored_link` stays near 6 ms at the two
+  largest sizes.
+- A membership table or an index on it is the likely fix if real archives approach
+  these sizes. It was not built, because that is a schema change no realistic size
+  here justifies.
+
+### Synthetic outage
+
+Added because it goes beyond `tests/test_v3_queue_capacity.py`: it fills the real 500
+entry limits, causes the outage with a real SQLite `BEGIN EXCLUSIVE` lock rather than a
+patched failure, and reads `/api/health` over the test client. Failed invariants raise,
+so a clean exit means all of them held. Fourth command, exit 0, `integrity_check` ok:
+
+| Stage | Observed |
+| --- | --- |
+| Outage with 600 alerts and 600 events, 2.469 s under `tracemalloc`, traced peak 1,757,194 bytes | `/api/health`: `degraded`, `pending_writes` 1,000, `dropped_alert_writes` 100, `dropped_event_writes` 100, `last_error_type` `OperationalError` |
+| Retry and opt-out while locked | Both failed. Queue kept at 1,000, logging stayed on, and the unsaved opt-out was not applied |
+| Recovery, 13.656 s for 1,000 writes | `healthy`, `pending_writes` 0, drop counts kept at 100 each. 499 alerts plus the grouped row, and 500 events, stored oldest first without the evicted entries |
+| Further recovery and flush passes | No replay: grouped count stayed at 2, and a new detection made it 3 |
+| Second full outage, then a saved opt-out | `pending_writes` 0, counts rose only by the new evictions to 200 each, so the 1,000 discarded writes were not reported as loss. Nothing discarded was stored, including after logging was turned back on |
+
+During the locked retry the log showed `PermissionError` as well as `OperationalError`:
+on Windows the schema check's file copy cannot read a locked database. Storage stayed
+degraded and recovered normally, so this changes only the reported error type.
+
+### Stability run
+
+**NOT RUN.** The orchestrator gives each agent invocation 40 minutes, and a 30-60 minute
+run would not fit that window alongside the benchmarks. No duration or aggregate metric
+is claimed, and no eight-hour soak has been run.
+
+### Limitations
+
+- One machine, one interpreter, one pass of each default archive, on a working laptop
+  with other software running. Python 3.13 was not measured.
+- Cases at the 5-sample floor give coarse percentiles. The 40 s figures are five samples.
+- Single-threaded storage calls only. Lock waits seen by a concurrent caller, the
+  dashboard and the full service loop were not measured.
+- The outage scenario calls private service methods directly and runs no worker loops.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -702,7 +868,11 @@ These come from code review and have not been reproduced, unless noted.
   collector error handling, so a failure there skips the snapshot and leaves
   `latest` stale.
 - `initialize` runs `PRAGMA integrity_check` inside a write transaction on every
-  recovery attempt. Cost on large databases is unmeasured.
+  recovery attempt. It took about 2.8 s on a 27 MB synthetic database; larger ones are
+  unmeasured. See [the benchmark](#synthetic-persistence-benchmark-2026-11-07).
+- The incident JSON scan holds the `Database` lock for about 40 s on a batch of 100
+  unlinked IDs at 10,000 x 100. See
+  [the benchmark](#synthetic-persistence-benchmark-2026-11-07).
 - Surrogates in monitored folder paths submitted through the API are untested.
 
 ## Known limitations
