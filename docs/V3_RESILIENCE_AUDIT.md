@@ -62,6 +62,11 @@ local commits only, and no further push is authorized. No changes to production 
   `0332aa8` synthetic persistence benchmark. None has run on hosted CI or Python 3.13.
   Results are in the sections below and in
   [Current Beta Validation](CURRENT_BETA_VALIDATION.md#local-only-results---november-7-2026).
+- LOCAL ONLY: history row-cap retention fix on `fix/v3-history-performance`, based on
+  `7bae229` (PR #7 merged). Python 3.11.9 on Windows: 663 pytest passed, 41 Playwright
+  tests passed against the synthetic server, Ruff, compilation and JavaScript syntax
+  passed. Hosted CI and Python 3.13 have not run on it. See
+  [History row-cap retention](#history-row-cap-retention-2026-11-09).
 - PENDING: open findings below. A supply-chain review of these changes is not recorded
   here.
 
@@ -865,6 +870,100 @@ is claimed, and no eight-hour soak has been run.
   dashboard and the full service loop were not measured.
 - The outage scenario calls private service methods directly and runs no worker loops.
 
+## History row-cap retention, 2026-11-09
+
+Local only, on `fix/v3-history-performance` from `7bae229`. Not pushed.
+
+**Cause.** `add_history_batch` runs `_prune_history_locked` on every history write, once
+per refresh, 2 s by default. Each row cap was
+`DELETE FROM t WHERE rowid NOT IN (SELECT rowid FROM t ORDER BY timestamp DESC LIMIT cap)`.
+`EXPLAIN QUERY PLAN` gives `SCAN t` and `LIST SUBQUERY 1`: SQLite built a set of up to
+`cap` kept row IDs, then visited every row, whether or not any row was over the cap. The
+process cap is `min(max_samples * 100, 2,000,000)`, so at the defaults it is 2,000,000.
+At 100 process rows per sample, that is about 11 hours of collection.
+
+**Change.** `Database._cap_history_rows` counts the rows first. Only when the count is
+over the cap does it delete the `count - cap` oldest rows by timestamp, through
+`SEARCH t USING INTEGER PRIMARY KEY (rowid=?)` over a walk of the time index that stops
+after that many rows. It covers the same three tables, with the same caps, still after
+time retention, in the same connection and transaction. No schema, index, setting or
+caller changed.
+
+Each table still keeps exactly `min(count, cap)` rows, and no kept row is older than a
+deleted one. Which of several rows that share the boundary timestamp survives was not
+specified before and is not now.
+
+`tests/test_v3_history_retention.py` adds 37 tests: newest rows kept when insertion order
+differs from time order, nothing deleted at or below the cap, 25 seeded model checks
+with repeated timestamps and a time cutoff, a full write at the cap, and a rollback of
+the whole write when the process cap fails. The work test counts SQLite VM steps while
+100 excess rows are removed. Before the change, 1,000 kept rows took 16,001 steps and
+20,000 took 263,001, so the test failed. After it, both take 2,907. Pruning with nothing
+to delete takes 84 steps at 1,000, 20,000 and 100,000 rows.
+
+### Measurements
+
+Windows 11 Home 10.0.26300, Intel i7-1360P (12 cores, 16 logical), 15.7 GB RAM,
+Python 3.11.9, SQLite 3.45.1. Databases were under the user temp directory, not
+OneDrive. `Win32_Battery` reported status 1, discharging, on the Balanced plan when
+checked at the end. Power state was not controlled, which may explain the variance below.
+
+A scratch script, not committed, created each database with `Database.initialize()` and
+inserted synthetic rows directly: one sample every 2 s ending at the current time, with
+100 process rows per sample. Each run copied the same seeded file. It then timed 20
+`Database.add_history_batch` calls, each with one sample, 100 process rows and one
+connection summary, at the case's `retention_hours` and `max_samples`. Statements were
+timed by wrapping the connection passed to `_prune_history_locked`. Every run ended
+with `PRAGMA integrity_check` = `ok` and the expected row counts.
+
+| Case | Rows seeded | Settings |
+| --- | --- | --- |
+| 1h | 180,000 process, 1,800 samples, 1,800 summaries | Defaults: 168 h, `max_samples` 100,000 |
+| default7d | 2,000,000 process, 43,200 samples, 100,000 summaries, 257,400 compacted keys in 143 rollups | Defaults, the 7-day steady state with 24 h left uncompacted |
+| large | 2,000,000 process, 1,296,000 samples, 2,000,000 summaries | 2,160 h, `max_samples` 2,000,000 |
+
+`add_history_batch` per write, median / p95 / max in ms. With 20 writes, p95 is the
+19th value.
+
+| Case | Before (`7bae229`) | After, pass 1 | After, pass 2 | After, 100 writes |
+| --- | --- | --- | --- | --- |
+| 1h | 686.59 / 752.25 / 805.91 | 49.39 / 83.88 / 97.64 | 86.09 / 139.22 / 156.37 | not run |
+| default7d | 8,259.48 / 45,976.44 / 61,801.03 | 382.23 / 544.76 / 693.56 | 987.37 / 1,041.51 / 1,266.28 | 958.01 / 1,002.55 / 1,039.35 |
+| large | 17,585.57 / 17,860.81 / 21,315.43 | 554.36 / 674.02 / 1,116.10 | 625.93 / 830.40 / 2,076.20 | not run |
+
+Median ms per statement:
+
+| Statement | 1h before / after | default7d before / after (100 writes) | large before / after (pass 1) |
+| --- | --- | --- | --- |
+| Process cap, old `NOT IN` | 573.67 | 7,484.87 | 7,086.43 |
+| Process `COUNT(*)` + bounded delete | 16.99 + none | 583.76 + 7.53 | 198.12 + 3.77 |
+| Summary cap, old `NOT IN` | 3.53 | 277.06 | 6,351.41 |
+| Summary `COUNT(*)` + bounded delete | 0.17 + none | 27.81 + 0.63 | 189.54 + 0.27 |
+| Sample cap, old `NOT IN` | 3.64 | 116.81 | 4,069.07 |
+| Sample `COUNT(*)`, under the cap | 0.21 | 11.61 | 128.73 |
+| `telemetry_compacted_keys` cleanup, unchanged | 0.11 / 0.04 | 246.76 / 230.92 | 0.10 / 0.05 |
+
+At the default 7-day size, a write fell from 8.3 s to about 1 s at the median, and the
+worst write from 61.8 s to 1.3 s. That brings writes inside the 2 s interval, but the
+cost still grows with the table.
+
+### What remains
+
+- `COUNT(*)` is still linear. It reads every page of the smallest index through the new
+  connection that `_connect` opens for each call. On the default7d process table, 15
+  fresh-connection counts took 361 ms median (193 to 639). On one warm connection with a
+  200 MB cache they took 17 ms. Removing that cost needs a maintained row count, which
+  means triggers and a counter table (a schema change), or a long-lived history
+  connection. Neither was built.
+- The `telemetry_compacted_keys` orphan cleanup scans every compacted key on every
+  write. At the default 7-day steady state it costs about 231 to 247 ms, unchanged by
+  this fix, and is now the second-largest cost per write.
+- `_enforce_retention` (alerts, at most 50,000), event retention (10,000) and
+  file-integrity event retention use the same `NOT IN` pattern at smaller caps. They
+  were not measured or changed.
+- One machine, one interpreter, synthetic rows, and single-threaded calls. Lock waits
+  seen by the dashboard or other storage calls were not measured.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -888,6 +987,10 @@ These come from code review and have not been reproduced, unless noted.
   unlinked IDs at 10,000 x 100. See
   [the benchmark](#synthetic-persistence-benchmark-2026-11-07).
 - Surrogates in monitored folder paths submitted through the API are untested.
+- Each history write still counts every capped table. At 2,000,000 process rows that
+  count took about 0.2 to 0.6 s at the median, with the `Database` lock held, and the `telemetry_compacted_keys`
+  cleanup adds about 0.23 s at the default 7-day size. See
+  [History row-cap retention](#history-row-cap-retention-2026-11-09).
 
 ## Known limitations
 

@@ -1916,24 +1916,23 @@ class Database:
             "SELECT 1 FROM telemetry_rollups AS rollups "
             "WHERE rollups.bucket_start = telemetry_compacted_keys.bucket_start)"
         )
-        connection.execute(
-            "DELETE FROM telemetry_samples WHERE rowid NOT IN "
-            "(SELECT rowid FROM telemetry_samples ORDER BY timestamp DESC LIMIT ?)",
-            (max_samples,),
-        )
-        connection.execute(
-            "DELETE FROM connection_summaries WHERE rowid NOT IN "
-            "(SELECT rowid FROM connection_summaries "
-            "ORDER BY timestamp DESC LIMIT ?)",
-            (max_samples,),
-        )
+        Database._cap_history_rows(connection, "telemetry_samples", max_samples)
+        Database._cap_history_rows(connection, "connection_summaries", max_samples)
         process_row_limit = min(max_samples * 100, 2_000_000)
-        connection.execute(
-            "DELETE FROM process_observations WHERE rowid NOT IN "
-            "(SELECT rowid FROM process_observations "
-            "ORDER BY timestamp DESC LIMIT ?)",
-            (process_row_limit,),
-        )
+        Database._cap_history_rows(connection, "process_observations", process_row_limit)
+
+    @staticmethod
+    def _cap_history_rows(connection: sqlite3.Connection, table: str, limit: int) -> None:
+        # Delete only the oldest excess rows. Selecting the rows to keep instead built a
+        # set of up to `limit` row IDs and scanned the whole table on every history write.
+        count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        if count > limit:
+            connection.execute(
+                f"DELETE FROM {table} WHERE rowid IN "  # noqa: S608
+                f"(SELECT rowid FROM {table} ORDER BY timestamp ASC LIMIT ?)",
+                (count - limit,),
+            )
+
     @staticmethod
     def _row_to_sample(row: sqlite3.Row) -> HistoricalSample:
         return HistoricalSample(
