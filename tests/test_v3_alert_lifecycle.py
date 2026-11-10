@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.config import MAX_LIVE_ALERTS
 from app.detection.engine import DetectionEngine
 from app.models import (
     Alert,
@@ -19,7 +20,7 @@ from app.models import (
     Settings,
     WindowsEventRecord,
 )
-from app.service import TelemetryService
+from app.service import StorageUnavailableError, TelemetryService
 from app.storage.database import Database
 
 # Defaults: 90% memory threshold, 10 s sustained duration, 60 s cooldown, 2 s refresh.
@@ -389,6 +390,333 @@ async def test_observations_during_an_outage_merge_into_one_alert(
     assert (row.first_occurrence, row.last_occurrence) == (at(10), at(130))
     assert row.condition_active is True
     assert service.storage.pending_writes == 0
+
+
+def disconnected_service(path, clock, system, network):
+    service = TelemetryService(Database(path), storage_retry_seconds=0)
+    service.detection_engine = engine(clock)
+    service.system_collector = Static(system)
+    service.network_collector = Static((network, []))
+    service.process_collector = Static([])
+    return service
+
+
+async def defender_burst(service, second):
+    for index in range(MAX_LIVE_ALERTS):
+        event = windows_detection(f"synthetic-burst-{index}").model_copy(
+            update={"timestamp": at(second)}
+        )
+        await service._correlate_windows_event(event)
+
+
+@pytest.mark.parametrize("logging", [False, True])
+@pytest.mark.parametrize("recover_before_restore", [False, True])
+async def test_delayed_restore_reconciles_provisional_episode_and_queued_events(
+    tmp_path, system_sample, network_sample, monkeypatch, logging, recover_before_restore
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 72)
+    [opened] = memory_rows(first)
+    await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
+    incident = await first.create_incident(IncidentCreate(
+        title="Synthetic original episode", severity="CRITICAL", alert_ids=[opened.id]
+    ))
+    first.database.save_settings(first.settings.model_copy(update={"event_logging_enabled": logging}))
+    stored = first.database.get_alert(opened.id)
+    [original_event] = memory_events(first)
+
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        await run(restarted, clock, 1000, 1072)
+        [provisional] = [a for a in restarted.live_alerts if a.rule_id == "memory"]
+        await defender_burst(restarted, 1071)
+        assert len(restarted.live_alerts) == MAX_LIVE_ALERTS
+        assert all(a.id != provisional.id for a in restarted.live_alerts)
+        if recover_before_restore:
+            system_sample.memory_percent = CLEAR
+            await run(restarted, clock, 1072, 1074)
+    await run(restarted, clock, 1074, 1076)
+
+    rows = [a for a in await restarted.list_alerts(1000, True) if a.rule_id == "memory"]
+    assert len(rows) == 1
+    [current] = rows
+    assert current.id == opened.id
+    assert current.occurrence_count == 4
+    assert (current.first_occurrence, current.last_occurrence) == (at(10), at(1070))
+    assert current.acknowledged is True
+    assert current.incident_id == incident.id
+    assert current.condition_active is not recover_before_restore
+    assert memory_events(restarted) == [original_event]
+    assert [e for e in await restarted.list_events(1000) if e.event_type == "alert"
+            and e.title.startswith("Memory")] == [original_event]
+    assert restarted.database.get_alert(provisional.id) is None
+    assert all(e.related_id != provisional.id for e in restarted._pending_events.values())
+
+    system_sample.memory_percent = CLEAR
+    await run(restarted, clock, 1076, 1078)
+    recovered = restarted._live_alert(opened.id)
+    assert recovered.condition_active is False
+    assert recovered.last_recovery == at(1072 if recover_before_restore else 1076)
+    assert recovered.occurrence_count == 4
+    assert recovered.acknowledged is True
+    if logging:
+        assert restarted.database.get_alert(opened.id) == recovered
+    else:
+        assert restarted.database.get_alert(opened.id) == stored
+    assert restarted.database.get_incident(incident.id).related_alerts == [opened.id]
+    assert restarted.storage.pending_writes == 0
+    assert len(restarted.live_alerts) <= MAX_LIVE_ALERTS
+
+
+@pytest.mark.parametrize("mode", ["logging_disabled", "retention", "outage", "retention_outage"])
+async def test_active_metadata_survives_display_eviction_and_recovery(
+    tmp_path, system_sample, network_sample, monkeypatch, mode
+):
+    path = tmp_path / "synthetic.db"
+    system_sample.memory_percent = BREACH
+    clock = Clock()
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 72)
+    [opened] = memory_rows(first)
+    await first.update_alert(opened.id, AlertUpdate(acknowledged=True, dismissed=True))
+    stored = first.database.get_alert(opened.id)
+    first.database.save_settings(first.settings.model_copy(update={
+        "event_logging_enabled": mode != "logging_disabled",
+        "alert_retention": 50 if "retention" in mode else 1000,
+    }))
+    clock = Clock(1000)
+    restarted = await monitored(path, clock, system_sample, network_sample)
+    await defender_burst(restarted, 1000)
+    assert len(restarted.live_alerts) == MAX_LIVE_ALERTS
+    assert all(a.id != opened.id for a in restarted.live_alerts)
+    system_sample.memory_percent = CLEAR
+    with monkeypatch.context() as patch:
+        if "outage" in mode:
+            patch.setattr(restarted.database, "add_alert", outage)
+        await run(restarted, clock, 1000, 1002)
+    live = restarted._live_alert(opened.id)
+    assert (live.occurrence_count, live.first_occurrence, live.last_occurrence) == (
+        2, at(10), at(70)
+    )
+    assert (live.acknowledged, live.dismissed, live.condition_active) == (True, True, False)
+    assert live.last_recovery == at(1000)
+    assert opened.id not in {a.id for a in restarted.latest.alerts}
+    await settle(restarted)
+    if mode == "logging_disabled":
+        assert restarted.database.get_alert(opened.id) == stored
+    elif "retention" in mode:
+        assert restarted.database.get_alert(opened.id) is None
+        assert len(restarted.database.list_alerts(1000, True)) == 50
+    else:
+        assert restarted.database.get_alert(opened.id).occurrence_count == 2
+    security = [a for a in restarted.live_alerts if a.rule_id == "windows_defender_detection"]
+    assert all(a.condition_active is None and a.occurrence_count == 1 for a in security)
+    # Recovery and storage-health alerts also consume display slots. The larger
+    # timeline retains every distinct Defender event without grouping them.
+    detections = [e for e in restarted.live_events if e.title == "defender_detection"]
+    assert len(detections) == MAX_LIVE_ALERTS
+    assert len({e.related_id for e in detections}) == MAX_LIVE_ALERTS
+    assert len(restarted.live_alerts) <= MAX_LIVE_ALERTS
+    assert restarted.storage.pending_writes == 0
+
+
+async def test_delayed_restore_does_not_merge_a_breach_after_an_observed_clear(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 12)
+    [opened] = memory_rows(first)
+    await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        system_sample.memory_percent = CLEAR
+        await run(restarted, clock, 1000, 1002)
+        system_sample.memory_percent = BREACH
+        await run(restarted, clock, 1002, 1014)
+    await run(restarted, clock, 1014, 1016)
+
+    old = restarted.database.get_alert(opened.id)
+    assert old.condition_active is False
+    assert old.last_recovery == at(1000)
+    assert old.acknowledged is True
+    [active] = [a for a in memory_rows(restarted) if a.condition_active is True]
+    assert active.id != opened.id
+    assert active.first_occurrence == at(1012)
+    assert active.acknowledged is False
+    assert len(memory_events(restarted)) == 2
+
+
+async def test_saved_logging_opt_out_keeps_explicit_provisional_operator_changes(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 12)
+    [opened] = memory_rows(first)
+    first.database.save_settings(first.settings.model_copy(update={"event_logging_enabled": False}))
+    stored = first.database.get_alert(opened.id)
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        await run(restarted, clock, 1000, 1012)
+        [provisional] = [a for a in restarted.live_alerts if a.rule_id == "memory"]
+        await restarted.update_alert(provisional.id, AlertUpdate(acknowledged=True, dismissed=True))
+    await run(restarted, clock, 1012, 1014)
+    current = restarted._live_alert(opened.id)
+    assert (current.acknowledged, current.dismissed) == (True, True)
+    assert current.occurrence_count == 2
+    assert restarted.database.get_alert(opened.id) == stored
+    assert restarted.database.get_alert(provisional.id) is None
+
+
+async def test_historical_operator_read_cannot_replace_active_episode_after_eviction(
+    tmp_path, system_sample, network_sample
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 12)
+    [old] = memory_rows(first)
+    first.database.save_settings(first.settings.model_copy(update={"event_logging_enabled": False}))
+    clock = Clock(1000)
+    restarted = await monitored(path, clock, system_sample, network_sample)
+    system_sample.memory_percent = CLEAR
+    await run(restarted, clock, 1000, 1002)
+    system_sample.memory_percent = BREACH
+    await run(restarted, clock, 1002, 1014)
+    [new] = [a for a in restarted.live_alerts if a.rule_id == "memory" and a.condition_active]
+    await restarted.update_alert(new.id, AlertUpdate(acknowledged=True))
+    await defender_burst(restarted, 1013)
+    previous = await restarted.update_alert(old.id, AlertUpdate(acknowledged=True))
+    assert previous.condition_active is False
+    system_sample.memory_percent = CLEAR
+    await run(restarted, clock, 1014, 1016)
+    recovered = restarted._live_alert(new.id)
+    assert recovered is not None
+    assert (recovered.condition_active, recovered.occurrence_count, recovered.acknowledged) == (
+        False, 1, True
+    )
+    assert recovered.first_occurrence == at(1012)
+    assert recovered.last_recovery == at(1014)
+    assert restarted.database.get_alert(old.id).condition_active is True
+    assert restarted.database.get_alert(new.id) is None
+
+
+async def test_delayed_restore_preserves_recurrence_after_provisional_recovery(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 12)
+    [opened] = memory_rows(first)
+    await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        await run(restarted, clock, 1000, 1012)
+        [provisional] = [a for a in restarted.live_alerts if a.rule_id == "memory"]
+        system_sample.memory_percent = CLEAR
+        await run(restarted, clock, 1012, 1014)
+        system_sample.memory_percent = BREACH
+        await run(restarted, clock, 1014, 1026)
+    await run(restarted, clock, 1026, 1028)
+
+    assert restarted.database.get_alert(provisional.id) is None
+    previous = restarted.database.get_alert(opened.id)
+    assert previous.condition_active is False
+    assert previous.last_recovery == at(1012)
+    assert previous.occurrence_count == 2
+    assert previous.acknowledged is True
+    [current] = [a for a in memory_rows(restarted) if a.condition_active]
+    assert current.id not in {opened.id, provisional.id}
+    assert current.first_occurrence == at(1024)
+    assert current.occurrence_count == 1
+    assert current.acknowledged is False
+    assert len(memory_events(restarted)) == 2
+
+
+async def test_provisional_identity_cannot_be_written_into_incident_history(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 12)
+    [opened] = memory_rows(first)
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        await run(restarted, clock, 1000, 1012)
+        [provisional] = [a for a in restarted.live_alerts if a.rule_id == "memory"]
+        with pytest.raises(StorageUnavailableError):
+            await restarted.create_incident(IncidentCreate(
+                title="Synthetic provisional selection", severity="CRITICAL", alert_ids=[provisional.id]
+            ))
+        assert restarted.database.list_incidents() == []
+    await run(restarted, clock, 1012, 1014)
+    incident = await restarted.create_incident(IncidentCreate(
+        title="Synthetic stable selection", severity="CRITICAL", alert_ids=[opened.id]
+    ))
+    assert incident.related_alerts == [opened.id]
+    assert restarted.database.get_alert(opened.id).incident_id == incident.id
+
+
+async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    path = tmp_path / "synthetic.db"
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    first = await monitored(path, clock, system_sample, network_sample)
+    await run(first, clock, 0, 72)
+    [opened] = memory_rows(first)
+    await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
+    first.database.save_settings(first.settings.model_copy(update={"alert_retention": 50}))
+    clock = Clock(1000)
+    restarted = disconnected_service(path, clock, system_sample, network_sample)
+    with monkeypatch.context() as patch:
+        patch.setattr(restarted.database, "initialize", outage)
+        assert not await restarted.initialize_storage()
+        await run(restarted, clock, 1000, 1072)
+        await defender_burst(restarted, 1071)
+        system_sample.memory_percent = CLEAR
+        await run(restarted, clock, 1072, 1074)
+    await run(restarted, clock, 1074, 1076)
+
+    # Queued Defender writes prune A before its positive-count recovery delta.
+    assert restarted.database.get_alert(opened.id) is None
+    current = restarted._live_alert(opened.id)
+    assert current.occurrence_count == 4
+    assert (current.first_occurrence, current.last_occurrence) == (at(10), at(1070))
+    assert current.last_recovery == at(1072)
+    assert current.condition_active is False
+    assert current.acknowledged is True
+    assert len(restarted.database.list_alerts(1000, True)) == 50
+    assert restarted.storage.pending_writes == 0
 
 
 def test_threshold_count_is_atomic_across_database_instances(

@@ -711,7 +711,9 @@ class Database:
                 (key, value.model_dump_json()),
             )
 
-    def add_alert(self, alert: Alert, retention: int) -> Alert | None:
+    def add_alert(
+        self, alert: Alert, retention: int, require_existing: bool = False
+    ) -> Alert | None:
         with self._lock, self._connect() as connection:
             # The authoritative relationship and grouped count must be read in
             # the same write transaction, including across Database instances.
@@ -720,6 +722,12 @@ class Database:
             row = connection.execute(
                 "SELECT * FROM alerts WHERE id = ?", (alert.id,)
             ).fetchone()
+            if row is None and require_existing:
+                # A restored episode delta assumes a persisted prefix. Retention
+                # may have removed it since restoration; never insert a suffix
+                # as though it were the complete episode. Check under the same
+                # write transaction that would merge the count.
+                return None
             if (
                 row is None and alert.rule_id in THRESHOLD_ALERT_RULES
                 and alert.condition_active is False and alert.occurrence_count == 0

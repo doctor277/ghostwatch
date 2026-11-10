@@ -1123,6 +1123,62 @@ Remaining limitations:
 - Collection-failure lifecycle behavior is unchanged; its startup-recovery limitation
   remains separate from these threshold episode corrections.
 
+## Delayed restoration and display-cache correction after cf62570
+
+The next focused correction preserves the episode identity, cooldown, incident,
+restart and retention behavior described above while addressing the final review's
+two reproduced failures.
+
+**Shared cause:** lifecycle aggregation depended on the 200-entry display deque.
+The detection engine retained observation deltas rather than full operator metadata,
+and its startup restoration skipped a saved episode when a provisional episode
+already occupied that rule. Consequently, eviction could remove the only complete
+baseline, and delayed restoration could persist a second identity for one breach.
+
+The service now keeps full active-episode metadata separately, with at most one
+entry per threshold rule. It also retains at most eight restored startup baselines,
+including live-only recoveries, so historical reads cannot resurrect unchanged
+SQLite state or displace a newer active episode. Display limits are unchanged.
+Observation merging, operator patches, incident refreshes and persistence acceptance
+update the same authoritative metadata. A recovery delta without any complete
+baseline is never displayed as a standalone alert.
+
+Until initial storage restoration finishes, the engine retains bounded summaries of
+the first possible continuation, first readable recovery and explicit operator
+changes for each threshold rule. Restoration binds a continuation to its original
+stored identity, transfers only its new observation count, and removes its duplicate
+queued/live detection. Operator-update events are rebound to the stable identity.
+An observed recovery is an episode boundary: subsequent breaches keep their separate
+identities, even if they qualified before SQLite returned. Explicit operator changes
+survive a saved logging opt-out discarding persistence queues.
+
+Incident creation involving a provisional threshold identity returns the existing
+503 error until storage restoration establishes the stable identity. This prevents
+an incident from acquiring a reference that reconciliation would orphan. Independent
+security-event selections are unchanged; no existing incident history is rewritten.
+
+Restored episode deltas are written with an optional internal `require_existing`
+guard. `Database.add_alert()` checks the baseline inside `BEGIN IMMEDIATE`. If
+retention pruned the original row before a reconciled positive-count delta reaches
+SQLite, the suffix is not inserted as incomplete history. The complete live episode
+remains available. The default two-argument database call and schema are unchanged;
+first-time episodes, including a queued initial breach and recovery, remain writable.
+
+Fourteen added cases cover delayed restore with logging on/off, recovery before and
+after restoration, 200 actual synthetic Defender correlations, retention and runtime
+outages, explicit provisional operator changes, historical reads after eviction,
+recurrence before SQLite returns, provisional incident references and retention
+pruning during a queued reconciliation flush. The first nine cases all failed
+against `cf62570`; the later operator/history and missing-baseline cases also failed
+before their targeted corrections. Full results are recorded in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#final-lifecycle-state-corrections-after-cf62570).
+
+Remaining limits are unchanged: bounded memory is not a durable journal, retention
+can remove persisted history, startup monitoring uses defaults until saved settings
+are readable, and previously corrupted or conflated history is not automatically
+rewritten. No production database, cache-limit increase, schema migration or separate
+expensive benchmark is part of this correction.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.

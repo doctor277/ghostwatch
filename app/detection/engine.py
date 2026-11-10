@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -20,6 +21,14 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True)
+class EpisodeRestoration:
+    stored: Alert
+    provisional: Alert | None
+    recovery: Alert | None
+    operator_changes: dict[str, bool]
+
+
 class DetectionEngine:
     def __init__(
         self,
@@ -34,26 +43,70 @@ class DetectionEngine:
         self._last_alerted: dict[str, float] = {}
         # Identity and first observation survive restarts for an ongoing episode.
         self._active: dict[str, Alert] = {}
+        # Until initial storage restoration completes, retain only the first
+        # possible continuation and the first readable clear per rule (max eight).
+        self._startup_first: dict[str, Alert] = {}
+        self._startup_clear: dict[str, tuple[RuleEvaluation, datetime]] = {}
+        self._startup_operator_changes: dict[str, dict[str, bool]] = {}
+        self._restored = False
         self._previous_connections: int | None = None
         self._collection_failure_active = False
         self._collection_failure_first: datetime | None = None
 
-    def restore_active(self, alerts: Iterable[Alert]) -> list[Alert]:
-        """Resume stored episodes without replacing newer in-process observations."""
-        restored = []
+    def restore_active(self, alerts: Iterable[Alert]) -> list[EpisodeRestoration]:
+        """Bind an unconfirmed startup continuation to its stored episode.
+
+        A readable clear is a boundary: episodes after it must remain independent.
+        The service reconciles the returned deltas before any queued write runs.
+        """
+        if self._restored:
+            return []
+        restored: list[EpisodeRestoration] = []
+        seen = set()
         for alert in alerts:
             if (
                 alert.rule_id in THRESHOLD_ALERT_RULES
                 and alert.condition_active is True
-                and alert.rule_id not in self._active
+                and alert.rule_id not in seen
             ):
+                seen.add(alert.rule_id)
                 alert = alert.model_copy(update={
                     "first_occurrence": alert.first_occurrence or alert.timestamp,
                     "last_occurrence": alert.last_occurrence or alert.timestamp,
                 })
-                self._active[alert.rule_id] = alert
-                restored.append(alert)
+                provisional = self._startup_first.get(alert.rule_id)
+                clear = self._startup_clear.get(alert.rule_id)
+                latest = alert.model_copy(update={
+                    "last_occurrence": (
+                        provisional.last_occurrence if provisional is not None
+                        else alert.last_occurrence
+                    )
+                })
+                recovery = self._recovery(*clear, latest) if clear is not None else None
+                if clear is None:
+                    self._active[alert.rule_id] = latest
+                restored.append(EpisodeRestoration(
+                    alert, provisional, recovery,
+                    dict(self._startup_operator_changes.get(alert.rule_id, {})),
+                ))
+        self._restored = True
+        self._startup_first.clear()
+        self._startup_clear.clear()
+        self._startup_operator_changes.clear()
         return restored
+
+    def active_episode_id(self, rule_key: str) -> str | None:
+        active = self._active.get(rule_key)
+        return active.id if active is not None else None
+
+    def note_operator_update(self, alert_id: str, changes: dict[str, bool]) -> None:
+        # Explicit local intent must survive a saved logging opt-out discarding
+        # persistence queues. Only the startup continuation can be rebound.
+        for rule, provisional in self._startup_first.items():
+            if provisional.id == alert_id:
+                previous = self._startup_operator_changes.get(rule, {})
+                self._startup_operator_changes[rule] = previous | changes
+                break
 
     def evaluate(
         self,
@@ -118,6 +171,8 @@ class DetectionEngine:
                 continue
             if not rule.breached:
                 self._breach_started.pop(rule.key, None)
+                if not self._restored and rule.available:
+                    self._startup_clear.setdefault(rule.key, (rule, observed_at))
                 # An unreadable metric has not been seen to clear.
                 if rule.available and rule.key in self._active:
                     active = self._active.pop(rule.key)
@@ -151,6 +206,11 @@ class DetectionEngine:
                 condition_active=True,
             )
             self._active[rule.key] = observation
+            if not self._restored and rule.key not in self._startup_clear:
+                previous = self._startup_first.get(rule.key)
+                self._startup_first[rule.key] = observation.model_copy(update={
+                    "occurrence_count": (previous.occurrence_count if previous else 0) + 1
+                })
             alerts.append(observation)
         return alerts
 

@@ -22,7 +22,7 @@ from app.config import (
     MAX_WEBSOCKET_CLIENTS,
     WEBSOCKET_SEND_TIMEOUT_SECONDS,
 )
-from app.detection.engine import DetectionEngine
+from app.detection.engine import DetectionEngine, EpisodeRestoration
 from app.models import (
     GROUPED_ALERT_RULES,
     MAX_ALERT_LABEL,
@@ -108,6 +108,12 @@ class TelemetryService:
         self.baseline_engine = BaselineEngine()
         self.history: deque[dict[str, Any]] = deque(maxlen=MAX_HISTORY_SAMPLES)
         self.live_alerts: deque[Alert] = deque(maxlen=MAX_LIVE_ALERTS)
+        # Full metadata for at most one active episode per threshold rule. The
+        # display deque may evict an alert without evicting its lifecycle state.
+        self._threshold_episodes: dict[str, Alert] = {}
+        # At most eight startup baselines also retain live-only recoveries. A
+        # later historical read must not resurrect an unchanged SQLite row.
+        self._restored_episodes: dict[str, Alert] = {}
         self.live_events: deque[EventRecord] = deque(maxlen=MAX_LIVE_EVENTS)
         self.live_windows_events: deque[WindowsEventRecord] = deque(maxlen=2000)
         self.live_file_integrity_events: deque[FileIntegrityEvent] = deque(maxlen=2000)
@@ -221,9 +227,61 @@ class TelemetryService:
         active_alerts = await asyncio.to_thread(
             self.database.active_threshold_alerts
         )
-        for alert in self.detection_engine.restore_active(active_alerts):
-            if self._live_alert(alert.id) is None:
-                self._remember_live_alert(alert, authoritative=True)
+        for restoration in self.detection_engine.restore_active(active_alerts):
+            self._restore_threshold_episode(restoration)
+
+    def _restore_threshold_episode(self, restoration: EpisodeRestoration) -> None:
+        stored = restoration.stored
+        provisional = restoration.provisional
+        delta = None
+        changes = dict(restoration.operator_changes)
+        if provisional is not None:
+            # Provisional observations cannot have committed while saved state
+            # was missing. Transfer their delta, never replay the stored count.
+            provisional_id = provisional.id
+            self._pending_alerts.pop(provisional_id, None)
+            queued_patch = self._pending_alert_updates.pop(provisional_id, None)
+            if queued_patch is not None:
+                changes = queued_patch.model_dump(exclude_none=True) | changes
+            if self._threshold_episodes.get(stored.rule_id, provisional).id == provisional_id:
+                self._threshold_episodes.pop(stored.rule_id, None)
+            self.live_alerts = deque(
+                (a for a in self.live_alerts if a.id != provisional_id), maxlen=MAX_LIVE_ALERTS
+            )
+            self.live_events = deque(
+                (e.model_copy(update={"related_id": stored.id})
+                 if e.related_id == provisional_id else e for e in self.live_events
+                 if not (e.related_id == provisional_id and e.event_type == "alert")),
+                maxlen=MAX_LIVE_EVENTS,
+            )
+            for event_id, event in list(self._pending_events.items()):
+                if event.related_id == provisional_id:
+                    if event.event_type == "alert":
+                        self._pending_events.pop(event_id)
+                    else:
+                        self._pending_events[event_id] = event.model_copy(
+                            update={"related_id": stored.id}
+                        )
+            delta = provisional.model_copy(update={
+                "id": stored.id, "first_occurrence": stored.first_occurrence,
+                "incident_id": stored.incident_id,
+            })
+        if restoration.recovery is not None:
+            delta = (
+                self._merge_grouped_alert(delta, restoration.recovery)
+                if delta is not None else restoration.recovery
+            )
+        result = self._merge_grouped_alert(stored, delta) if delta is not None else stored
+        result = result.model_copy(update={"incident_id": stored.incident_id})
+        result = result.model_copy(update=changes)
+        self._restored_episodes[stored.id] = result
+        self._remember_live_alert(result, authoritative=True)
+        if self.settings.event_logging_enabled:
+            if delta is not None:
+                self._queue_with_operator_state(delta)
+            if changes:
+                self._queue_alert_update(stored.id, changes)
+        self.storage = self.storage.model_copy(update=self._queue_health())
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -935,29 +993,49 @@ class TelemetryService:
         )
 
     def _remember_live_alert(self, alert: Alert, *, authoritative: bool = False) -> Alert:
-        for index, existing in enumerate(self.live_alerts):
-            if existing.id == alert.id:
-                if not authoritative:
-                    # An observation never owns the incident relationship.
-                    alert = alert.model_copy(update={"incident_id": existing.incident_id})
+        existing = self._live_alert(alert.id)
+        remembered = alert
+        if existing is not None:
+            if not authoritative:
+                # An observation never owns the incident relationship.
+                alert = alert.model_copy(update={"incident_id": existing.incident_id})
+            if (
+                not authoritative
+                and alert.rule_id in GROUPED_ALERT_RULES
+                and alert.condition_active is True
+                and existing.condition_active is False
+            ):
+                self._queue_alert_update(alert.id, {"acknowledged": False, "dismissed": False})
+            remembered = (
+                alert if authoritative or alert.rule_id not in GROUPED_ALERT_RULES
+                else self._merge_grouped_alert(existing, alert)
+            )
+        elif (
+            alert.rule_id in THRESHOLD_ALERT_RULES
+            and alert.condition_active is False and alert.occurrence_count == 0
+        ):
+            # A transition delta without a baseline is not a displayable alert.
+            return alert
+        if remembered.rule_id in THRESHOLD_ALERT_RULES:
+            if remembered.condition_active is True:
+                pinned = self._threshold_episodes.get(remembered.rule_id)
+                engine_id = self.detection_engine.active_episode_id(remembered.rule_id)
                 if (
-                    not authoritative
-                    and alert.rule_id in GROUPED_ALERT_RULES
-                    and alert.condition_active is True
-                    and existing.condition_active is False
+                    engine_id == remembered.id
+                    or (pinned is not None and pinned.id == remembered.id)
+                    or (engine_id is None and pinned is None and not authoritative)
                 ):
-                    self._queue_alert_update(
-                        alert.id, {"acknowledged": False, "dismissed": False}
-                    )
-                remembered = (
-                    alert
-                    if authoritative or alert.rule_id not in GROUPED_ALERT_RULES
-                    else self._merge_grouped_alert(existing, alert)
-                )
+                    self._threshold_episodes[remembered.rule_id] = remembered
+            elif self._threshold_episodes.get(remembered.rule_id, remembered).id == remembered.id:
+                self._threshold_episodes.pop(remembered.rule_id, None)
+            if remembered.id in self._restored_episodes:
+                self._restored_episodes[remembered.id] = remembered
+        for index, cached in enumerate(self.live_alerts):
+            if cached.id == remembered.id:
                 self.live_alerts[index] = remembered
                 return remembered
-        self.live_alerts.appendleft(alert)
-        return alert
+        self.live_alerts.appendleft(remembered)
+        return remembered
 
     def _queue_pending_alert(self, alert: Alert) -> None:
         existing = self._pending_alerts.get(alert.id)
@@ -1084,6 +1162,11 @@ class TelemetryService:
             LOGGER.warning("Pending %s queue is full; %d writes dropped", kind, count)
 
     def _live_alert(self, alert_id: str) -> Alert | None:
+        for alert in self._threshold_episodes.values():
+            if alert.id == alert_id:
+                return alert
+        if alert_id in self._restored_episodes:
+            return self._restored_episodes[alert_id]
         return next((item for item in self.live_alerts if item.id == alert_id), None)
 
     def _queue_alert_update(self, alert_id: str, changes: dict[str, bool]) -> None:
@@ -1203,8 +1286,11 @@ class TelemetryService:
         before = self._live_alert(alert.id)
         sequence = self._incident_refresh_sequence
         try:
+            arguments = (alert, self.settings.alert_retention)
+            if alert.id in self._restored_episodes:
+                arguments += (True,)
             stored = await asyncio.to_thread(
-                self.database.add_alert, alert, self.settings.alert_retention
+                self.database.add_alert, *arguments
             )
         except InvalidRecordError as exc:
             self._reject_write(exc)
@@ -1265,13 +1351,13 @@ class TelemetryService:
         self._clear_pending_flag(alert_id)
 
     def _clear_pending_flag(self, alert_id: str) -> None:
-        for index, alert in enumerate(self.live_alerts):
-            if alert.id == alert_id:
-                self.live_alerts[index] = alert.model_copy(update={
-                    "persistence_pending": (
-                        alert_id in self._pending_alerts or alert_id in self._pending_alert_updates
-                    )
-                })
+        alert = self._live_alert(alert_id)
+        if alert is not None:
+            self._remember_live_alert(alert.model_copy(update={
+                "persistence_pending": (
+                    alert_id in self._pending_alerts or alert_id in self._pending_alert_updates
+                )
+            }), authoritative=True)
 
     async def _maybe_recover_storage(self) -> None:
         # A direct write can restore health without passing through recovery.
@@ -1307,10 +1393,13 @@ class TelemetryService:
         self._pending_alerts.clear()
         self._pending_events.clear()
         self._pending_alert_updates.clear()
-        for index, alert in enumerate(self.live_alerts):
+        alerts = {a.id: a for a in (
+            *self.live_alerts, *self._restored_episodes.values(), *self._threshold_episodes.values()
+        )}
+        for alert in alerts.values():
             if alert.persistence_pending:
-                self.live_alerts[index] = alert.model_copy(
-                    update={"persistence_pending": False}
+                self._remember_live_alert(
+                    alert.model_copy(update={"persistence_pending": False}), authoritative=True
                 )
         self.storage = self.storage.model_copy(update=self._queue_health())
 
@@ -1339,8 +1428,11 @@ class TelemetryService:
             sequence = self._incident_refresh_sequence
             try:
                 clean = alert.model_copy(update={"persistence_pending": False})
+                arguments = (clean, self.settings.alert_retention)
+                if alert_id in self._restored_episodes:
+                    arguments += (True,)
                 stored = await asyncio.to_thread(
-                    self.database.add_alert, clean, self.settings.alert_retention
+                    self.database.add_alert, *arguments
                 )
             except InvalidRecordError as exc:
                 # A newer version is judged on its own by the next pass.
@@ -1420,7 +1512,9 @@ class TelemetryService:
             except Exception as exc:
                 self._mark_storage_failure(exc)
         merged = {alert.id: alert for alert in persisted}
-        for alert in self.live_alerts:
+        for alert in (
+            *self.live_alerts, *self._restored_episodes.values(), *self._threshold_episodes.values()
+        ):
             merged[alert.id] = alert
         alerts = sorted(merged.values(), key=lambda alert: alert.timestamp, reverse=True)
         if not include_dismissed:
@@ -1498,12 +1592,11 @@ class TelemetryService:
             self._remember_live_alert(current, authoritative=True)
         if not changes:
             return current
-        memory_result: Alert | None = None
-        for index, alert in enumerate(self.live_alerts):
-            if alert.id == alert_id:
-                memory_result = alert.model_copy(update=changes)
-                self.live_alerts[index] = memory_result
-                break
+        memory_result = self._remember_live_alert(
+            current.model_copy(update=changes), authoritative=True
+        )
+        if current.rule_id in THRESHOLD_ALERT_RULES:
+            self.detection_engine.note_operator_update(alert_id, changes)
         if generation == self._logging_generation:
             self._queue_alert_update(alert_id, changes)
         patch = self._pending_alert_updates.get(alert_id)
@@ -2021,6 +2114,12 @@ class TelemetryService:
         selected = [alert for alert in alerts if alert.id in set(request.alert_ids)]
         if len(selected) != len(set(request.alert_ids)):
             raise ValueError("One or more selected alerts were not found")
+        if self._persisted_state_missing and any(
+            alert.rule_id in THRESHOLD_ALERT_RULES for alert in selected
+        ):
+            # A provisional identity may be rebound. Never persist an incident
+            # reference that reconciliation would subsequently orphan.
+            raise StorageUnavailableError("Alert identities await storage recovery; retry afterward")
         now = datetime.now(UTC)
         first = min((alert.timestamp for alert in selected), default=now)
         last = max((alert.timestamp for alert in selected), default=now)
