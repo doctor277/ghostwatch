@@ -67,6 +67,11 @@ local commits only, and no further push is authorized. No changes to production 
   tests passed against the synthetic server, Ruff, compilation and JavaScript syntax
   passed. Hosted CI and Python 3.13 have not run on it. See
   [History row-cap retention](#history-row-cap-retention-2026-11-09).
+- LOCAL ONLY: threshold alert lifecycle fix on `fix/v3-alert-lifecycle`, based on
+  `22a20a2`. Python 3.11.9 on Windows: 684 pytest passed, 42 Playwright tests passed
+  against the synthetic server, Ruff, compilation and
+  JavaScript syntax passed. Hosted CI and Python 3.13 have not run on it. See
+  [Threshold alert lifecycle](#threshold-alert-lifecycle-2026-11-10).
 - PENDING: open findings below. A supply-chain review of these changes is not recorded
   here.
 
@@ -963,6 +968,216 @@ cost still grows with the table.
   were not measured or changed.
 - One machine, one interpreter, synthetic rows, and single-threaded calls. Lock waits
   seen by the dashboard or other storage calls were not measured.
+
+## Threshold alert lifecycle, 2026-11-10
+
+Historical implementation at `bc83f51`, on `fix/v3-alert-lifecycle` from
+`22a20a2`. The episode correction below supersedes the per-rule identity and
+cooldown behavior in this section. Neither change has been pushed.
+
+**Cause.** `DetectionEngine.evaluate` named each threshold alert
+`uuid5("ghostwatch:{rule}:{breach start}:{occurrence}")` and incremented `occurrence`
+every time the cooldown expired. A sustained breach therefore produced a new alert ID,
+row and timeline event once per cooldown, 60 s by default. Threshold alerts also carried
+no lifecycle state and recorded no recovery, and the grouped-alert merge in
+`TelemetryService` and `Database.add_alert` applied only to `collection_failure`.
+Reproduced at `22a20a2` through the real engine, service and SQLite, with a synthetic
+sample held at 97% memory for 5 minutes: 5 memory rows, each with its own ID and an
+`occurrence_count` of 1.
+
+**Change.** The threshold rules (`cpu`, `memory`, `bandwidth`, `connections`,
+`connection_spike`, `process_count`, `disk_space` and `destination_diversity`) now use
+the grouped-alert path that collection failures already used:
+
+| Condition | Effect on the rule's one alert |
+| --- | --- |
+| Breach sustained for the configured duration | Opens it with a stable per-rule ID, `condition_active` true, `first_occurrence` and `last_occurrence` set, and a count of 1 |
+| Breach still present when the cooldown expires | Count +1. `last_occurrence`, timestamp, metric and evidence are updated. `first_occurrence`, acknowledge and dismiss are kept |
+| First readable sample within the threshold | `condition_active` false and `last_recovery` set. Count, first occurrence and operator state are kept. Severity stays the rule's |
+| Metric unreadable | No change. An open alert stays open until a readable sample clears it |
+| Breach again after a recovery | The same alert reopens with count +1, and acknowledge and dismiss are cleared, as for collection failures. It still waits for the cooldown since the rule last reported |
+| Restart during a breach | The same alert continues, keeping its first occurrence and operator state |
+| Restart after the condition cleared while stopped | Startup reads which threshold alerts are still stored as active. The first readable clear sample records their recovery |
+
+Each observation is a delta that live memory, the bounded pending queue and SQLite merge
+into that one record, under the existing race handling. `GROUPED_ALERT_RULES` in
+`app/models.py` lists the rules this applies to. Windows event, file integrity and
+storage alerts are not in it, so each security event stays its own alert.
+
+The timeline gets one `alert` event per breach instead of one per cooldown. A recovery
+updates the alert and adds no event, so it is not counted as a CRITICAL detection. The
+Detection Center shows the lifecycle line (state, first, last, occurrences and last
+recovery) for any alert that carries lifecycle state, not only collection failures.
+Recovered alerts were already left out of active signals and the navigation count.
+
+No schema, setting, API model or retention rule changed. `Database.active_alert_ids`
+reads only the IDs of active rows at startup, so an unreadable stored row cannot block
+storage initialization.
+
+**Tests.** `tests/test_v3_alert_lifecycle.py` adds 21 tests against the real engine,
+service and SQLite. A fake monotonic clock and an injected wall clock
+(`DetectionEngine(wall_clock=...)`) give exact timestamps, and races are held open with
+events around the database write, not timing. The first 17 were written before the fix:
+16 failed at `22a20a2` with duplicate rows, missing lifecycle state or the missing
+restore, and the guard that each rule keeps its own alert passed before and after. The
+file now uses the injected wall clock, which the old engine does not accept, so it
+cannot be rerun unchanged against `22a20a2`. The Playwright test
+`threshold alerts show their lifecycle state` failed before the dashboard change.
+
+Mutation checks reverted 16 parts of the fix one at a time, and at least one test failed
+for each: the stable ID, cooldown gating, the unreadable-metric guard and the memory
+availability flag in the engine; the startup restore and the active-ID lookup; storage
+grouping; the six service merge sites, including the live reopen reset; per-breach
+timeline events and the skipped recovery event; and adding security rules to the
+grouped set. Three of the service merge sites are reached only during a race, and
+their tests were added after the first mutation run found them uncovered. Merging a
+stored write with a newer queued observation (`_accept_stored_alert`) was not covered
+by any existing test, including for collection failures.
+
+### Limitations recorded at bc83f51
+
+- Rows written before this change keep their per-cooldown IDs and have no lifecycle
+  state, so they still count as active until dismissed or removed by retention. They
+  are not migrated.
+- A rule disabled while its alert is open leaves the alert open, because no sample
+  clears it. Re-enabling the rule resumes it.
+- A breach that returns within the cooldown is not reported until the cooldown ends,
+  so the alert can read `RECOVERED` for up to one cooldown while the threshold is
+  breached again. This is the existing cooldown behavior.
+- `occurrence_count` on a threshold alert counts reports, at most one per cooldown, not
+  samples.
+- Recovery needs one readable sample. A value that oscillates around the threshold can
+  recover and reopen once per cooldown, and each reopen clears acknowledge and dismiss.
+  There is no hysteresis.
+- The startup restore covers threshold rules only. A collection failure stored as
+  active when GhostWatch stopped stays active until the next failure and recovery, as
+  before.
+- A reopened alert keeps the incident link from its earlier breach, as grouped
+  collection-failure alerts already did.
+- A breach seen again after a restart adds one new timeline event, because the engine
+  starts a new breach in that process.
+- If startup storage failed and the saved state is loaded later, a recovery already
+  queued in memory can be recorded twice. The second only moves `last_recovery` later.
+
+## Alert episode correction after Codex review, 2026-11-10
+
+The correction builds on `bc83f51`; it does not replace the monitoring or persistence
+architecture. Each continuous threshold breach now owns an alert ID. Repeated
+observations merge into that episode until a readable sample confirms recovery. A
+later qualifying breach receives a new UUID, count and first occurrence. This also
+applies when the new breach qualifies inside the previous episode's cooldown.
+
+The five reviewed defects and their corrections are:
+
+1. **Hidden rebreach:** cooldown previously suppressed the transition back to active.
+   It now throttles only repeated observations of an already active episode. The
+   deterministic regression opens at t=10, recovers at t=12, opens a second episode
+   at t=24 and recovers it at t=40.
+2. **Historical incident association:** a rule-wide ID allowed the old incident's
+   `related_alerts` JSON to associate a new breach with the resolved case. Separate
+   episode IDs preserve the recovered alert and its incident relationship. Tests
+   check both `incident_id` and `_incident_for_alert()` without its stored-link
+   shortcut; a new episode cannot rediscover the old incident.
+3. **Lost metadata after restart:** restoring IDs alone left a recovery delta without
+   its count, timestamps or operator state. Startup now restores full active
+   threshold records into the engine and live view before evaluation. With logging
+   disabled, recovery changes the live state while SQLite remains unchanged, including
+   acknowledgement and dismissal.
+4. **Duplicate or shifted timeline detection:** restored episodes retain their ID and
+   first occurrence. Only the initial qualifying observation emits a timeline event;
+   subsequent observations cannot insert another event or overwrite the original in
+   the live timeline. The existing event-ID format is preserved for earlier beta rows.
+5. **Empty recovery after retention:** `Database.add_alert()` checks for a missing
+   threshold row inside its existing `BEGIN IMMEDIATE` transaction. A zero-occurrence
+   recovery delta for an expired episode is intentionally not inserted. The live
+   recovery retains its known history; direct writes and queued recovery both clear
+   pending state without resurrecting an empty persisted record. A queued episode
+   that includes actual observations can still be persisted normally.
+
+No schema migration, network exposure or security-event identity policy changed.
+Windows Defender, other Windows events and file-integrity alerts remain independent.
+The existing transaction and bounded-retention policies remain in place. Tests also
+exercise concurrent threshold increments across four database instances, rollback
+after a retention failure, unavailable telemetry for all eight threshold rules and
+continuation of an active ID written by `bc83f51`.
+
+Validation commands and final counts are recorded in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#alert-episode-review-corrections---november-10-2026).
+All added database fixtures are disposable synthetic data. No production database,
+unrelated expensive benchmark or external service is needed for these regressions.
+
+Remaining limitations:
+
+- Occurrences count emitted reports, rather than every telemetry sample. Repeats
+  within an episode still use the configured cooldown.
+- Recovery requires a readable enabled rule. Disabling a rule freezes its existing
+  state; unavailable telemetry does not establish recovery. No hysteresis was added.
+- Restart continuation relies on retained, readable persisted lifecycle state.
+  Retention-expired and never-persisted episodes cannot be reconstructed after exit.
+  Logging-disabled transitions remain live-only, and pending queues remain bounded
+  memory rather than a durable journal.
+- Pre-lifecycle alerts with unspecified condition state remain historical rows until
+  dismissed or removed by retention. Existing active beta lifecycle rows are resumed
+  under their stored IDs, then subsequent episodes use distinct IDs. Previously
+  conflated historical beta episodes are not split or rewritten.
+- Collection-failure lifecycle behavior is unchanged; its startup-recovery limitation
+  remains separate from these threshold episode corrections.
+
+## Delayed restoration and display-cache correction after cf62570
+
+The next focused correction preserves the episode identity, cooldown, incident,
+restart and retention behavior described above while addressing the final review's
+two reproduced failures.
+
+**Shared cause:** lifecycle aggregation depended on the 200-entry display deque.
+The detection engine retained observation deltas rather than full operator metadata,
+and its startup restoration skipped a saved episode when a provisional episode
+already occupied that rule. Consequently, eviction could remove the only complete
+baseline, and delayed restoration could persist a second identity for one breach.
+
+The service now keeps full active-episode metadata separately, with at most one
+entry per threshold rule. It also retains at most eight restored startup baselines,
+including live-only recoveries, so historical reads cannot resurrect unchanged
+SQLite state or displace a newer active episode. Display limits are unchanged.
+Observation merging, operator patches, incident refreshes and persistence acceptance
+update the same authoritative metadata. A recovery delta without any complete
+baseline is never displayed as a standalone alert.
+
+Until initial storage restoration finishes, the engine retains bounded summaries of
+the first possible continuation, first readable recovery and explicit operator
+changes for each threshold rule. Restoration binds a continuation to its original
+stored identity, transfers only its new observation count, and removes its duplicate
+queued/live detection. Operator-update events are rebound to the stable identity.
+An observed recovery is an episode boundary: subsequent breaches keep their separate
+identities, even if they qualified before SQLite returned. Explicit operator changes
+survive a saved logging opt-out discarding persistence queues.
+
+Incident creation involving a provisional threshold identity returns the existing
+503 error until storage restoration establishes the stable identity. This prevents
+an incident from acquiring a reference that reconciliation would orphan. Independent
+security-event selections are unchanged; no existing incident history is rewritten.
+
+Restored episode deltas are written with an optional internal `require_existing`
+guard. `Database.add_alert()` checks the baseline inside `BEGIN IMMEDIATE`. If
+retention pruned the original row before a reconciled positive-count delta reaches
+SQLite, the suffix is not inserted as incomplete history. The complete live episode
+remains available. The default two-argument database call and schema are unchanged;
+first-time episodes, including a queued initial breach and recovery, remain writable.
+
+Fourteen added cases cover delayed restore with logging on/off, recovery before and
+after restoration, 200 actual synthetic Defender correlations, retention and runtime
+outages, explicit provisional operator changes, historical reads after eviction,
+recurrence before SQLite returns, provisional incident references and retention
+pruning during a queued reconciliation flush. The first nine cases all failed
+against `cf62570`; the later operator/history and missing-baseline cases also failed
+before their targeted corrections. Full results are recorded in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#final-lifecycle-state-corrections-after-cf62570).
+
+Remaining limits are unchanged: bounded memory is not a durable journal, retention
+can remove persisted history, startup monitoring uses defaults until saved settings
+are readable, and previously corrupted or conflated history is not automatically
+rewritten. No production database, cache-limit increase, schema migration or separate
+expensive benchmark is part of this correction.
 
 ## Open findings
 

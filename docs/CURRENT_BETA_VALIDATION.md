@@ -9,11 +9,152 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | Group | Applies to | Result | Does not cover |
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
+| Local-only results, final lifecycle state corrections | The correction following `cf62570` on `fix/v3-alert-lifecycle`; see [below](#final-lifecycle-state-corrections-after-cf62570) | 716 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
+| Local-only results, alert episode corrections | `cf62570`; see [below](#alert-episode-review-corrections---november-10-2026) | 702 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | The final lifecycle state corrections, hosted CI, Python 3.13, any other browser engine |
+| Local-only results, original alert lifecycle fix | `bc83f51`, based on `22a20a2`; see [below](#threshold-alert-lifecycle---november-10-2026) | 684 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | The later episode corrections, hosted CI, Python 3.13, any other browser engine |
 | Local-only results, history fix | The history row-cap commit on `fix/v3-history-performance`, based on `7bae229`; see [below](#history-row-cap-retention---november-9-2026) | 663 passed with one warning on Python 3.11.9. 41 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
 | Local-only results | `0332aa8` plus this documentation change; see [below](#local-only-results---november-7-2026) | 626 passed with one warning on Python 3.11.9. 41 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
 | Dated historical snapshots | The sections below dated October 27 to November 3, 2026 | 222 Python and 15 Playwright, as recorded on each date | The current tree |
 
 `c162eed` is the head of draft [PR #7](https://github.com/doctor277/ghostwatch/pull/7), which was open and unmerged at the last check on November 5, 2026. The merge decision belongs to the owner. The hosted figures above are carried over from that checkpoint and were not fetched again for the local run below.
+
+## Threshold alert lifecycle - November 10, 2026
+
+The results in this section apply to the original implementation at `bc83f51`.
+The [review corrections](#alert-episode-review-corrections---november-10-2026) below
+supersede its rule-wide alert identity and cooldown behavior.
+
+Status: local only, not pushed. **Hosted CI and Python 3.13 were not run on this
+change.** It is one commit on `fix/v3-alert-lifecycle`, based on `22a20a2`, which
+merged PR #8.
+
+A sustained threshold breach now keeps one alert per rule. Later reports update its
+occurrence count and last occurrence, a clear records a recovery on it, and a later
+breach reopens it. Before this change, a sustained high-memory condition added a new
+CRITICAL alert every 60 seconds. Security-event alerts are unchanged. The cause, the
+behavior table, the tests and what remains are in the
+[audit](V3_RESILIENCE_AUDIT.md#threshold-alert-lifecycle-2026-11-10).
+
+Alerts written before this change are not migrated. Earlier per-cooldown rows stay as
+they are until dismissed or removed by alert retention.
+
+Environment: Windows 11, Python 3.11.9, Node 22.23.2, the installed Playwright
+Chromium, and synthetic data only. No production or host database was read or changed.
+
+| Command | Result |
+| --- | --- |
+| `python -m pytest -q --basetemp=<ignored scratch> -p no:cacheprovider` | `684 passed, 0 failed, 0 skipped, 1 warning` |
+| `python -m pytest tests/test_v3_alert_lifecycle.py` (same options), first 17 tests before the fix | `16 failed, 1 passed` |
+| `npm run test:e2e` | `42 passed, 0 failed, 0 skipped` |
+| `python -m ruff check .` | `All checks passed!` |
+| `python -m compileall -q app scripts tests` | Passed |
+| `node --check`, the nine JavaScript files listed in the [README](../README.md#testing) | `9 passed, 0 failed` |
+| `git diff --check` | Passed |
+
+The release archive was not rebuilt for this change. The new test file falls under the
+existing `tests` directory.
+
+## Alert episode review corrections - November 10, 2026
+
+Local corrections on `fix/v3-alert-lifecycle`, following `bc83f51`. No push or merge
+is authorized. Hosted CI, Python 3.13 and other browser engines have not been run for
+this correction.
+
+Threshold alerts now retain one ID per continuous breach episode, including across a
+restart when stored state is available. A confirmed recovery closes that episode; a
+new qualifying breach receives a distinct ID immediately after its configured
+duration, independently of the earlier cooldown. This preserves historical incident
+links. Startup hydrates saved counts, occurrence timestamps and operator state before
+applying recovery, including when logging is disabled. Repeated observations cannot
+replace the original timeline detection. A recovery-only delta does not recreate a
+retention-expired database row.
+
+No installation or configuration change is required. Existing beta active records
+continue under their stored IDs. The
+[correction notes](V3_RESILIENCE_AUDIT.md#alert-episode-correction-after-codex-review-2026-11-10)
+describe the five root causes, regression scenarios, retention policy and remaining
+limitations.
+
+Before implementation, all seven new parameterized blocker/follow-up regression cases
+failed against `bc83f51` for the reproduced defects. Strengthening the restart test to
+check the merged live timeline also exposed an overwritten detection timestamp; it
+failed before timeline emission was restricted to initial detections.
+
+Final local validation on Windows with Python 3.11.9 and the installed Playwright
+Chromium:
+
+| Command | Result |
+| --- | --- |
+| `python -m pytest -q -p no:cacheprovider --tb=short` with isolated ignored `TEMP` / `TMP` | `702 passed, 0 failed, 0 skipped, 1 warning` in 198.66 s |
+| `npm run test:e2e -- --reporter=list` | `42 passed, 0 failed, 0 skipped`, desktop and mobile Chromium |
+| `python -m ruff check --no-cache .` | `All checks passed!` |
+| `python -m compileall -q app scripts tests` | Passed |
+| `node --check` for frontend, E2E and Playwright configuration | `9 files passed, 0 failed` |
+| `git diff --check` and focused diff privacy review | Passed |
+
+The lifecycle file now contains 39 cases, 18 more than `bc83f51`. Four existing cases
+were updated for the explicitly changed episode/restore contract; they still check
+throttling, preserved history and operator-state isolation. The final full Python
+run supersedes an earlier complete run of 691 cases before the last 11 coverage
+cases were added. The one warning is the existing Starlette/httpx TestClient
+deprecation warning.
+
+Test data is synthetic and isolated under ignored scratch directories; no production
+data is used. No separate expensive benchmark or release archive build was run.
+
+## Final lifecycle state corrections after cf62570
+
+Local work on `fix/v3-alert-lifecycle`, building on
+`cf625707b020a07f8ddc1fa5f06aa9c175f5d3c3`. No push or merge is authorized.
+
+The final review reproduced two remaining failures: delayed SQLite restoration
+could leave two active identities for one breach, and eviction from the display
+cache could discard complete metadata before recovery. The service now keeps
+bounded authoritative episode metadata separately from display entries. Startup
+reconciliation transfers provisional observation deltas onto the original ID,
+preserves operator state and incident relationships, removes duplicate queued
+detections, and respects any readable recovery boundary before later episodes.
+
+Explicit provisional operator changes survive a saved logging opt-out. Historical
+reads cannot replace the current episode's metadata. A selected provisional
+threshold ID cannot enter incident history until restoration establishes its stable
+identity; the existing API returns 503 and can be retried after recovery.
+
+Restored episode writes require their original SQLite baseline inside the write
+transaction. If retention expired it, a queued partial delta cannot recreate an
+incomplete row. Full live metadata remains available. Display-cache limits and
+database schema are unchanged, and ordinary two-argument database writes remain
+compatible.
+
+Fourteen cases were added to the lifecycle file (53 total), including both exact
+reproductions and combinations of restart, eviction, recovery, recurrence,
+retention, logging opt-out and storage outages. The first nine failed before the
+correction. Additional focused review cases reproduced and then protected operator
+intent, historical reads, provisional incident references and retention during
+queued restoration. All data uses disposable synthetic databases.
+
+See the [architecture and limits](V3_RESILIENCE_AUDIT.md#delayed-restoration-and-display-cache-correction-after-cf62570).
+
+Final validation, using disposable ignored scratch directories for `TEMP` / `TMP`:
+
+| Check | Result |
+| --- | --- |
+| Complete pytest suite, with JUnit output under ignored scratch | `716 passed, 0 failed, 0 skipped, 1 warning` in 314.69 s |
+| Lifecycle, persistence-race, final-race and operator-state suites | `176 passed, 0 failed, 0 skipped` |
+| Complete Playwright suite | `42 passed, 0 failed, 0 skipped`, desktop and mobile Chromium |
+| Ruff over the repository | `All checks passed!` |
+| Python compilation of `app`, `scripts` and `tests` | Passed |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| Diff whitespace and focused privacy checks | Passed |
+
+An intermediate full run exposed `test_live_alerts_remain_visible_when_logging_is_disabled`:
+operator updates were calling a threshold-only method on its generic test detector.
+Tracking was restricted to threshold alerts; all nine service tests then passed.
+The final complete run above supersedes that stopped intermediate run. The warning
+is the existing Starlette/httpx TestClient deprecation warning.
+
+No production data, separate expensive benchmark, release build, hosted CI or
+Python 3.13 run is part of this correction.
 
 ## History row-cap retention - November 9, 2026
 

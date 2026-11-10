@@ -14,6 +14,8 @@ from threading import Lock
 from pydantic import BaseModel
 
 from app.models import (
+    GROUPED_ALERT_RULES,
+    THRESHOLD_ALERT_RULES,
     AISettings,
     Alert,
     AlertUpdate,
@@ -709,7 +711,9 @@ class Database:
                 (key, value.model_dump_json()),
             )
 
-    def add_alert(self, alert: Alert, retention: int) -> Alert:
+    def add_alert(
+        self, alert: Alert, retention: int, require_existing: bool = False
+    ) -> Alert | None:
         with self._lock, self._connect() as connection:
             # The authoritative relationship and grouped count must be read in
             # the same write transaction, including across Database instances.
@@ -718,6 +722,19 @@ class Database:
             row = connection.execute(
                 "SELECT * FROM alerts WHERE id = ?", (alert.id,)
             ).fetchone()
+            if row is None and require_existing:
+                # A restored episode delta assumes a persisted prefix. Retention
+                # may have removed it since restoration; never insert a suffix
+                # as though it were the complete episode. Check under the same
+                # write transaction that would merge the count.
+                return None
+            if (
+                row is None and alert.rule_id in THRESHOLD_ALERT_RULES
+                and alert.condition_active is False and alert.occurrence_count == 0
+            ):
+                # Retention expired this episode. A transition-only delta cannot
+                # reconstruct its history; keep recovery in live memory only.
+                return None
             # Incident writes own this relationship. Observations can be stale,
             # or the incident may have been created before this row existed.
             incident_id = self._incident_for_alert(
@@ -726,7 +743,7 @@ class Database:
             if incident_id is None:
                 incident_id = alert.incident_id
             stored = alert.model_copy(update={"incident_id": incident_id})
-            if alert.rule_id == "collection_failure":
+            if alert.rule_id in GROUPED_ALERT_RULES:
                 if row is not None:
                     existing = self._row_to_alert(row)
                     reopened = (
@@ -874,6 +891,21 @@ class Database:
                 tuple(values),
             )
         return self.get_alert(alert_id)
+
+    def active_threshold_alerts(self) -> list[Alert]:
+        placeholders = ", ".join("?" for _ in THRESHOLD_ALERT_RULES)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM alerts WHERE condition_active = 1 AND rule_id IN ({placeholders}) ORDER BY timestamp DESC",  # noqa: S608 - placeholders only
+                tuple(THRESHOLD_ALERT_RULES),
+            ).fetchall()
+        alerts = []
+        for row in rows:
+            try:
+                alerts.append(self._row_to_alert(row))
+            except (ValueError, TypeError) as exc:
+                LOGGER.warning("Active alert could not be restored (%s)", type(exc).__name__)
+        return alerts
 
     def get_alert(self, alert_id: str) -> Alert | None:
         with self._lock, self._connect() as connection:

@@ -138,6 +138,24 @@ DEFAULT_RULE_ENABLEMENT = {
     "storage_failure": True,
 }
 
+# Rules whose observations merge into an alert lifecycle. Threshold alerts keep
+# one ID per continuous breach episode. Security-event
+# alerts are not listed: each event is its own alert.
+GROUPED_ALERT_RULES = frozenset(
+    {
+        "cpu",
+        "memory",
+        "bandwidth",
+        "connections",
+        "connection_spike",
+        "process_count",
+        "disk_space",
+        "destination_diversity",
+        "collection_failure",
+    }
+)
+THRESHOLD_ALERT_RULES = GROUPED_ALERT_RULES - {"collection_failure"}
+
 
 class DetectionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
