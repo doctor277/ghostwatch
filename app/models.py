@@ -138,6 +138,23 @@ DEFAULT_RULE_ENABLEMENT = {
     "storage_failure": True,
 }
 
+# Rules whose alerts keep one stable ID and a lifecycle. Each observation is a
+# delta that live memory and storage merge into that one record. Security-event
+# alerts are not listed: each event is its own alert.
+GROUPED_ALERT_RULES = frozenset(
+    {
+        "cpu",
+        "memory",
+        "bandwidth",
+        "connections",
+        "connection_spike",
+        "process_count",
+        "disk_space",
+        "destination_diversity",
+        "collection_failure",
+    }
+)
+
 
 class DetectionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")

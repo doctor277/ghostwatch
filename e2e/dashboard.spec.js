@@ -73,6 +73,23 @@ test("alerts acknowledge and dismiss without stale counters", async ({ page }) =
   await expect(page.locator("#nav-alert-count")).toHaveText("0");
 });
 
+test("threshold alerts show their lifecycle state", async ({ page }) => {
+  const recoveredAt = new Date().toISOString();
+  backend.state.snapshot.alerts = [{
+    id: "synthetic-memory-alert", timestamp: recoveredAt, severity: "CRITICAL", source: "System",
+    metric: "Memory 41.0%", explanation: "Recovered: the latest sample is within the configured threshold.",
+    acknowledged: false, dismissed: false, rule_id: "memory", evidence: { observed_percent: 41, threshold_percent: 90 },
+    persistence_pending: false, first_occurrence: new Date(Date.now() - 600000).toISOString(),
+    last_occurrence: new Date(Date.now() - 60000).toISOString(), occurrence_count: 4,
+    condition_active: false, last_recovery: recoveredAt,
+  }];
+  backend.sendSnapshot();
+  await page.locator('[data-view="alerts"]').click();
+  await expect(page.locator("#alert-list")).toContainText("STATE: RECOVERED");
+  await expect(page.locator("#alert-list")).toContainText("Occurrences: 4");
+  await expect(page.locator("#nav-alert-count")).toHaveText("0");
+});
+
 test("settings persist across a browser reload", async ({ page }) => {
   await page.locator('[data-view="settings"]').click();
   await page.locator('#settings-form [name="refresh_interval"]').fill("5");

@@ -22,8 +22,9 @@ from app.config import (
     MAX_WEBSOCKET_CLIENTS,
     WEBSOCKET_SEND_TIMEOUT_SECONDS,
 )
-from app.detection.engine import DetectionEngine
+from app.detection.engine import THRESHOLD_ALERT_IDS, DetectionEngine
 from app.models import (
+    GROUPED_ALERT_RULES,
     MAX_ALERT_LABEL,
     AISettings,
     Alert,
@@ -216,6 +217,10 @@ class TelemetryService:
             self.database.load_baseline_state
         )
         self.baseline_engine.restore_state(baseline_state)
+        active_alerts = await asyncio.to_thread(
+            self.database.active_alert_ids, list(THRESHOLD_ALERT_IDS)
+        )
+        self.detection_engine.restore_active(active_alerts)
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -835,7 +840,9 @@ class TelemetryService:
             for alert in new_alerts:
                 self._remember_live_alert(alert)
                 try:
-                    event = self._alert_event(alert)
+                    # A threshold recovery updates its alert. The timeline keeps detections.
+                    recovery = alert.condition_active is False and alert.id in THRESHOLD_ALERT_IDS
+                    event = None if recovery else self._alert_event(alert)
                 except ValidationError as exc:
                     # One alert must not cost the rest of this telemetry cycle.
                     LOGGER.warning("Alert event could not be created (%s)", type(exc).__name__)
@@ -925,7 +932,7 @@ class TelemetryService:
                     alert = alert.model_copy(update={"incident_id": existing.incident_id})
                 if (
                     not authoritative
-                    and alert.rule_id == "collection_failure"
+                    and alert.rule_id in GROUPED_ALERT_RULES
                     and alert.condition_active is True
                     and existing.condition_active is False
                 ):
@@ -934,7 +941,7 @@ class TelemetryService:
                     )
                 remembered = (
                     alert
-                    if authoritative or alert.rule_id != "collection_failure"
+                    if authoritative or alert.rule_id not in GROUPED_ALERT_RULES
                     else self._merge_grouped_alert(existing, alert)
                 )
                 self.live_alerts[index] = remembered
@@ -944,7 +951,7 @@ class TelemetryService:
 
     def _queue_pending_alert(self, alert: Alert) -> None:
         existing = self._pending_alerts.get(alert.id)
-        if existing is not None and alert.rule_id == "collection_failure":
+        if existing is not None and alert.rule_id in GROUPED_ALERT_RULES:
             alert = self._merge_grouped_alert(existing, alert)
         self._queue_pending(self._pending_alerts, alert.id, alert)
 
@@ -960,8 +967,12 @@ class TelemetryService:
             "WARNING": "HIGH",
             "CRITICAL": "CRITICAL",
         }[alert.severity]
+        event_id = f"event-alert-{alert.id}"
+        if alert.id in THRESHOLD_ALERT_IDS and alert.first_occurrence is not None:
+            # One timeline entry per breach, however often it is re-confirmed.
+            event_id = f"{event_id}-{alert.first_occurrence.isoformat()}"
         return EventRecord(
-            id=f"event-alert-{alert.id}",
+            id=event_id,
             timestamp=alert.timestamp,
             event_type="alert",
             severity=severity,  # type: ignore[arg-type]
@@ -1084,7 +1095,7 @@ class TelemetryService:
         if pending is not None:
             result = (
                 self._merge_grouped_alert(stored, pending)
-                if stored.rule_id == "collection_failure" else pending
+                if stored.rule_id in GROUPED_ALERT_RULES else pending
             ).model_copy(update={"incident_id": stored.incident_id})
         if current is not None:
             before_link = before.incident_id if before is not None else None
@@ -1198,7 +1209,7 @@ class TelemetryService:
                     # it was in flight. Keep recovery/reopening in that order.
                     pending = (
                         self._merge_grouped_alert(alert, newer)
-                        if alert.rule_id == "collection_failure" else newer
+                        if alert.rule_id in GROUPED_ALERT_RULES else newer
                     )
                     self._queue_pending(self._pending_alerts, alert.id, pending)
             self._mark_storage_failure(exc)
@@ -1333,7 +1344,7 @@ class TelemetryService:
                 # Retain only the unwritten count, never replay the committed delta.
                 newer = self._pending_alerts.get(alert_id)
                 if (
-                    newer is not None and alert.rule_id == "collection_failure"
+                    newer is not None and alert.rule_id in GROUPED_ALERT_RULES
                     and generation == self._logging_generation
                 ):
                     self._pending_alerts[alert_id] = newer.model_copy(update={

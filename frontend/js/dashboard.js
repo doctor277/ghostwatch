@@ -363,7 +363,7 @@ function renderAlerts() {
     const copy = element("div");
     copy.append(element("p", "", alert.explanation));
     copy.append(element("div", "evidence", `Rule: ${alert.rule_id || "legacy"} · Evidence: ${JSON.stringify(alert.evidence || {})}`));
-    if (alert.rule_id === "collection_failure") {
+    if (alert.rule_id === "collection_failure" || typeof alert.condition_active === "boolean") {
       const first = alert.first_occurrence ? new Date(alert.first_occurrence).toLocaleString() : "unknown";
       const last = alert.last_occurrence ? new Date(alert.last_occurrence).toLocaleString() : "unknown";
       const recovery = alert.last_recovery ? new Date(alert.last_recovery).toLocaleString() : "none observed";

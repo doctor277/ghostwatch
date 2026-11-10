@@ -14,6 +14,7 @@ from threading import Lock
 from pydantic import BaseModel
 
 from app.models import (
+    GROUPED_ALERT_RULES,
     AISettings,
     Alert,
     AlertUpdate,
@@ -726,7 +727,7 @@ class Database:
             if incident_id is None:
                 incident_id = alert.incident_id
             stored = alert.model_copy(update={"incident_id": incident_id})
-            if alert.rule_id == "collection_failure":
+            if alert.rule_id in GROUPED_ALERT_RULES:
                 if row is not None:
                     existing = self._row_to_alert(row)
                     reopened = (
@@ -874,6 +875,18 @@ class Database:
                 tuple(values),
             )
         return self.get_alert(alert_id)
+
+    def active_alert_ids(self, alert_ids: list[str]) -> set[str]:
+        # Only identifiers are read, so an unreadable row cannot block startup.
+        if not alert_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in alert_ids)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM alerts WHERE condition_active = 1 AND id IN ({placeholders})",  # noqa: S608 - placeholders only
+                tuple(alert_ids),
+            ).fetchall()
+        return {row["id"] for row in rows}
 
     def get_alert(self, alert_id: str) -> Alert | None:
         with self._lock, self._connect() as connection:

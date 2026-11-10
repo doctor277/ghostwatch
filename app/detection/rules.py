@@ -16,6 +16,8 @@ class RuleEvaluation:
     explanation: str
     duration: float
     evidence: dict[str, Any] = field(default_factory=dict)
+    # False when the metric could not be read: not breached, but not cleared either.
+    available: bool = True
 
 
 def evaluate_rules(
@@ -51,6 +53,7 @@ def evaluate_rules(
             "High use is not proof of malicious activity.",
             settings.threshold_duration,
             {"observed_percent": system.cpu_percent, "threshold_percent": settings.cpu_threshold},
+            "cpu_percent" not in system_unavailable,
         ),
         RuleEvaluation(
             "memory",
@@ -65,6 +68,7 @@ def evaluate_rules(
                 "observed_percent": system.memory_percent,
                 "threshold_percent": settings.memory_threshold,
             },
+            "memory_percent" not in system_unavailable,
         ),
         RuleEvaluation(
             "bandwidth",
@@ -80,6 +84,7 @@ def evaluate_rules(
                 "observed_mbps": network.upload_mbps,
                 "threshold_mbps": settings.bandwidth_threshold_mbps,
             },
+            "upload_mbps" not in network_unavailable,
         ),
         RuleEvaluation(
             "connections",
@@ -95,6 +100,7 @@ def evaluate_rules(
                 "observed_count": network.established_connections,
                 "threshold_count": settings.connection_threshold,
             },
+            "established_connections" not in network_unavailable,
         ),
         RuleEvaluation(
             "connection_spike",
@@ -110,6 +116,8 @@ def evaluate_rules(
                 "observed_count": network.established_connections,
                 "growth_threshold": detection.connection_growth_threshold,
             },
+            "established_connections" not in network_unavailable
+            and previous_connection_count is not None,
         ),
         RuleEvaluation(
             "process_count",
@@ -125,6 +133,7 @@ def evaluate_rules(
                 "observed_count": system.process_count,
                 "threshold_count": detection.process_count_threshold,
             },
+            "process_count" not in system_unavailable,
         ),
         RuleEvaluation(
             "disk_space",
@@ -138,6 +147,7 @@ def evaluate_rules(
                 "free_percent": disk_free,
                 "threshold_percent": detection.disk_free_threshold_percent,
             },
+            disk_free is not None,
         ),
         RuleEvaluation(
             "destination_diversity",
@@ -154,6 +164,7 @@ def evaluate_rules(
                 "observed_count": network.unique_remote_destinations,
                 "threshold_count": detection.destination_diversity_threshold,
             },
+            "unique_remote_destinations" not in network_unavailable,
         ),
         RuleEvaluation(
             "collection_failure",
