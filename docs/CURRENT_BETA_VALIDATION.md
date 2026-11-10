@@ -9,7 +9,8 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | Group | Applies to | Result | Does not cover |
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
-| Local-only results, alert lifecycle fix | The threshold alert lifecycle commit on `fix/v3-alert-lifecycle`, based on `22a20a2`; see [below](#threshold-alert-lifecycle---november-10-2026) | 684 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
+| Local-only results, alert episode corrections | The correction following `bc83f51` on `fix/v3-alert-lifecycle`; see [below](#alert-episode-review-corrections---november-10-2026) | 702 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
+| Local-only results, original alert lifecycle fix | `bc83f51`, based on `22a20a2`; see [below](#threshold-alert-lifecycle---november-10-2026) | 684 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | The later episode corrections, hosted CI, Python 3.13, any other browser engine |
 | Local-only results, history fix | The history row-cap commit on `fix/v3-history-performance`, based on `7bae229`; see [below](#history-row-cap-retention---november-9-2026) | 663 passed with one warning on Python 3.11.9. 41 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
 | Local-only results | `0332aa8` plus this documentation change; see [below](#local-only-results---november-7-2026) | 626 passed with one warning on Python 3.11.9. 41 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
 | Dated historical snapshots | The sections below dated October 27 to November 3, 2026 | 222 Python and 15 Playwright, as recorded on each date | The current tree |
@@ -17,6 +18,10 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 `c162eed` is the head of draft [PR #7](https://github.com/doctor277/ghostwatch/pull/7), which was open and unmerged at the last check on November 5, 2026. The merge decision belongs to the owner. The hosted figures above are carried over from that checkpoint and were not fetched again for the local run below.
 
 ## Threshold alert lifecycle - November 10, 2026
+
+The results in this section apply to the original implementation at `bc83f51`.
+The [review corrections](#alert-episode-review-corrections---november-10-2026) below
+supersede its rule-wide alert identity and cooldown behavior.
 
 Status: local only, not pushed. **Hosted CI and Python 3.13 were not run on this
 change.** It is one commit on `fix/v3-alert-lifecycle`, based on `22a20a2`, which
@@ -47,6 +52,54 @@ Chromium, and synthetic data only. No production or host database was read or ch
 
 The release archive was not rebuilt for this change. The new test file falls under the
 existing `tests` directory.
+
+## Alert episode review corrections - November 10, 2026
+
+Local corrections on `fix/v3-alert-lifecycle`, following `bc83f51`. No push or merge
+is authorized. Hosted CI, Python 3.13 and other browser engines have not been run for
+this correction.
+
+Threshold alerts now retain one ID per continuous breach episode, including across a
+restart when stored state is available. A confirmed recovery closes that episode; a
+new qualifying breach receives a distinct ID immediately after its configured
+duration, independently of the earlier cooldown. This preserves historical incident
+links. Startup hydrates saved counts, occurrence timestamps and operator state before
+applying recovery, including when logging is disabled. Repeated observations cannot
+replace the original timeline detection. A recovery-only delta does not recreate a
+retention-expired database row.
+
+No installation or configuration change is required. Existing beta active records
+continue under their stored IDs. The
+[correction notes](V3_RESILIENCE_AUDIT.md#alert-episode-correction-after-codex-review-2026-11-10)
+describe the five root causes, regression scenarios, retention policy and remaining
+limitations.
+
+Before implementation, all seven new parameterized blocker/follow-up regression cases
+failed against `bc83f51` for the reproduced defects. Strengthening the restart test to
+check the merged live timeline also exposed an overwritten detection timestamp; it
+failed before timeline emission was restricted to initial detections.
+
+Final local validation on Windows with Python 3.11.9 and the installed Playwright
+Chromium:
+
+| Command | Result |
+| --- | --- |
+| `python -m pytest -q -p no:cacheprovider --tb=short` with isolated ignored `TEMP` / `TMP` | `702 passed, 0 failed, 0 skipped, 1 warning` in 198.66 s |
+| `npm run test:e2e -- --reporter=list` | `42 passed, 0 failed, 0 skipped`, desktop and mobile Chromium |
+| `python -m ruff check --no-cache .` | `All checks passed!` |
+| `python -m compileall -q app scripts tests` | Passed |
+| `node --check` for frontend, E2E and Playwright configuration | `9 files passed, 0 failed` |
+| `git diff --check` and focused diff privacy review | Passed |
+
+The lifecycle file now contains 39 cases, 18 more than `bc83f51`. Four existing cases
+were updated for the explicitly changed episode/restore contract; they still check
+throttling, preserved history and operator-state isolation. The final full Python
+run supersedes an earlier complete run of 691 cases before the last 11 coverage
+cases were added. The one warning is the existing Starlette/httpx TestClient
+deprecation warning.
+
+Test data is synthetic and isolated under ignored scratch directories; no production
+data is used. No separate expensive benchmark or release archive build was run.
 
 ## History row-cap retention - November 9, 2026
 

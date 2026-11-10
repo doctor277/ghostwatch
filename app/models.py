@@ -138,8 +138,8 @@ DEFAULT_RULE_ENABLEMENT = {
     "storage_failure": True,
 }
 
-# Rules whose alerts keep one stable ID and a lifecycle. Each observation is a
-# delta that live memory and storage merge into that one record. Security-event
+# Rules whose observations merge into an alert lifecycle. Threshold alerts keep
+# one ID per continuous breach episode. Security-event
 # alerts are not listed: each event is its own alert.
 GROUPED_ALERT_RULES = frozenset(
     {
@@ -154,6 +154,7 @@ GROUPED_ALERT_RULES = frozenset(
         "collection_failure",
     }
 )
+THRESHOLD_ALERT_RULES = GROUPED_ALERT_RULES - {"collection_failure"}
 
 
 class DetectionSettings(BaseModel):

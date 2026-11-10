@@ -22,10 +22,11 @@ from app.config import (
     MAX_WEBSOCKET_CLIENTS,
     WEBSOCKET_SEND_TIMEOUT_SECONDS,
 )
-from app.detection.engine import THRESHOLD_ALERT_IDS, DetectionEngine
+from app.detection.engine import DetectionEngine
 from app.models import (
     GROUPED_ALERT_RULES,
     MAX_ALERT_LABEL,
+    THRESHOLD_ALERT_RULES,
     AISettings,
     Alert,
     AlertUpdate,
@@ -218,9 +219,11 @@ class TelemetryService:
         )
         self.baseline_engine.restore_state(baseline_state)
         active_alerts = await asyncio.to_thread(
-            self.database.active_alert_ids, list(THRESHOLD_ALERT_IDS)
+            self.database.active_threshold_alerts
         )
-        self.detection_engine.restore_active(active_alerts)
+        for alert in self.detection_engine.restore_active(active_alerts):
+            if self._live_alert(alert.id) is None:
+                self._remember_live_alert(alert, authoritative=True)
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -840,9 +843,16 @@ class TelemetryService:
             for alert in new_alerts:
                 self._remember_live_alert(alert)
                 try:
-                    # A threshold recovery updates its alert. The timeline keeps detections.
-                    recovery = alert.condition_active is False and alert.id in THRESHOLD_ALERT_IDS
-                    event = None if recovery else self._alert_event(alert)
+                    # Only the first detection enters the timeline. Repeated
+                    # observations (including after restart) must not replace it.
+                    transition_only = (
+                        alert.rule_id in THRESHOLD_ALERT_RULES
+                        and (
+                            alert.condition_active is False
+                            or alert.timestamp != alert.first_occurrence
+                        )
+                    )
+                    event = None if transition_only else self._alert_event(alert)
                 except ValidationError as exc:
                     # One alert must not cost the rest of this telemetry cycle.
                     LOGGER.warning("Alert event could not be created (%s)", type(exc).__name__)
@@ -968,7 +978,7 @@ class TelemetryService:
             "CRITICAL": "CRITICAL",
         }[alert.severity]
         event_id = f"event-alert-{alert.id}"
-        if alert.id in THRESHOLD_ALERT_IDS and alert.first_occurrence is not None:
+        if alert.rule_id in THRESHOLD_ALERT_RULES and alert.first_occurrence is not None:
             # One timeline entry per breach, however often it is re-confirmed.
             event_id = f"{event_id}-{alert.first_occurrence.isoformat()}"
         return EventRecord(
@@ -1214,7 +1224,10 @@ class TelemetryService:
                     self._queue_pending(self._pending_alerts, alert.id, pending)
             self._mark_storage_failure(exc)
             return False
-        self._accept_stored_alert(stored, before)
+        if stored is not None:
+            self._accept_stored_alert(stored, before)
+        else:
+            self._clear_pending_flag(alert.id)
         self._mark_storage_success()
         await self._reconcile_written_link(alert.id, sequence)
         return True
@@ -1350,11 +1363,17 @@ class TelemetryService:
                     self._pending_alerts[alert_id] = newer.model_copy(update={
                         "occurrence_count": newer.occurrence_count - alert.occurrence_count
                     })
-                self._accept_stored_alert(stored, before)
+                if stored is not None:
+                    self._accept_stored_alert(stored, before)
+                else:
+                    self._clear_pending_flag(alert_id)
                 await self._reconcile_written_link(alert_id, sequence)
                 continue
             self._pending_alerts.pop(alert_id, None)
-            self._accept_stored_alert(stored, before)
+            if stored is not None:
+                self._accept_stored_alert(stored, before)
+            else:
+                self._clear_pending_flag(alert_id)
             await self._reconcile_written_link(alert_id, sequence)
         for alert_id in list(self._pending_alert_updates):
             if not self.settings.event_logging_enabled:

@@ -971,7 +971,9 @@ cost still grows with the table.
 
 ## Threshold alert lifecycle, 2026-11-10
 
-Local only, on `fix/v3-alert-lifecycle` from `22a20a2`. Not pushed.
+Historical implementation at `bc83f51`, on `fix/v3-alert-lifecycle` from
+`22a20a2`. The episode correction below supersedes the per-rule identity and
+cooldown behavior in this section. Neither change has been pushed.
 
 **Cause.** `DetectionEngine.evaluate` named each threshold alert
 `uuid5("ghostwatch:{rule}:{breach start}:{occurrence}")` and incremented `occurrence`
@@ -1032,7 +1034,7 @@ their tests were added after the first mutation run found them uncovered. Mergin
 stored write with a newer queued observation (`_accept_stored_alert`) was not covered
 by any existing test, including for collection failures.
 
-### What remains
+### Limitations recorded at bc83f51
 
 - Rows written before this change keep their per-cooldown IDs and have no lifecycle
   state, so they still count as active until dismissed or removed by retention. They
@@ -1056,6 +1058,70 @@ by any existing test, including for collection failures.
   starts a new breach in that process.
 - If startup storage failed and the saved state is loaded later, a recovery already
   queued in memory can be recorded twice. The second only moves `last_recovery` later.
+
+## Alert episode correction after Codex review, 2026-11-10
+
+The correction builds on `bc83f51`; it does not replace the monitoring or persistence
+architecture. Each continuous threshold breach now owns an alert ID. Repeated
+observations merge into that episode until a readable sample confirms recovery. A
+later qualifying breach receives a new UUID, count and first occurrence. This also
+applies when the new breach qualifies inside the previous episode's cooldown.
+
+The five reviewed defects and their corrections are:
+
+1. **Hidden rebreach:** cooldown previously suppressed the transition back to active.
+   It now throttles only repeated observations of an already active episode. The
+   deterministic regression opens at t=10, recovers at t=12, opens a second episode
+   at t=24 and recovers it at t=40.
+2. **Historical incident association:** a rule-wide ID allowed the old incident's
+   `related_alerts` JSON to associate a new breach with the resolved case. Separate
+   episode IDs preserve the recovered alert and its incident relationship. Tests
+   check both `incident_id` and `_incident_for_alert()` without its stored-link
+   shortcut; a new episode cannot rediscover the old incident.
+3. **Lost metadata after restart:** restoring IDs alone left a recovery delta without
+   its count, timestamps or operator state. Startup now restores full active
+   threshold records into the engine and live view before evaluation. With logging
+   disabled, recovery changes the live state while SQLite remains unchanged, including
+   acknowledgement and dismissal.
+4. **Duplicate or shifted timeline detection:** restored episodes retain their ID and
+   first occurrence. Only the initial qualifying observation emits a timeline event;
+   subsequent observations cannot insert another event or overwrite the original in
+   the live timeline. The existing event-ID format is preserved for earlier beta rows.
+5. **Empty recovery after retention:** `Database.add_alert()` checks for a missing
+   threshold row inside its existing `BEGIN IMMEDIATE` transaction. A zero-occurrence
+   recovery delta for an expired episode is intentionally not inserted. The live
+   recovery retains its known history; direct writes and queued recovery both clear
+   pending state without resurrecting an empty persisted record. A queued episode
+   that includes actual observations can still be persisted normally.
+
+No schema migration, network exposure or security-event identity policy changed.
+Windows Defender, other Windows events and file-integrity alerts remain independent.
+The existing transaction and bounded-retention policies remain in place. Tests also
+exercise concurrent threshold increments across four database instances, rollback
+after a retention failure, unavailable telemetry for all eight threshold rules and
+continuation of an active ID written by `bc83f51`.
+
+Validation commands and final counts are recorded in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#alert-episode-review-corrections---november-10-2026).
+All added database fixtures are disposable synthetic data. No production database,
+unrelated expensive benchmark or external service is needed for these regressions.
+
+Remaining limitations:
+
+- Occurrences count emitted reports, rather than every telemetry sample. Repeats
+  within an episode still use the configured cooldown.
+- Recovery requires a readable enabled rule. Disabling a rule freezes its existing
+  state; unavailable telemetry does not establish recovery. No hysteresis was added.
+- Restart continuation relies on retained, readable persisted lifecycle state.
+  Retention-expired and never-persisted episodes cannot be reconstructed after exit.
+  Logging-disabled transitions remain live-only, and pending queues remain bounded
+  memory rather than a durable journal.
+- Pre-lifecycle alerts with unspecified condition state remain historical rows until
+  dismissed or removed by retention. Existing active beta lifecycle rows are resumed
+  under their stored IDs, then subsequent episodes use distinct IDs. Previously
+  conflated historical beta episodes are not split or rewritten.
+- Collection-failure lifecycle behavior is unchanged; its startup-recovery limitation
+  remains separate from these threshold episode corrections.
 
 ## Open findings
 

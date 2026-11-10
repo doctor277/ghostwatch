@@ -3,28 +3,17 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from app.detection.rules import RuleEvaluation, evaluate_rules
 from app.models import (
-    GROUPED_ALERT_RULES,
+    THRESHOLD_ALERT_RULES,
     Alert,
     DetectionSettings,
     NetworkSample,
     Settings,
     SystemSample,
 )
-
-
-def rule_alert_id(rule_key: str) -> str:
-    # One record per threshold rule: a sustained breach updates it, a clear
-    # records its recovery, and a later breach reopens it.
-    return str(uuid5(NAMESPACE_URL, f"ghostwatch:rule:{rule_key}"))
-
-
-THRESHOLD_ALERT_IDS = {
-    rule_alert_id(rule): rule for rule in GROUPED_ALERT_RULES - {"collection_failure"}
-}
 
 
 def _utc_now() -> datetime:
@@ -43,20 +32,28 @@ class DetectionEngine:
         self.cooldown_seconds = cooldown_seconds
         self._breach_started: dict[str, float] = {}
         self._last_alerted: dict[str, float] = {}
-        # Open threshold alerts and their first occurrence in this process. None
-        # means resumed from storage, which keeps the stored first occurrence.
-        self._active: dict[str, datetime | None] = {}
+        # Identity and first observation survive restarts for an ongoing episode.
+        self._active: dict[str, Alert] = {}
         self._previous_connections: int | None = None
         self._collection_failure_active = False
         self._collection_failure_first: datetime | None = None
 
-    def restore_active(self, alert_ids: Iterable[str]) -> None:
-        """Resume threshold alerts that storage still records as active, so a
-        clear that happened while GhostWatch was stopped records a recovery."""
-        for alert_id in alert_ids:
-            rule = THRESHOLD_ALERT_IDS.get(alert_id)
-            if rule is not None:
-                self._active.setdefault(rule, None)
+    def restore_active(self, alerts: Iterable[Alert]) -> list[Alert]:
+        """Resume stored episodes without replacing newer in-process observations."""
+        restored = []
+        for alert in alerts:
+            if (
+                alert.rule_id in THRESHOLD_ALERT_RULES
+                and alert.condition_active is True
+                and alert.rule_id not in self._active
+            ):
+                alert = alert.model_copy(update={
+                    "first_occurrence": alert.first_occurrence or alert.timestamp,
+                    "last_occurrence": alert.last_occurrence or alert.timestamp,
+                })
+                self._active[alert.rule_id] = alert
+                restored.append(alert)
+        return restored
 
     def evaluate(
         self,
@@ -123,44 +120,45 @@ class DetectionEngine:
                 self._breach_started.pop(rule.key, None)
                 # An unreadable metric has not been seen to clear.
                 if rule.available and rule.key in self._active:
-                    del self._active[rule.key]
-                    alerts.append(self._recovery(rule, observed_at))
+                    active = self._active.pop(rule.key)
+                    alerts.append(self._recovery(rule, observed_at, active))
                 continue
             started = self._breach_started.setdefault(rule.key, now)
             if now - started < rule.duration:
                 continue
             last_alerted = self._last_alerted.get(rule.key)
+            active = self._active.get(rule.key)
             if (
-                last_alerted is not None
+                active is not None
+                and last_alerted is not None
                 and now - last_alerted < configured.cooldown_seconds
             ):
                 continue
             self._last_alerted[rule.key] = now
-            first = self._active.get(rule.key) or observed_at
-            self._active[rule.key] = first
-            alerts.append(
-                Alert(
-                    id=rule_alert_id(rule.key),
-                    timestamp=observed_at,
-                    severity=rule.severity,  # type: ignore[arg-type]
-                    source=rule.source,
-                    metric=rule.metric,
-                    explanation=rule.explanation,
-                    rule_id=rule.key,
-                    evidence=rule.evidence,
-                    first_occurrence=first,
-                    last_occurrence=observed_at,
-                    occurrence_count=1,
-                    condition_active=True,
-                )
+            first = active.first_occurrence if active is not None else observed_at
+            observation = Alert(
+                id=active.id if active is not None else str(uuid4()),
+                timestamp=observed_at,
+                severity=rule.severity,  # type: ignore[arg-type]
+                source=rule.source,
+                metric=rule.metric,
+                explanation=rule.explanation,
+                rule_id=rule.key,
+                evidence=rule.evidence,
+                first_occurrence=first,
+                last_occurrence=observed_at,
+                occurrence_count=1,
+                condition_active=True,
             )
+            self._active[rule.key] = observation
+            alerts.append(observation)
         return alerts
 
     @staticmethod
-    def _recovery(rule: RuleEvaluation, observed_at: datetime) -> Alert:
+    def _recovery(rule: RuleEvaluation, observed_at: datetime, active: Alert) -> Alert:
         # Severity stays the rule's own, so history still shows what was breached.
         return Alert(
-            id=rule_alert_id(rule.key),
+            id=active.id,
             timestamp=observed_at,
             severity=rule.severity,  # type: ignore[arg-type]
             source=rule.source,
@@ -168,6 +166,8 @@ class DetectionEngine:
             explanation="Recovered: the latest sample is within the configured threshold.",
             rule_id=rule.key,
             evidence=rule.evidence,
+            first_occurrence=active.first_occurrence,
+            last_occurrence=active.last_occurrence,
             occurrence_count=0,
             condition_active=False,
             last_recovery=observed_at,
