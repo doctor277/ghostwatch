@@ -27,6 +27,8 @@ from typing import NamedTuple
 
 import psutil
 
+from app.text_utils import safe_text
+
 LOGGER = logging.getLogger(__name__)
 
 _SYSTEM_PROCESS_INFORMATION = 5
@@ -41,6 +43,7 @@ _NTSTATUS_WARNING_OR_ERROR = 0x80000000
 # C extension also reads. A process entry is 0x100 bytes followed by one 0x50-byte
 # SYSTEM_THREAD_INFORMATION per thread.
 _ENTRY = struct.Struct("<II24xqqq24xQ56xQ")
+_IMAGE_NAME = struct.Struct("<HH4xQ")  # UNICODE_STRING at offset 0x38.
 _PROCESS_ENTRY_SIZE = 0x100
 _THREAD_ENTRY_SIZE = 0x50
 _MAX_PID = 0xFFFFFFFF
@@ -78,6 +81,8 @@ class ProcessMetricReading(NamedTuple):
     cpu_seconds: float | None
     # Working set, which psutil reports as rss on Windows.
     rss: int
+    # ImageName from this same native record, never from a separate PID lookup.
+    name: str | None = None
 
 
 def native_supported() -> bool:
@@ -90,6 +95,7 @@ def parse_process_snapshot(
     max_rss: int | None = None,
     now: float | None = None,
     logical_cpus: int | None = None,
+    buffer_address: int | None = None,
 ) -> dict[int, ProcessMetricReading]:
     """Parse SystemProcessInformation output, rejecting anything inconsistent.
 
@@ -125,11 +131,31 @@ def parse_process_snapshot(
             and cpu_seconds > (now - started + _CPU_LIFETIME_GRACE_SECONDS) * logical_cpus
         ):
             cpu_seconds = None
-        readings[pid] = ProcessMetricReading(started=started, cpu_seconds=cpu_seconds, rss=rss)
+        name = _image_name(data, offset, entry_end, next_entry, buffer_address)
+        readings[pid] = ProcessMetricReading(
+            started=started, cpu_seconds=cpu_seconds, rss=rss, name=name
+        )
         if next_entry == 0:
             return readings
         offset += next_entry
     raise InvalidSnapshot("process entries do not terminate")
+
+
+def _image_name(
+    data: bytes, offset: int, entry_end: int, next_entry: int, buffer_address: int | None
+) -> str | None:
+    length, maximum, pointer = _IMAGE_NAME.unpack_from(data, offset + 0x38)
+    if not length:
+        return None
+    if buffer_address is None or length % 2 or maximum % 2 or length > maximum or pointer % 2:
+        raise InvalidSnapshot("invalid image name descriptor")
+    start = pointer - buffer_address
+    end = offset + next_entry if next_entry else len(data)
+    # Interpret pointers only as offsets into the copied bytes. Never dereference
+    # a kernel-supplied address, including after the query buffer has been freed.
+    if start < entry_end or start + maximum > end or end > len(data):
+        raise InvalidSnapshot("image name extends outside its process entry")
+    return safe_text(data[start : start + length].decode("utf-16-le", "surrogatepass"))
 
 
 @functools.cache
@@ -180,7 +206,7 @@ class WindowsProcessMetrics:
         try:
             enumerated = set(self.psutil.pids())
             before = self._own_reading()
-            data = self._query()
+            data, buffer_address = self._query()
             queried_at = time.time()
             after = self._own_reading()
             readings = parse_process_snapshot(
@@ -188,6 +214,7 @@ class WindowsProcessMetrics:
                 max_rss=self._max_rss(),
                 now=queried_at,
                 logical_cpus=self._cpu_count(),
+                buffer_address=buffer_address,
             )
             self._cross_check(readings, enumerated, before, after)
         except Exception as exc:
@@ -225,7 +252,7 @@ class WindowsProcessMetrics:
                 return None
         return self._logical_cpus
 
-    def _query(self) -> bytes:
+    def _query(self) -> tuple[bytes, int]:
         function = self._nt_query or _nt_query_system_information()
         size = self._buffer_bytes
         for _ in range(_MAX_QUERY_ATTEMPTS):
@@ -246,7 +273,7 @@ class WindowsProcessMetrics:
                 _MAX_BUFFER_BYTES,
                 max(_INITIAL_BUFFER_BYTES, returned.value + returned.value // 4),
             )
-            return ctypes.string_at(buffer, returned.value)
+            return ctypes.string_at(buffer, returned.value), ctypes.addressof(buffer)
         raise OSError("process snapshot kept growing between attempts")
 
     def _cross_check(

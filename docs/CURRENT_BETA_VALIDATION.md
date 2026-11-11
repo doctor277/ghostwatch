@@ -9,6 +9,7 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | Group | Applies to | Result | Does not cover |
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
+| Local-only results, remaining PID ownership corrections | The local correction following `c6d7724`; see [below](#pid-ownership-correction-after-c6d7724---november-11-2026) | 802 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, other operating systems, 32-bit Python, other browser engines |
 | Local-only results, process accuracy review corrections | The correction following `83343f3` on `fix/v3-process-accuracy`; see [below](#process-accuracy-review-corrections---november-11-2026) | 779 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, process monitoring accuracy | `83343f3`, based on `8fea111`; see [below](#process-monitoring-accuracy---november-11-2026) | 764 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | The review corrections, hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, final lifecycle state corrections | The correction following `cf62570` on `fix/v3-alert-lifecycle`; see [below](#final-lifecycle-state-corrections-after-cf62570) | 716 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
@@ -103,6 +104,61 @@ deprecation warning.
 
 Test data is synthetic and isolated under ignored scratch directories; no production
 data is used. No separate expensive benchmark or release archive build was run.
+
+## PID ownership correction after c6d7724 - November 11, 2026
+
+Local correction on `fix/v3-process-accuracy`, based on `c6d7724`. The follow-up
+review identified four remaining ownership blockers. Seven deterministic regression
+cases reproduced them before the collector changed: `7 failed, 63 deselected`.
+The correction and remaining sampling limits are described in the
+[resilience audit](V3_RESILIENCE_AUDIT.md#pid-ownership-correction-after-c6d7724-2026-11-11).
+
+The process suite now has 86 cases, including 23 new cases covering the four
+blockers, native Unicode-string bounds and surrogate handling, closely spaced
+creation times, failed final owner checks, staged identity, the kernel System
+exception, and overview responses plus persisted SQLite history. Test-double
+updates preserve the earlier assertions while exercising independent `Process(pid)`
+reads instead of an enumeration-only shortcut.
+
+| Check | Result |
+| --- | --- |
+| Complete Python suite | `802 passed, 0 failed, 0 skipped, 1 warning` in 176.97 s |
+| Focused process accuracy and ownership suite | `86 passed, 0 failed, 0 skipped, 1 warning` |
+| Complete Playwright suite | `43 passed, 0 failed, 0 skipped`, desktop and mobile Chromium, about 1.6 minutes |
+| Ruff over the repository, without a cache | `All checks passed!` |
+| In-memory compilation of `app`, `scripts` and `tests` | `70 files passed, 0 failed` |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| Git diff whitespace checks | Passed |
+
+The warning is the existing Starlette/httpx TestClient deprecation warning.
+Pytest used an ignored disposable base directory. Playwright used an isolated
+SQLite database outside the repository and a temporary configuration that kept
+the existing suite and loopback address. Production databases were not used.
+
+A short local comparison loaded `c6d7724` in memory and alternated it with the
+corrected collector, using 12 measured observations per implementation per path
+after warm-up. Only aggregate durations were retained; no process identities or
+real telemetry records were written. Environment: Windows, Python 3.11.9,
+psutil 7.1.0.
+
+| Path | `c6d7724` median | Corrected median |
+| --- | ---: | ---: |
+| Native sampling pass, including one identity read | 50.70 ms | 58.50 ms |
+| Native cycle between identity passes | 31.75 ms | 32.43 ms |
+| Fallback sampling pass | 183.91 ms | 186.19 ms |
+
+The native path still uses one whole-system snapshot per cycle. Its identity pass
+now pays for the independent final creation-time check. The fallback retains its
+64-process cap and 100 ms metric-loop budget, but the extra verification reduces
+coverage: the median number of attempted processes per pass was 9 before and 6.5
+after. These are short, host-dependent observations, not a broad performance or
+long-running resource benchmark. The loop budget excludes enumeration and identity
+work, and one in-progress process read can exceed the deadline.
+
+No push, merge, release build, hosted CI, Python 3.13 or non-Windows run is part of
+this correction. PID-based psutil reads remain non-atomic; boundary checks fail
+closed on detectable ownership uncertainty, with timestamp-resolution limits
+documented in the resilience audit.
 
 ## Process accuracy review corrections - November 11, 2026
 

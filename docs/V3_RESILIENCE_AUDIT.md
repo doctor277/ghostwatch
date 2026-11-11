@@ -1359,6 +1359,65 @@ between 532 and 538 and memory stayed level.
 The new regressions failed against `83343f3` and pass now; results are in
 [Current Beta Validation](CURRENT_BETA_VALIDATION.md#process-accuracy-review-corrections---november-11-2026).
 
+## PID ownership correction after c6d7724, 2026-11-11
+
+The focused follow-up review blocked `c6d7724` on four remaining ownership defects.
+Before changing the collector, seven deterministic cases failed against that
+implementation: multi-PID reuse, stale first discovery, a native/psutil owner race
+with identity budgets of zero and one, the false 40% fallback sample, an inaccessible
+identity creation time, and native RSS with no creation time.
+
+The corrections retain the native snapshot and the earlier CPU, freshness, ranking
+and ABI changes:
+
+1. **Wrong enumeration object.** Native updates no longer accept an enumerated
+   process object. Enumeration supplies liveness only; its cached name and extra
+   `info` fields never overwrite verified row fields. The PID 10/PID 20 regression
+   continues for four cycles after reuse, so a restored old name is detected.
+2. **Native identity.** `ImageName` is decoded from the same native record as creation
+   time, CPU and RSS, including first discovery. The `UNICODE_STRING` address is
+   translated into an offset into the copied buffer. Length, alignment and bounds
+   must keep the string after the thread records and within its own process entry;
+   no supplied pointer is dereferenced. Optional psutil metadata is staged and must
+   match that native owner before it can be attached. A later owner cannot replace
+   the snapshot's name or creation time during the identity pass.
+3. **Non-atomic psutil reads.** Fallback metrics and identity reads have a creation
+   time check before reading and an independent `Process(pid)` instance after
+   reading, outside the first instance's `oneshot()` cache. A mismatch, missing time,
+   `AccessDenied` or termination rejects attribution. No staged fallback CPU, RSS or
+   name is published in that case. The regression uses the real psutil wrapper over
+   a synthetic platform API: constructor-cached owner A at 50 CPU-seconds followed
+   by owner B at 54 seconds can no longer produce A at 40%.
+4. **Unknown ownership.** A native record without a creation time clears the cached
+   owner and publishes unavailable fields. An unverifiable identity read clears the
+   optional metadata instead of keeping an apparently available executable or user.
+   The explicit exception is Windows PID 4, the non-reusable System pseudo-process:
+   its native working set and fixed name remain usable, while CPU, creation time and
+   psutil identity stay unavailable. PID 0 remains excluded.
+
+Cached CPU counters require exact creation-time equality. The old 10 ms allowance
+could combine separate owners even when both boundary reads succeeded; a 5 microsecond
+reuse fixture now resets the baseline. Only cross-source optional metadata matching
+allows one floating-point step, because the native and psutil FILETIME conversions
+can round differently. Switching metric sources can conservatively restart CPU
+measurement when those representations differ.
+
+The new tests also exercise the actual overview route and persist history batches
+to disposable SQLite databases, then read them back to check name, creation time and
+unavailable resource values. Existing test doubles now implement `Process(pid)` so
+the collector does not need a test-only path that trusts the enumerated instance.
+
+**Limits.** psutil's PID-based getters are not a transaction pinned to one Windows
+process handle. The checks reject detectable changes and verification failures;
+they cannot distinguish owners whose creation times are indistinguishable at the
+API's floating-point resolution, or prevent a process from exiting after a completed
+sample. Native rows describe their snapshot; fallback rows describe their last
+verified sample. Enumeration alone does not refresh ownership or metric freshness.
+This is not a claim of atomic psutil sampling or absolute PID-reuse safety.
+
+Validation and the focused performance comparison are recorded in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#pid-ownership-correction-after-c6d7724---november-11-2026).
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.

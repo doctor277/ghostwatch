@@ -5,14 +5,16 @@ import os
 import struct
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import psutil
 import pytest
+from fastapi.testclient import TestClient
 
 from app.ai import LocalAIAnalyst
 from app.config import MAX_PROCESSES
+from app.main import create_app
 from app.models import ProcessInfo
 from app.monitoring import windows_process_metrics as native
 from app.monitoring.process_selection import measured, select_processes
@@ -490,7 +492,9 @@ class FakeNativeMetrics:
         if not self.available:
             return None
         return {
-            process.pid: ProcessMetricReading(process.created, process.cpu_seconds, process.rss)
+            process.pid: ProcessMetricReading(
+                process.created, process.cpu_seconds, process.rss, process.name()
+            )
             for process in self.processes
             if process.pid not in self.missing
         }
@@ -499,6 +503,7 @@ class FakeNativeMetrics:
 def make_collector(processes, clock, *, native_metrics=None, cpus=4, **options):
     module = SimpleNamespace(
         process_iter=lambda attrs, ad_value: list(processes),
+        Process=lambda pid: next(process for process in processes if process.pid == pid),
         cpu_count=lambda: cpus,
         virtual_memory=lambda: SimpleNamespace(total=PHYSICAL_MEMORY),
     )
@@ -1128,3 +1133,323 @@ def test_history_does_not_record_stale_process_values_as_current(tmp_path, snaps
     observed = {item.pid: item for item in batch.processes}
     assert observed[1].cpu_percent is None and observed[1].memory_percent is None
     assert observed[2].cpu_percent == 10.0
+
+
+# --- PID ownership regressions from the c6d7724 review --------------------------
+
+
+def test_native_reused_pid_before_another_pid_never_recovers_the_old_name():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    other = FakeProcess(20, clock, name="other.exe")
+    system = PsutilLikeSystem(old, other)
+    reader = FakeNativeMetrics([old, other])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock, identity_budget=0)
+    collector.collect([])
+    new = reuse_pid(system, None, clock, cpu_seconds=1.0)
+    reader.processes = [new, other]
+
+    for _ in range(4):
+        clock.advance(2.0)
+        row = by_pid(collector.collect([]))[10]
+        assert row.name == "new.exe"
+        assert row.create_time == datetime.fromtimestamp(new.created, UTC)
+
+
+def test_native_first_discovery_does_not_trust_a_stale_enumerated_name():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    new = FakeProcess(10, clock, created=old.created + 30, name="new.exe")
+    system = PsutilLikeSystem(old)
+    system.current[10] = new
+    collector = ProcessCollector(system, native_metrics=FakeNativeMetrics([new]), clock=clock)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "new.exe"
+    assert row.executable == "C:\\synthetic\\new.exe"
+    assert row.create_time == datetime.fromtimestamp(new.created, UTC)
+
+
+@pytest.mark.parametrize("identity_budget", [0, 1])
+def test_native_snapshot_owner_is_not_combined_with_a_later_owner(identity_budget):
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock,
+                                 identity_budget=identity_budget)
+    collector.collect([])
+    owner_b = FakeProcess(10, clock, created=old.created + 30, name="B.exe")
+    owner_b.rss = 8192
+    owner_c = FakeProcess(10, clock, created=old.created + 60, name="C.exe")
+    reader.processes = [owner_b]
+    system.current[10] = owner_c  # Reused again after the native snapshot.
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert row.name in {"B.exe", "Unknown"}
+    assert row.create_time == datetime.fromtimestamp(owner_b.created, UTC)
+    assert row.memory_bytes == 8192
+    assert row.executable is None and row.username is None
+    assert {"executable", "username", "status", "parent_pid"} <= set(row.unavailable_fields)
+
+
+def test_fallback_rejects_constructor_cached_owner_and_next_owner_cpu(monkeypatch):
+    """Real psutil wrapper: A=50 s, then B=54 s must never become A at 40%."""
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock, identity_budget=0)
+    collector.collect([])
+    reader.available = False
+    state = {"created": old.created}
+
+    class PlatformProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self, fast_only=False):
+            return state["created"]
+
+        def oneshot_enter(self):
+            state["created"] = old.created + 30  # A exits after construction.
+
+        def oneshot_exit(self):
+            pass
+
+        def cpu_times(self):
+            return psutil._common.pcputimes(54.0, 0.0, 0.0, 0.0)
+
+        def memory_info(self):
+            return SimpleNamespace(rss=16384)
+
+        def name(self):
+            return "B.exe"
+
+    monkeypatch.setattr(psutil, "WINDOWS", True)
+    monkeypatch.setattr(psutil._psplatform, "Process", PlatformProcess)
+    system.Process = psutil.Process
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert {"cpu_percent", "memory_percent", "memory_bytes"} <= set(row.unavailable_fields)
+    assert row.cpu_percent == 0.0 and row.memory_bytes == 0
+    assert row.executable is None
+
+
+def test_identity_without_creation_time_cannot_overwrite_a_native_owner():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock)
+    collector.collect([])
+    new = FakeProcess(10, clock, name="new.exe")
+    new.created = None
+    system.current[10] = new
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "old.exe"  # Native data still describes A.
+    assert row.create_time == datetime.fromtimestamp(old.created, UTC)
+    assert row.executable is None and row.username is None
+    assert {"executable", "username", "status", "parent_pid"} <= set(row.unavailable_fields)
+    assert row.access_status == "partial"
+
+
+def test_native_without_creation_time_cannot_attach_rss_to_a_cached_owner():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    collector, reader = native_collector([old], clock, identity_budget=0)
+    collector.collect([])
+    reader.read = lambda: {10: ProcessMetricReading(None, 100.0, 8 * 1024**3)}
+    clock.advance(2.0)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "Unknown" and row.create_time is None
+    assert row.memory_bytes == 0 and row.executable is None
+    assert {"name", "create_time", "cpu_percent", "memory_percent", "memory_bytes"} <= set(
+        row.unavailable_fields
+    )
+
+
+def named_snapshot(name: str = "snapshot.exe", *, base: int = 0x100000) -> bytes:
+    encoded = name.encode("utf-16-le", "surrogatepass")
+    data = bytearray(snapshot_bytes([{"pid": 10, "created": 1_700_000_000.0}]))
+    struct.pack_into("<HH4xQ", data, 0x38, len(encoded), len(encoded), base + len(data))
+    return bytes(data) + encoded
+
+
+def test_native_image_name_is_read_from_the_same_bounds_checked_record():
+    row = parse_process_snapshot(named_snapshot("native-\ud800.exe"), buffer_address=0x100000)[10]
+
+    assert row.name == "native-\\ud800.exe"
+    assert row.started == 1_700_000_000.0
+
+
+@pytest.mark.parametrize(
+    ("length", "maximum", "pointer"),
+    [(3, 4, 0x100100), (4, 2, 0x100100), (4, 4, 0),
+     (4, 4, 0x100020), (4, 4, 0x100101), (100, 100, 0x100100)],
+    ids=["odd-length", "length-over-maximum", "null", "inside-header", "misaligned", "past-end"],
+)
+def test_native_image_name_rejects_invalid_unicode_string_bounds(length, maximum, pointer):
+    data = bytearray(named_snapshot())
+    struct.pack_into("<HH4xQ", data, 0x38, length, maximum, pointer)
+
+    with pytest.raises(native.InvalidSnapshot):
+        parse_process_snapshot(bytes(data), buffer_address=0x100000)
+
+
+def test_fallback_close_creation_times_still_identify_different_owners():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    system = PsutilLikeSystem(old)
+    collector = ProcessCollector(system, clock=clock, identity_budget=0)
+    collector.collect([])
+    new = reuse_pid(system, None, clock, cpu_seconds=54.0, created_offset=0.000005)
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert "cpu_percent" in row.unavailable_fields
+    assert row.name == "new.exe"
+    assert row.create_time == datetime.fromtimestamp(new.created, UTC)
+
+
+@pytest.mark.parametrize("error", [psutil.AccessDenied, psutil.NoSuchProcess])
+def test_fallback_discards_the_sample_when_final_owner_check_fails(error):
+    clock = FakeClock()
+    owner = FakeProcess(10, clock)
+    system = PsutilLikeSystem(owner)
+    collector = ProcessCollector(system, clock=clock, identity_budget=0)
+    collector.collect([])
+    original_times = owner.cpu_times
+
+    def exiting_times():
+        result = original_times()
+        system.Process = lambda pid: (_ for _ in ()).throw(error(pid))
+        return result
+
+    owner.cpu_times = exiting_times
+    owner.cpu_seconds += 4.0
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "Unknown" and row.create_time is None
+    assert row.cpu_percent == 0.0 and row.memory_bytes == 0
+    assert row.metrics_observed is None
+    assert {"cpu_percent", "memory_percent", "memory_bytes", "name"} <= set(row.unavailable_fields)
+
+
+def test_identity_fields_are_staged_until_the_final_owner_check():
+    clock = FakeClock()
+    owner_a = FakeProcess(10, clock, name="A.exe")
+    owner_b = FakeProcess(10, clock, created=owner_a.created + 30, name="B.exe")
+    system = PsutilLikeSystem(owner_a)
+    reader = FakeNativeMetrics([owner_a])
+
+    def reused_exe():
+        system.current[10] = owner_b
+        return owner_b.executable
+
+    owner_a.exe = reused_exe
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "A.exe" and row.create_time == datetime.fromtimestamp(owner_a.created, UTC)
+    assert row.memory_bytes == 4096
+    assert row.executable is None and row.username is None
+    assert {"executable", "username", "status", "parent_pid"} <= set(row.unavailable_fields)
+
+
+def test_native_system_pseudo_process_has_only_explicitly_safe_fields(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    clock = FakeClock()
+    system = FakeProcess(4, clock, name="System")
+    system.created = None
+    collector, _ = native_collector([system], clock)
+
+    row = collector.collect([])[0]
+
+    assert row.name == "System" and row.create_time is None
+    assert row.memory_bytes == 4096
+    assert {"cpu_percent", "create_time", "executable", "username"} <= set(row.unavailable_fields)
+    assert "memory_bytes" not in row.unavailable_fields
+
+
+@pytest.mark.parametrize("scenario", ["first-discovery", "snapshot-race", "fallback-race", "no-time"])
+def test_overview_and_persisted_history_receive_only_coherent_owners(tmp_path, snapshot, scenario):
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    new = FakeProcess(10, clock, created=old.created + 30, name="new.exe")
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock)
+    if scenario == "first-discovery":
+        reader.processes = [new]
+        system.current[10] = new
+        expected_name, expected_time = "new.exe", new.created
+    else:
+        collector.collect([])
+        clock.advance(INTERVAL)
+        if scenario == "snapshot-race":
+            reader.processes = [new]
+            system.current[10] = FakeProcess(10, clock, created=new.created + 30, name="C.exe")
+            expected_name, expected_time = "new.exe", new.created
+        elif scenario == "fallback-race":
+            reader.available = False
+
+            def replaced_times():
+                system.current[10] = new
+                return SimpleNamespace(user=54.0, system=0.0)
+
+            old.cpu_times = replaced_times
+            # The identity rotation cannot verify either owner in this fixture.
+            new.created = None
+            expected_name, expected_time = "Unknown", None
+        else:
+            reader.read = lambda: {10: ProcessMetricReading(None, 100.0, 8 * 1024**3)}
+            expected_name, expected_time = "Unknown", None
+    rows = collector.collect([])
+    current = snapshot.model_copy(update={"processes": rows})
+    app = create_app(tmp_path / "ownership.db", start_background=False)
+    with TestClient(app) as client:
+        service = app.state.telemetry
+        service.latest = current
+        response = client.get("/api/overview")
+        assert response.status_code == 200
+        wire = response.json()["processes"][0]
+        assert wire["name"] == expected_name
+        assert wire["create_time"] == (
+            datetime.fromtimestamp(expected_time, UTC).isoformat().replace("+00:00", "Z")
+            if expected_time is not None else None
+        )
+        if scenario != "first-discovery":
+            assert wire["executable"] is None and wire["username"] is None
+        service._queue_history_sample(current)
+        batch = service._history_queue.get_nowait()
+        app.state.database.add_history_batch(batch.sample, batch.processes, batch.connection_summary)
+        observations = app.state.database.list_process_observations(
+            current.system.timestamp - timedelta(seconds=1),
+            current.system.timestamp + timedelta(seconds=1),
+        )
+        assert len(observations) == 1
+        stored = observations[0]
+        assert stored.name == expected_name
+        assert stored.create_time == (
+            datetime.fromtimestamp(expected_time, UTC) if expected_time is not None else None
+        )
+        if expected_time is None:
+            assert stored.cpu_percent is None and stored.memory_percent is None

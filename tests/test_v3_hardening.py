@@ -164,8 +164,15 @@ def test_process_pid_reuse_clears_stale_identity_when_access_is_limited():
                 raise PermissionError
             return "synthetic"
 
+    initial = Process(1000, "C:\\old.exe")
+
     class Processes:
-        current = Process(1000, "C:\\old.exe")
+        current = initial
+
+        @classmethod
+        def Process(cls, pid):
+            assert pid == 44
+            return cls.current
 
         @staticmethod
         def cpu_count():

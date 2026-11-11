@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import sys
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -17,12 +19,19 @@ from app.text_utils import safe_text
 
 # Shorter CPU-time windows are too noisy to report as a percentage.
 MIN_CPU_WINDOW_SECONDS = 0.5
-# A different creation time for a cached PID means Windows reused the PID.
-PID_REUSE_TOLERANCE_SECONDS = 0.01
 # Timing jitter can put a fully busy process slightly above 100%. Anything beyond
 # this needs more CPU time than all logical processors could supply.
 CPU_PERCENT_TOLERANCE = 1.05
-_READ_ERRORS = (AttributeError, psutil.Error, OSError, RuntimeError, TimeoutError, ValueError)
+_READ_ERRORS = (
+    AttributeError, psutil.Error, OSError, RuntimeError, TimeoutError,
+    OverflowError, TypeError, ValueError,
+)
+_IDENTITY_CALLS = {
+    "status": ("status", str),
+    "parent_pid": ("ppid", int),
+    "executable": ("exe", safe_text),
+    "username": ("username", safe_text),
+}
 
 
 @dataclass(slots=True)
@@ -51,13 +60,12 @@ class CachedProcess:
     # Creation time of the owner these values describe, from the native snapshot or
     # a new psutil instance. A different creation time means the PID was reused.
     started: float | None = None
-    # process_iter()'s instance for this PID when it still belongs to a previous owner.
-    stale_instance: object | None = None
     # Sampling pass of the last psutil metric read and identity read (0 = never).
     metric_attempt: int = 0
     identity_attempt: int = 0
     unavailable_fields: set[str] = field(
         default_factory=lambda: {
+            "name",
             "cpu_percent",
             "memory_percent",
             "memory_bytes",
@@ -174,25 +182,16 @@ class ProcessCollector:
             ):
                 self.skipped_count += 1
                 continue
-            if pid == 0 or name.casefold() in {"system idle process", "idle"}:
+            if pid == 0:
                 self.idle_excluded_count += 1
                 continue
             active_pids.add(pid)
             cached = self._cache.get(pid)
             if cached is None:
-                cached = self._cache[pid] = self._new_entry(name, now)
-            elif cached.stale_instance is not None:
-                if process is cached.stale_instance:
-                    # psutil caches the name on this instance; it is the previous owner's.
-                    name = cached.name
-                else:
-                    cached.stale_instance = None
-            cached.name = name
+                cached = self._cache[pid] = self._new_entry("Unknown", now)
+            # Enumeration is liveness only: its cached name and eager info may
+            # describe a previous owner. Only verified samples supply row fields.
             cached.last_observed = now
-            # Test doubles and some psutil versions may return requested data eagerly.
-            if self._apply_eager_info(cached, info):
-                cached.metrics_observed = now
-                cached.metrics_clock = self.clock()
             records.append((process, pid, name))
 
         self._cache = {pid: value for pid, value in self._cache.items() if pid in active_pids}
@@ -213,12 +212,12 @@ class ProcessCollector:
                 reading = readings.get(pid)
                 # A process started after the snapshot is read on the next cycle.
                 if reading is not None:
-                    self._apply_native(process, pid, reading, taken_at, now)
+                    self._apply_native(pid, reading, taken_at, now)
         elif full_pass:
             self.metric_source = "psutil"
             deadline = self.clock() + self.metric_time_budget_seconds
-            for process, pid, _ in self._fallback_candidates(records, counts):
-                self._refresh_metrics(process, pid, now)
+            for _, pid, _ in self._fallback_candidates(records, counts):
+                self._refresh_metrics(pid, now)
                 if self.clock() >= deadline:
                     break
 
@@ -235,8 +234,8 @@ class ProcessCollector:
                     record[1],
                 ),
             )
-            for process, pid, _ in identity_candidates[: self.identity_budget]:
-                self._refresh_identity(process, pid, now)
+            for _, pid, _ in identity_candidates[: self.identity_budget]:
+                self._refresh_identity(pid, now, readings.get(pid) if readings is not None else None)
 
         current = self.clock()
         processes = [
@@ -279,22 +278,22 @@ class ProcessCollector:
         return processes
 
     def _new_entry(self, name: str, now: datetime) -> CachedProcess:
-        return CachedProcess(
+        entry = CachedProcess(
             name=name, first_observed=now, last_observed=now, discovered=self._collections
         )
+        if name != "Unknown":
+            entry.unavailable_fields.discard("name")
+        return entry
 
-    def _current_process(self, pid: int, enumerated: object | None) -> object | None:
+    def _current_process(self, pid: int) -> object | None:
         """A psutil Process for whoever owns the PID now.
 
         psutil caches the name, parent, executable and creation time on each Process
         instance, and process_iter() can keep an instance after its PID is reused.
         Reads that must describe the current owner use a new instance.
         """
-        factory = getattr(self.psutil, "Process", None)
-        if factory is None:  # Test doubles without Process().
-            return enumerated
         try:
-            return factory(pid)
+            return self.psutil.Process(pid)
         except _READ_ERRORS:
             return None
 
@@ -302,23 +301,37 @@ class ProcessCollector:
     def _creation_time(process: object) -> float | None:
         try:
             value = float(process.create_time())
-        except (*_READ_ERRORS, OverflowError, TypeError):
+            if not math.isfinite(value) or value <= 0:
+                return None
+            datetime.fromtimestamp(value, UTC)
+        except _READ_ERRORS:
             return None
         # psutil reports 0 for the Idle and System pseudo-processes.
-        return value if value > 0 else None
+        return value
+
+    def _owner_still_matches(self, pid: int, started: float | None) -> bool:
+        # The instance used for the reads may cache its constructor's creation
+        # time. A separately constructed instance after those reads supplies an
+        # independent check, outside the old instance's oneshot cache.
+        return started is not None and self._creation_time(self._current_process(pid)) == started
+
+    @staticmethod
+    def _same_owner(left: float | None, right: float | None) -> bool:
+        # Native and psutil FILETIME conversion can differ by one floating-point
+        # step. This allowance is only for cross-source identity metadata, never
+        # for deciding whether cached CPU counters belong to the same owner.
+        return (
+            left is not None and right is not None
+            and abs(left - right) <= max(math.ulp(left), math.ulp(right))
+        )
 
     def _owner_entry(
-        self, pid: int, enumerated: object, started: float | None, now: datetime
+        self, pid: int, started: float, now: datetime
     ) -> CachedProcess:
         """The cache entry for the PID's current owner, identified by creation time."""
         cached = self._cache[pid]
-        if started is None:
-            return cached
-        if (
-            cached.started is not None
-            and abs(started - cached.started) > PID_REUSE_TOLERANCE_SECONDS
-        ):
-            cached = self._replace_owner(pid, enumerated, now)
+        if cached.started != started:
+            cached = self._cache[pid] = self._new_entry("Unknown", now)
         cached.started = started
         try:
             cached.create_time = datetime.fromtimestamp(started, UTC)
@@ -327,16 +340,12 @@ class ProcessCollector:
         cached.unavailable_fields.discard("create_time")
         return cached
 
-    def _replace_owner(self, pid: int, enumerated: object, now: datetime) -> CachedProcess:
-        """Start over for a reused PID: nothing cached for the previous owner applies."""
+    def _forget_owner(self, pid: int, now: datetime) -> CachedProcess:
+        """Discard uncertain attribution without letting failed reads jump the queue."""
+        previous = self._cache[pid]
         entry = self._cache[pid] = self._new_entry("Unknown", now)
-        entry.stale_instance = enumerated
-        current = self._current_process(pid, None)
-        if current is not None:
-            try:
-                entry.name = safe_text(current.name())
-            except (*_READ_ERRORS, TypeError):
-                pass
+        entry.metric_attempt = previous.metric_attempt
+        entry.identity_attempt = previous.identity_attempt
         return entry
 
     def _fallback_candidates(
@@ -354,39 +363,31 @@ class ProcessCollector:
         return ordered[: max(0, self.metric_budget)]
 
     @staticmethod
-    def _apply_eager_info(cached: CachedProcess, info: dict[str, object]) -> bool:
-        memory_info = info.get("memory_info")
-        eager = {
-            "cpu_percent": info.get("cpu_percent"),
-            "memory_percent": info.get("memory_percent"),
-            "memory_bytes": getattr(memory_info, "rss", None),
-            "status": info.get("status"),
-        }
-        if eager["cpu_percent"] is not None:
-            cached.cpu_percent = round(max(0.0, float(eager["cpu_percent"])), 1)
-            cached.unavailable_fields.discard("cpu_percent")
-        if eager["memory_percent"] is not None:
-            cached.memory_percent = round(max(0.0, float(eager["memory_percent"])), 2)
-            cached.unavailable_fields.discard("memory_percent")
-        if eager["memory_bytes"] is not None:
-            cached.memory_bytes = max(0, int(eager["memory_bytes"]))
-            cached.unavailable_fields.discard("memory_bytes")
-        if eager["status"] is not None:
-            cached.status = str(eager["status"])
-            cached.unavailable_fields.discard("status")
-        return any(
-            eager[name] is not None for name in ("cpu_percent", "memory_percent", "memory_bytes")
-        )
+    def _set_name(cached: CachedProcess, name: str | None) -> None:
+        cached.name = safe_text(name) if name else "Unknown"
+        if name:
+            cached.unavailable_fields.discard("name")
+        else:
+            cached.unavailable_fields.add("name")
 
     def _apply_native(
         self,
-        enumerated: object,
         pid: int,
         reading: ProcessMetricReading,
         taken_at: float,
         now: datetime,
     ) -> None:
-        cached = self._owner_entry(pid, enumerated, reading.started, now)
+        if reading.started is None:
+            cached = self._forget_owner(pid, now)
+            # PID 4 is the non-reusable Windows kernel System pseudo-process.
+            # Its native working set remains meaningful without a creation time;
+            # CPU and psutil identity are deliberately unavailable. PID 0 is excluded.
+            if sys.platform != "win32" or pid != 4:
+                return
+            self._set_name(cached, "System")
+        else:
+            cached = self._owner_entry(pid, reading.started, now)
+            self._set_name(cached, reading.name)
         physical_memory = self._total_physical_memory()
         self._record_metrics(
             cached,
@@ -404,18 +405,17 @@ class ProcessCollector:
         if self._physical_memory is None:
             try:
                 self._physical_memory = int(self.psutil.virtual_memory().total) or None
-            except _READ_ERRORS + (TypeError,):
+            except _READ_ERRORS:
                 return None
         return self._physical_memory
 
-    def _refresh_metrics(self, enumerated: object, pid: int, now: datetime) -> None:
+    def _refresh_metrics(self, pid: int, now: datetime) -> None:
         self._cache[pid].metric_attempt = self._sampling_pass
-        started = cpu_seconds = memory_percent = memory_bytes = None
+        started = cpu_seconds = memory_percent = memory_bytes = name = None
         at = self.clock()
-        process = self._current_process(pid, enumerated)
+        process = self._current_process(pid)
         if process is not None:
-            # oneshot() lets psutil answer every read below from one restricted-access
-            # query, including the creation time that identifies the owner.
+            # oneshot() reduces query cost; it does not make these reads atomic.
             with getattr(process, "oneshot", nullcontext)():
                 started = self._creation_time(process)
                 try:
@@ -432,11 +432,16 @@ class ProcessCollector:
                     memory_bytes = int(process.memory_info().rss)
                 except _READ_ERRORS:
                     pass
-        cached = self._owner_entry(pid, enumerated, started, now)
+                try:
+                    name = safe_text(process.name())
+                except _READ_ERRORS:
+                    pass
+        if not self._owner_still_matches(pid, started):
+            self._forget_owner(pid, now)
+            return
+        cached = self._owner_entry(pid, started, now)
         cached.metric_attempt = self._sampling_pass
-        if started is None:
-            # Values that cannot be tied to one owner are not attributed to this row.
-            cpu_seconds = memory_percent = memory_bytes = None
+        self._set_name(cached, name)
         self._record_metrics(
             cached,
             cpu_seconds=cpu_seconds,
@@ -510,33 +515,52 @@ class ProcessCollector:
         cached.cpu_clock = at
         cached.unavailable_fields.discard("cpu_percent")
 
-    def _refresh_identity(self, enumerated: object, pid: int, now: datetime) -> None:
+    @staticmethod
+    def _clear_identity(cached: CachedProcess) -> None:
+        cached.status = "unknown"
+        cached.parent_pid = cached.executable = cached.username = None
+        cached.unavailable_fields.update(_IDENTITY_CALLS)
+
+    def _refresh_identity(
+        self, pid: int, now: datetime, native_reading: ProcessMetricReading | None
+    ) -> None:
         self._cache[pid].identity_attempt = self._sampling_pass
-        process = self._current_process(pid, enumerated)
-        if process is None:
+        if native_reading is not None and native_reading.started is None:
+            self._clear_identity(self._cache[pid])
             return
-        with getattr(process, "oneshot", nullcontext)():
-            # A new instance's creation time replaces the entry if the owner changed.
-            cached = self._owner_entry(pid, enumerated, self._creation_time(process), now)
-            cached.identity_attempt = self._sampling_pass
-            calls = {
-                "status": ("status", str),
-                "parent_pid": ("ppid", int),
-                "executable": ("exe", safe_text),
-                "username": ("username", safe_text),
-            }
-            for field_name, (method_name, converter) in calls.items():
-                try:
-                    value = converter(getattr(process, method_name)())
-                    setattr(cached, field_name, value)
-                    cached.unavailable_fields.discard(field_name)
-                except (
-                    AttributeError,
-                    psutil.Error,
-                    OSError,
-                    RuntimeError,
-                    TimeoutError,
-                    TypeError,
-                    ValueError,
-                ):
-                    continue
+        process = self._current_process(pid)
+        started = None
+        values = {}
+        if process is not None:
+            with getattr(process, "oneshot", nullcontext)():
+                started = self._creation_time(process)
+                for field_name, (method_name, converter) in {
+                    "name": ("name", safe_text), **_IDENTITY_CALLS
+                }.items():
+                    try:
+                        values[field_name] = converter(getattr(process, method_name)())
+                    except _READ_ERRORS:
+                        continue
+        if (
+            not self._owner_still_matches(pid, started)
+            or (native_reading is not None and not self._same_owner(started, native_reading.started))
+        ):
+            if native_reading is not None:
+                # Keep the coherent native row, but publish none of the uncertain
+                # psutil metadata or previously cached optional identity fields.
+                self._clear_identity(self._cache[pid])
+            else:
+                self._forget_owner(pid, now)
+            return
+        # Native time/name are authoritative when a snapshot is present.
+        cached = self._owner_entry(
+            pid, native_reading.started if native_reading is not None else started, now
+        )
+        cached.identity_attempt = self._sampling_pass
+        self._clear_identity(cached)
+        if native_reading is None or native_reading.name is None:
+            self._set_name(cached, values.pop("name", None))
+        for field_name in _IDENTITY_CALLS:
+            if field_name in values:
+                setattr(cached, field_name, values[field_name])
+                cached.unavailable_fields.discard(field_name)

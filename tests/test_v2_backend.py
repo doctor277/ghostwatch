@@ -235,6 +235,10 @@ def test_process_sampling_work_is_bounded():
         creation_calls = 0
 
         @staticmethod
+        def Process(pid):
+            return Process(pid)
+
+        @staticmethod
         def process_iter(attrs, ad_value):
             return [Process(pid) for pid in range(1, 301)]
 
@@ -253,8 +257,8 @@ def test_process_sampling_work_is_bounded():
     assert len(result) == 200
     assert FakeProcesses.metric_calls == 60
     assert FakeProcesses.identity_calls == 4
-    # Each of the 20 metric reads and the one identity read confirms its owner.
-    assert FakeProcesses.creation_calls == 21
+    # Each metric/identity sample independently checks its owner before and after.
+    assert FakeProcesses.creation_calls == 42
 
 
 def test_process_collector_defaults_keep_windows_sampling_cost_bounded():
