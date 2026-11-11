@@ -25,6 +25,7 @@ from app.models import (
 )
 from app.monitoring.network import NetworkCollector
 from app.monitoring.processes import ProcessCollector
+from app.monitoring.windows_process_metrics import WindowsProcessMetrics
 from app.reporting import csv_safe, redact_payload, render_report, report_payload
 from app.service import TelemetryService
 from app.storage.database import SCHEMA_VERSION, Database
@@ -196,9 +197,9 @@ def test_process_sampling_work_is_bounded():
         def __init__(self, pid):
             self.info = {"pid": pid, "name": f"p{pid}"}
 
-        def cpu_percent(self):
+        def cpu_times(self):
             FakeProcesses.metric_calls += 1
-            return 1
+            return SimpleNamespace(user=1.0, system=0.0)
 
         def memory_percent(self):
             FakeProcesses.metric_calls += 1
@@ -260,9 +261,15 @@ def test_process_collector_defaults_keep_windows_sampling_cost_bounded():
             return 8
 
     collector = ProcessCollector(FakeProcesses)
-    assert collector.metric_budget == 8
+    # Metrics normally come from one native snapshot per cycle. The per-process
+    # psutil fallback, identity lookups and fallback pass duration stay bounded.
+    assert collector.metric_budget == 64
     assert collector.identity_budget == 1
     assert collector.sampling_interval_seconds == 10.0
+    assert collector.metric_time_budget_seconds == 0.1
+    # A fake psutil module never pairs with a snapshot of the real system.
+    assert collector.native_metrics is None
+    assert isinstance(ProcessCollector().native_metrics, WindowsProcessMetrics)
 
 
 @pytest.mark.asyncio

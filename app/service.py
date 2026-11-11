@@ -711,14 +711,16 @@ class TelemetryService:
                 pid=process.pid,
                 create_time=process.create_time,
                 name=process.name,
+                # A stale value was measured earlier; it is not an observation at
+                # this sample's timestamp.
                 cpu_percent=(
                     None
-                    if "cpu_percent" in process.unavailable_fields
+                    if process.metrics_stale or "cpu_percent" in process.unavailable_fields
                     else process.cpu_percent
                 ),
                 memory_percent=(
                     None
-                    if "memory_percent" in process.unavailable_fields
+                    if process.metrics_stale or "memory_percent" in process.unavailable_fields
                     else process.memory_percent
                 ),
                 connection_count=process.connection_count,

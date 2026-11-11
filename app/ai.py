@@ -8,12 +8,44 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
-from app.models import AIAnalysisRequest, AIAnalysisResponse, AISettings, TelemetrySnapshot
+from app.models import (
+    AIAnalysisRequest,
+    AIAnalysisResponse,
+    AISettings,
+    ProcessInfo,
+    TelemetrySnapshot,
+)
 from app.privacy import redact_structure
+
+MAX_CONTEXT_PROCESSES = 15
+# Context rows reserved for the heaviest measured CPU consumers; the rest keep
+# the snapshot's network-activity order.
+CONTEXT_CPU_PROCESSES = 5
 
 
 class AIServiceUnavailable(RuntimeError):
     pass
+
+
+def _measured(process: ProcessInfo, field: str) -> float | None:
+    """A current measurement, or None for unavailable or stale values."""
+    if process.metrics_stale or field in process.unavailable_fields:
+        return None
+    return getattr(process, field)
+
+
+def _context_processes(processes: list[ProcessInfo]) -> list[ProcessInfo]:
+    busiest = sorted(
+        (process for process in processes if _measured(process, "cpu_percent") is not None),
+        key=lambda process: process.cpu_percent,
+        reverse=True,
+    )[:CONTEXT_CPU_PROCESSES]
+    selected = {process.pid: process for process in busiest}
+    for process in processes:
+        if len(selected) >= MAX_CONTEXT_PROCESSES:
+            break
+        selected.setdefault(process.pid, process)
+    return list(selected.values())
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -84,11 +116,11 @@ class LocalAIAnalyst:
                 {
                     "pid": process.pid,
                     "name": process.name,
-                    "cpu_percent": process.cpu_percent,
-                    "memory_percent": process.memory_percent,
+                    "cpu_percent": _measured(process, "cpu_percent"),
+                    "memory_percent": _measured(process, "memory_percent"),
                     "connection_count": process.connection_count,
                 }
-                for process in snapshot.processes[:15]
+                for process in _context_processes(snapshot.processes)
             ],
             "baseline_deviations": [
                 item.model_dump(mode="json") for item in snapshot.baselines[:10]

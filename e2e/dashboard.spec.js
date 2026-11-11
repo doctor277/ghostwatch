@@ -65,6 +65,31 @@ test("process search, sorting, drawer, and keyboard close work", async ({ page }
   await expect(page.locator("#process-drawer")).not.toHaveClass(/open/);
 });
 
+test("process metrics distinguish unavailable, stale, and measured values", async ({ page }) => {
+  const [measured, unmeasured, stale] = backend.state.snapshot.processes;
+  Object.assign(unmeasured, {
+    cpu_percent: 0, memory_percent: 0, memory_bytes: 0, metrics_observed: null, cpu_window_seconds: null,
+    unavailable_fields: ["cpu_percent", "memory_bytes", "memory_percent"], access_status: "partial",
+  });
+  stale.metrics_stale = true;
+  backend.sendSnapshot();
+  await page.locator('[data-view="processes"]').click();
+  const cells = (process) => page.locator(`#process-table tr[data-pid="${process.pid}"] td`);
+  await expect(cells(unmeasured).nth(3)).toHaveText("—");
+  await expect(cells(unmeasured).nth(4)).toHaveText("—");
+  await expect(cells(stale).nth(3)).toHaveText(`${stale.cpu_percent.toFixed(1)}% · stale`);
+  await expect(cells(measured).nth(3)).toHaveText(`${measured.cpu_percent.toFixed(1)}%`);
+  // A missing measurement sorts after every real value in both directions.
+  const lastRow = page.locator("#process-table tr").last();
+  await expect(lastRow).toHaveAttribute("data-pid", String(unmeasured.pid));
+  await page.locator('[data-sort="cpu_percent"]').click();
+  await expect(page.locator('[data-sort="cpu_percent"]')).toHaveAttribute("aria-sort", "ascending");
+  await expect(lastRow).toHaveAttribute("data-pid", String(unmeasured.pid));
+  await lastRow.click();
+  await expect(page.locator("#drawer-details")).toContainText("Unavailable (not yet measured)");
+  await expect(page.locator("#drawer-details")).toContainText("Not yet sampled");
+});
+
 test("alerts acknowledge and dismiss without stale counters", async ({ page }) => {
   await page.locator('[data-view="alerts"]').click();
   await page.getByRole("button", { name: "ACKNOWLEDGE" }).first().click();

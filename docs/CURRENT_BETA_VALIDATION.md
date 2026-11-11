@@ -9,6 +9,7 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | Group | Applies to | Result | Does not cover |
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
+| Local-only results, process monitoring accuracy | The process-accuracy commit on `fix/v3-process-accuracy`, based on `8fea111`; see [below](#process-monitoring-accuracy---november-11-2026) | 764 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, final lifecycle state corrections | The correction following `cf62570` on `fix/v3-alert-lifecycle`; see [below](#final-lifecycle-state-corrections-after-cf62570) | 716 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
 | Local-only results, alert episode corrections | `cf62570`; see [below](#alert-episode-review-corrections---november-10-2026) | 702 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | The final lifecycle state corrections, hosted CI, Python 3.13, any other browser engine |
 | Local-only results, original alert lifecycle fix | `bc83f51`, based on `22a20a2`; see [below](#threshold-alert-lifecycle---november-10-2026) | 684 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | The later episode corrections, hosted CI, Python 3.13, any other browser engine |
@@ -101,6 +102,41 @@ deprecation warning.
 
 Test data is synthetic and isolated under ignored scratch directories; no production
 data is used. No separate expensive benchmark or release archive build was run.
+
+## Process monitoring accuracy - November 11, 2026
+
+Local work on `fix/v3-process-accuracy`, based on
+`8fea111`. No push or merge is authorized.
+
+Process CPU and memory now come from one validated whole-system Windows snapshot per
+collection cycle. Per-process psutil sampling remains the automatic fallback. CPU is
+a share of total capacity between two readings and stays unavailable until both
+exist. Rows report when metrics were read and whether they are stale. Identity
+sampling rotates fairly, and the 200-row bound keeps the largest CPU and memory
+consumers. Root causes, design, real-system measurements and limits are in the
+[resilience audit](V3_RESILIENCE_AUDIT.md#process-monitoring-accuracy-2026-11-11).
+
+`tests/test_v3_process_accuracy.py` adds 48 cases: layout, parser, reader
+validation and failure handling, two live Windows checks, native and fallback
+collector behavior, and AI and history consumers. A Playwright case covers
+unavailable, stale and measured process rows. Measurements used a disposable
+child process and no GhostWatch database.
+
+Final validation, using disposable scratch directories outside the repository for
+`TEMP` / `TMP` and pytest's base temporary directory:
+
+| Check | Result |
+| --- | --- |
+| Complete pytest suite, with JUnit output outside the repository | `764 passed, 0 failed, 0 skipped, 1 warning` in 177.99 s |
+| Process accuracy suite, repeated six times before the final run | `47 passed` each time; 48 after the final added case |
+| Complete Playwright suite | `43 passed, 0 failed, 0 skipped`, desktop and mobile Chromium |
+| Ruff over the repository | `All checks passed!` |
+| Python compilation of `app`, `scripts` and `tests` | Passed |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| Diff whitespace and profile-path checks on changed sources | Passed |
+
+The warning is the existing Starlette/httpx TestClient deprecation warning. No
+production data, release build, hosted CI or Python 3.13 run is part of this change.
 
 ## Final lifecycle state corrections after cf62570
 

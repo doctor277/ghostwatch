@@ -180,6 +180,33 @@ function renderRanks(rankings) {
   if (!rows.length) container.append(element("div", "empty-state", "No accessible ownership aggregates"));
 }
 
+// Unsampled metrics carry a placeholder 0 on the wire; treat them as missing, not zero.
+function processValue(process, key) {
+  if ((process.unavailable_fields || []).includes(key)) return null;
+  return process[key] ?? null;
+}
+
+function processPercent(process, key, digits) {
+  const value = processValue(process, key);
+  return value === null ? null : `${value.toFixed(digits)}%`;
+}
+
+function processMemory(process) {
+  const parts = [processPercent(process, "memory_percent", 2), processValue(process, "memory_bytes") === null ? null : bytes(process.memory_bytes)];
+  return parts.some((part) => part !== null) ? parts.filter((part) => part !== null).join(" · ") : null;
+}
+
+function processCpuDetail(process) {
+  const cpu = processPercent(process, "cpu_percent", 1);
+  if (cpu === null) return process.metrics_observed ? "Unavailable (needs two readings of this process)" : "Unavailable (not yet measured)";
+  return `${cpu} of total CPU capacity${process.cpu_window_seconds ? `, averaged over ${process.cpu_window_seconds} s` : ""}`;
+}
+
+function metricsFreshness(process) {
+  if (!process.metrics_observed) return "Not yet sampled";
+  return `${new Date(process.metrics_observed).toLocaleString()}${process.metrics_stale ? " (stale)" : ""}`;
+}
+
 function filteredProcesses() {
   if (!state.snapshot) return [];
   const query = $("#process-search").value.trim().toLowerCase();
@@ -189,7 +216,9 @@ function filteredProcesses() {
   );
   const { key, direction } = state.processSort;
   return [...items].sort((a, b) => {
-    const left = a[key] ?? ""; const right = b[key] ?? "";
+    const left = processValue(a, key); const right = processValue(b, key);
+    // Missing values go last in either direction so they never outrank measurements.
+    if (left === null || right === null) return (left === null) - (right === null);
     if (typeof left === "string") return left.localeCompare(String(right)) * direction;
     return (Number(left) - Number(right)) * direction;
   });
@@ -210,12 +239,17 @@ function renderProcessTable() {
     row.className = "clickable";
     row.tabIndex = 0;
     row.dataset.pid = String(process.pid);
-    if (process.cpu_percent >= 20 || process.memory_percent >= 10) row.classList.add("warning-row");
+    const cpu = processValue(process, "cpu_percent");
+    const memory = processValue(process, "memory_percent");
+    if (cpu >= 20 || memory >= 10) row.classList.add("warning-row");
+    const stale = process.metrics_stale ? " · stale" : "";
     makeCell(row, process.name);
     makeCell(row, process.pid);
     makeCell(row, process.parent_pid ?? "—");
-    makeCell(row, `${process.cpu_percent.toFixed(1)}%`, process.cpu_percent >= 20 ? "positive" : "");
-    makeCell(row, `${process.memory_percent.toFixed(2)}% · ${bytes(process.memory_bytes)}`);
+    const cpuCell = makeCell(row, cpu === null ? "—" : `${cpu.toFixed(1)}%${stale}`, process.metrics_stale ? "stale" : cpu >= 20 ? "positive" : "");
+    const memoryText = processMemory(process);
+    const memoryCell = makeCell(row, memoryText === null ? "—" : `${memoryText}${stale}`, process.metrics_stale ? "stale" : "");
+    cpuCell.title = memoryCell.title = `Metrics sampled: ${metricsFreshness(process)}`;
     makeCell(row, process.status);
     makeCell(row, process.connection_count);
     makeCell(row, process.access_status);
@@ -240,14 +274,15 @@ function openProcess(process, trigger) {
   [
     ["PID", process.pid],
     ["Parent PID", process.parent_pid ?? "Unavailable"],
-    ["CPU", `${process.cpu_percent.toFixed(1)}%`],
-    ["Memory", `${process.memory_percent.toFixed(2)}% (${bytes(process.memory_bytes)})`],
+    ["CPU", processCpuDetail(process)],
+    ["Memory", processMemory(process) ?? "Unavailable"],
+    ["Metrics sampled", metricsFreshness(process)],
     ["Connections", process.connection_count],
     ["Executable", process.executable || "Unavailable"],
     ["Username", process.username || "Unavailable"],
     ["Created", process.create_time ? new Date(process.create_time).toLocaleString() : "Unavailable"],
     ["First observed", process.first_observed ? new Date(process.first_observed).toLocaleString() : "Unavailable"],
-    ["Last observed", process.last_observed ? new Date(process.last_observed).toLocaleString() : "Unavailable"],
+    ["Last seen running", process.last_observed ? new Date(process.last_observed).toLocaleString() : "Unavailable"],
   ].forEach(([label, value]) => {
     const row = element("div");
     row.append(element("dt", "", label), element("dd", "", value));
@@ -290,8 +325,8 @@ function renderTree() {
     row.append(
       element("span", "tree-toggle", descendants.length ? "▾" : "·"),
       element("strong", "", `${process.name} · ${process.pid}`),
-      element("small", "", `CPU ${process.cpu_percent.toFixed(1)}%`),
-      element("small", "", `RAM ${process.memory_percent.toFixed(1)}%`),
+      element("small", "", `CPU ${processPercent(process, "cpu_percent", 1) ?? "—"}`),
+      element("small", "", `RAM ${processPercent(process, "memory_percent", 1) ?? "—"}`),
       element("small", "", `${process.connection_count} conn.`),
     );
     if (matches) row.classList.add("tree-match");
