@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import sys
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from app.ai import LocalAIAnalyst
 from app.config import MAX_PROCESSES
 from app.models import ProcessInfo
 from app.monitoring import windows_process_metrics as native
+from app.monitoring.process_selection import measured, select_processes
 from app.monitoring.processes import ProcessCollector
 from app.monitoring.windows_process_metrics import (
     ProcessMetricReading,
@@ -86,6 +88,10 @@ class FakeSystem:
         return self.own
 
     @staticmethod
+    def cpu_count():
+        return 16
+
+    @staticmethod
     def virtual_memory():
         return SimpleNamespace(total=PHYSICAL_MEMORY)
 
@@ -120,36 +126,43 @@ def make_reader(entries=None, *, system=None, status=0):
 # --- native layout and parsing --------------------------------------------------
 
 
-@pytest.mark.skipif(struct.calcsize("P") != 8, reason="64-bit layout")
+@pytest.mark.skipif(
+    sys.platform != "win32" or struct.calcsize("P") != 8,
+    reason="describes the 64-bit Windows ABI",
+)
 def test_layout_offsets_match_documented_winternl_structures():
+    # Windows widths are spelled out: ULONG/LONG are 32-bit there, while ctypes.c_ulong
+    # and ctypes.c_long are 64-bit on LP64 platforms.
+    ulong, long_, ushort = ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint16
+    pointer, size_t, large_integer = ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int64
+
     class UnicodeString(ctypes.Structure):
-        _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort),
-                    ("Buffer", ctypes.c_void_p)]
+        _fields_ = [("Length", ushort), ("MaximumLength", ushort), ("Buffer", pointer)]
 
     # SYSTEM_PROCESS_INFORMATION exactly as published in winternl.h.
     class SystemProcessInformation(ctypes.Structure):
         _fields_ = [
-            ("NextEntryOffset", ctypes.c_ulong), ("NumberOfThreads", ctypes.c_ulong),
-            ("Reserved1", ctypes.c_byte * 48), ("ImageName", UnicodeString),
-            ("BasePriority", ctypes.c_long), ("UniqueProcessId", ctypes.c_void_p),
-            ("Reserved2", ctypes.c_void_p), ("HandleCount", ctypes.c_ulong),
-            ("SessionId", ctypes.c_ulong), ("Reserved3", ctypes.c_void_p),
-            ("PeakVirtualSize", ctypes.c_size_t), ("VirtualSize", ctypes.c_size_t),
-            ("Reserved4", ctypes.c_ulong), ("PeakWorkingSetSize", ctypes.c_size_t),
-            ("WorkingSetSize", ctypes.c_size_t), ("Reserved5", ctypes.c_void_p),
-            ("QuotaPagedPoolUsage", ctypes.c_size_t), ("Reserved6", ctypes.c_void_p),
-            ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
-            ("PeakPagefileUsage", ctypes.c_size_t), ("PrivatePageCount", ctypes.c_size_t),
-            ("Reserved7", ctypes.c_longlong * 6),
+            ("NextEntryOffset", ulong), ("NumberOfThreads", ulong),
+            ("Reserved1", ctypes.c_uint8 * 48), ("ImageName", UnicodeString),
+            ("BasePriority", long_), ("UniqueProcessId", pointer),
+            ("Reserved2", pointer), ("HandleCount", ulong),
+            ("SessionId", ulong), ("Reserved3", pointer),
+            ("PeakVirtualSize", size_t), ("VirtualSize", size_t),
+            ("Reserved4", ulong), ("PeakWorkingSetSize", size_t),
+            ("WorkingSetSize", size_t), ("Reserved5", pointer),
+            ("QuotaPagedPoolUsage", size_t), ("Reserved6", pointer),
+            ("QuotaNonPagedPoolUsage", size_t), ("PagefileUsage", size_t),
+            ("PeakPagefileUsage", size_t), ("PrivatePageCount", size_t),
+            ("Reserved7", large_integer * 6),
         ]
 
     class SystemThreadInformation(ctypes.Structure):
         _fields_ = [
-            ("Reserved1", ctypes.c_longlong * 3), ("Reserved2", ctypes.c_ulong),
-            ("StartAddress", ctypes.c_void_p), ("ClientId", ctypes.c_void_p * 2),
-            ("Priority", ctypes.c_long), ("BasePriority", ctypes.c_long),
-            ("Reserved3", ctypes.c_ulong), ("ThreadState", ctypes.c_ulong),
-            ("WaitReason", ctypes.c_ulong),
+            ("Reserved1", large_integer * 3), ("Reserved2", ulong),
+            ("StartAddress", pointer), ("ClientId", pointer * 2),
+            ("Priority", long_), ("BasePriority", long_),
+            ("Reserved3", ulong), ("ThreadState", ulong),
+            ("WaitReason", ulong),
         ]
 
     assert ctypes.sizeof(SystemProcessInformation) == native._PROCESS_ENTRY_SIZE
@@ -287,6 +300,25 @@ def test_reader_rejects_impossible_returned_length():
     assert "returned snapshot length" in reader.last_error
 
 
+def test_reader_marks_cpu_time_beyond_process_lifetime_unavailable():
+    started = time.time() - 60
+    reader, _ = make_reader([
+        {"pid": 4},
+        OWN,
+        # 60 s on 16 logical CPUs allows at most about 990 CPU-seconds.
+        {"pid": 100, "created": started, "user": 10_000.0, "rss": 8192},
+        {"pid": 101, "created": started, "user": 900.0, "kernel": 50.0},
+        {"pid": 102, "created": started, "kernel": 0.0},
+    ])
+
+    readings = reader.read()
+
+    assert readings is not None
+    assert readings[100] == ProcessMetricReading(started, None, 8192)
+    assert readings[101].cpu_seconds == 950.0  # Heavy but possible.
+    assert readings[102].cpu_seconds == 0.0
+
+
 def test_reader_turns_unexpected_errors_into_fallback():
     def exhausted(info_class, buffer, size, returned):
         raise MemoryError
@@ -392,8 +424,10 @@ class FakeProcess:
     """psutil-like process for enumeration, fallback metric reads and identity."""
 
     def __init__(self, pid: int, clock: FakeClock, *, read_cost: float = 0.0,
-                 exe_denied: bool = False, created: float = 1_700_000_000.0) -> None:
-        self.info = {"pid": pid, "name": f"synthetic-{pid}.exe"}
+                 exe_denied: bool = False, created: float = 1_700_000_000.0,
+                 name: str | None = None) -> None:
+        self.info = {"pid": pid, "name": name or f"synthetic-{pid}.exe"}
+        self.executable = f"C:\\synthetic\\{name or f'{pid}.exe'}"
         self.pid = pid
         self.clock = clock
         self.read_cost = read_cost
@@ -418,7 +452,12 @@ class FakeProcess:
     def memory_info(self):
         return SimpleNamespace(rss=self.rss)
 
+    def name(self):
+        return self.info["name"]
+
     def create_time(self):
+        if self.created is None:
+            raise psutil.AccessDenied(pid=self.pid)
         return self.created
 
     def status(self):
@@ -431,7 +470,7 @@ class FakeProcess:
         self.identity_reads += 1
         if self.exe_denied:
             raise psutil.AccessDenied(pid=self.pid)
-        return f"C:\\synthetic\\{self.pid}.exe"
+        return self.executable
 
     def username(self):
         return "synthetic"
@@ -512,16 +551,56 @@ def test_native_cpu_percent_is_share_of_total_capacity_between_snapshots():
     assert "cpu_percent" not in rows[11].unavailable_fields
 
 
-def test_native_cpu_percent_is_clamped_to_total_capacity():
+def test_impossible_cpu_delta_is_rejected_not_clamped():
     clock = FakeClock()
     process = FakeProcess(10, clock)
     collector, _ = native_collector([process], clock, cpus=2)
     collector.collect([])
 
-    process.cpu_seconds += 1000.0
+    process.cpu_seconds += 1000.0  # 1000 CPU-seconds in 2 s on 2 logical CPUs.
     clock.advance(2.0)
+    rejected = collector.collect([])[0]
+    assert "cpu_percent" in rejected.unavailable_fields
+    assert rejected.cpu_percent == 0.0 and rejected.cpu_window_seconds is None
 
-    assert collector.collect([])[0].cpu_percent == 100.0
+    # Measurement restarts from the rejected reading.
+    process.cpu_seconds += 2.0
+    clock.advance(2.0)
+    assert collector.collect([])[0].cpu_percent == 50.0
+
+
+@pytest.mark.parametrize(("used", "expected"), [(4.0, 100.0), (4.1, 100.0)])
+def test_full_cpu_usage_is_kept_within_timing_tolerance(used, expected):
+    clock = FakeClock()
+    process = FakeProcess(10, clock)
+    collector, _ = native_collector([process], clock, cpus=2)
+    collector.collect([])
+
+    process.cpu_seconds += used  # 100% and 102.5% of two CPUs for 2 s.
+    clock.advance(2.0)
+    row = collector.collect([])[0]
+
+    assert row.cpu_percent == expected
+    assert "cpu_percent" not in row.unavailable_fields
+
+
+def test_native_cpu_beyond_process_lifetime_is_unavailable():
+    clock = FakeClock()
+    process = FakeProcess(10, clock)
+    reader = FakeNativeMetrics([process])
+    collector = make_collector([process], clock, native_metrics=reader)
+    collector.collect([])
+    process.cpu_seconds += 1.0
+    clock.advance(2.0)
+    assert collector.collect([])[0].cpu_percent == 12.5
+
+    # The reader flags an impossible counter as None; memory is still current.
+    reader.read = lambda: {10: ProcessMetricReading(process.created, None, 8192)}
+    clock.advance(2.0)
+    row = collector.collect([])[0]
+
+    assert "cpu_percent" in row.unavailable_fields
+    assert row.memory_bytes == 8192 and "memory_bytes" not in row.unavailable_fields
 
 
 def test_native_snapshot_refreshes_every_process_every_cycle_without_per_process_reads():
@@ -561,22 +640,176 @@ def test_native_creation_time_change_is_treated_as_pid_reuse():
 
     assert "cpu_percent" in reused.unavailable_fields
     assert reused.executable is None and reused.status == "unknown"
-    assert {"create_time", "executable", "username"} <= set(reused.unavailable_fields)
+    assert {"executable", "username", "parent_pid", "status"} <= set(reused.unavailable_fields)
+    assert reused.create_time == datetime.fromtimestamp(process.created, UTC)
     process.cpu_seconds += 0.5
     clock.advance(2.0)
     assert collector.collect([])[0].cpu_percent == 25.0
 
 
-def test_identity_creation_time_comes_from_native_snapshot():
+class PsutilLikeSystem:
+    """process_iter() keeps each instance, and its cached name, across PID reuse.
+
+    ``Process(pid)`` returns whoever owns the PID now, as a new psutil instance does.
+    """
+
+    def __init__(self, *owners: FakeProcess, cpus: int = 1) -> None:
+        self.iterated = {owner.pid: owner for owner in owners}
+        self.current = dict(self.iterated)
+        self.cpus = cpus
+
+    def process_iter(self, attrs, ad_value):
+        return list(self.iterated.values())
+
+    def Process(self, pid):
+        if pid not in self.current:
+            raise psutil.NoSuchProcess(pid)
+        return self.current[pid]
+
+    def cpu_count(self):
+        return self.cpus
+
+    @staticmethod
+    def virtual_memory():
+        return SimpleNamespace(total=PHYSICAL_MEMORY)
+
+
+def reuse_pid(system, reader, clock, *, cpu_seconds, created_offset=30.0):
+    """Give PID 10 to new.exe while process_iter() keeps yielding old.exe."""
+    old = system.iterated[10]
+    new = FakeProcess(10, clock, created=old.created + created_offset, name="new.exe")
+    new.cpu_seconds = cpu_seconds
+    system.current[10] = new
+    if reader is not None:
+        reader.processes = [new]
+    return new
+
+
+def test_native_pid_reuse_takes_name_and_identity_from_the_new_owner():
     clock = FakeClock()
-    process = FakeProcess(10, clock, created=1_700_000_500.0)
-    collector, _ = native_collector([process], clock)
-    # psutil can keep a Process instance (and its cached creation time) across PID reuse.
-    process.create_time = lambda: 1_600_000_000.0
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock,
+                                 sampling_interval_seconds=INTERVAL)
+    first = collector.collect([])[0]
+    assert (first.name, first.executable) == ("old.exe", "C:\\synthetic\\old.exe")
+
+    new = reuse_pid(system, reader, clock, cpu_seconds=60.0)
+    clock.advance(2.0)  # Native detects the new owner before any identity pass.
+    reused = collector.collect([])[0]
+
+    assert reused.name == "new.exe"
+    assert reused.executable is None and reused.username is None
+    assert {"executable", "username", "parent_pid", "status", "cpu_percent"} <= set(
+        reused.unavailable_fields
+    )
+    assert reused.create_time == datetime.fromtimestamp(new.created, UTC)
+
+    # process_iter() still yields old.exe's instance; nothing of it comes back.
+    clock.advance(8.0)
+    identified = collector.collect([])[0]
+    assert identified.name == "new.exe"
+    assert identified.executable == "C:\\synthetic\\new.exe"
+
+    # Once psutil replaces its instance, enumeration is trusted again.
+    system.iterated[10] = new
+    clock.advance(2.0)
+    assert collector.collect([])[0].name == "new.exe"
+
+
+@pytest.mark.parametrize("new_owner_cpu", [90.0, 2.0], ids=["counter-higher", "counter-lower"])
+def test_fallback_never_computes_cpu_across_pid_owners(new_owner_cpu):
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    system = PsutilLikeSystem(old)
+    reader = FakeNativeMetrics([old])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock,
+                                 sampling_interval_seconds=INTERVAL, identity_budget=0)
+    collector.collect([])  # Native baseline for old.exe.
+
+    reader.available = False
+    new = reuse_pid(system, None, clock, cpu_seconds=new_owner_cpu)
+    clock.advance(INTERVAL)
+    reused = collector.collect([])[0]
+
+    assert collector.metric_source == "psutil"
+    assert "cpu_percent" in reused.unavailable_fields
+    assert reused.name == "new.exe"
+    assert reused.create_time == datetime.fromtimestamp(new.created, UTC)
+
+    new.cpu_seconds += 2.5
+    clock.advance(INTERVAL)
+    assert collector.collect([])[0].cpu_percent == 25.0  # new.exe alone, 2.5 s in 10 s.
+
+
+def test_fallback_pid_reuse_is_detected_without_native_metrics():
+    clock = FakeClock()
+    old = FakeProcess(10, clock, name="old.exe")
+    old.cpu_seconds = 50.0
+    system = PsutilLikeSystem(old)
+    collector = ProcessCollector(system, clock=clock, sampling_interval_seconds=INTERVAL)
+    collector.collect([])
+    assert collector.native_metrics is None
+
+    reuse_pid(system, None, clock, cpu_seconds=80.0)
+    clock.advance(INTERVAL)
+    row = collector.collect([])[0]
+
+    assert "cpu_percent" in row.unavailable_fields
+    assert row.name == "new.exe"
+
+
+def test_fallback_without_creation_time_attributes_nothing():
+    clock = FakeClock()
+    process = FakeProcess(10, clock)
+    system = PsutilLikeSystem(process)
+    collector = ProcessCollector(system, clock=clock, sampling_interval_seconds=INTERVAL)
+    collector.collect([])
+    process.cpu_seconds += 5.0
+    clock.advance(INTERVAL)
+    assert collector.collect([])[0].cpu_percent == 50.0
+
+    process.created = None  # The owner can no longer be identified.
+    process.cpu_seconds += 5.0
+    clock.advance(INTERVAL)
+    row = collector.collect([])[0]
+
+    assert {"cpu_percent", "memory_percent", "memory_bytes"} <= set(row.unavailable_fields)
+
+
+def test_identity_creation_time_comes_from_a_current_process_instance():
+    clock = FakeClock()
+    stale = FakeProcess(10, clock, created=1_600_000_000.0)
+    current = FakeProcess(10, clock, created=1_700_000_500.0)
+    system = PsutilLikeSystem(stale)
+    system.current[10] = current
+    reader = FakeNativeMetrics([current])
+    collector = ProcessCollector(system, native_metrics=reader, clock=clock)
 
     row = collector.collect([])[0]
 
+    # The cached instance's creation time is never published or compared.
     assert row.create_time == datetime.fromtimestamp(1_700_000_500.0, UTC)
+    assert row.executable == "C:\\synthetic\\10.exe"
+
+
+def test_native_creation_time_is_published_without_an_identity_read(tmp_path, snapshot):
+    clock = FakeClock()
+    process = FakeProcess(10, clock, created=1_700_000_500.0)
+    collector, _ = native_collector([process], clock, identity_budget=0)
+
+    row = collector.collect([])[0]
+
+    assert process.identity_reads == 0
+    assert row.create_time == datetime.fromtimestamp(1_700_000_500.0, UTC)
+    assert "create_time" not in row.unavailable_fields
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    service._queue_history_sample(snapshot.model_copy(update={"processes": [row]}))
+    observation = service._history_queue.get_nowait().processes[0]
+    assert observation.create_time == row.create_time
 
 
 def test_process_missing_from_snapshot_ages_instead_of_looking_current():
@@ -793,10 +1026,11 @@ def test_high_cpu_process_survives_the_display_bound():
 
 
 def process_row(pid: int, *, cpu: float, connections: int = 0, **update) -> ProcessInfo:
-    return ProcessInfo(
-        pid=pid, name=f"synthetic-{pid}.exe", cpu_percent=cpu, memory_percent=1.0,
-        memory_bytes=4096, status="running", connection_count=connections, **update,
-    )
+    fields = {
+        "pid": pid, "name": f"synthetic-{pid}.exe", "cpu_percent": cpu, "memory_percent": 1.0,
+        "memory_bytes": 4096, "status": "running", "connection_count": connections,
+    }
+    return ProcessInfo(**{**fields, **update})
 
 
 def test_ai_context_includes_busy_processes_and_hides_unmeasured_values(snapshot):
@@ -813,6 +1047,75 @@ def test_ai_context_includes_busy_processes_and_hides_unmeasured_values(snapshot
     assert listed[900]["cpu_percent"] == 88.0
     assert listed[2]["cpu_percent"] is None
     assert 901 not in listed or listed[901]["cpu_percent"] is None
+
+
+CONNECTED = [process_row(pid, cpu=0.0, connections=5) for pid in range(1000, 1150)]
+
+
+def test_stale_cpu_never_outranks_a_fresh_reading():
+    stale_hot = [process_row(pid, cpu=90.0, metrics_stale=True) for pid in range(1, 101)]
+    fresh = process_row(500, cpu=60.0)
+
+    selected = {row.pid for row in select_processes([*stale_hot, *CONNECTED, fresh], 200)}
+
+    assert 500 in selected
+
+
+def test_idle_memory_heavy_unconnected_process_keeps_a_row():
+    light_cpu = [process_row(pid, cpu=0.5) for pid in range(1, 121)]
+    hog = process_row(600, cpu=0.0, memory_bytes=8 * 1024**3)
+
+    rows = select_processes([*light_cpu, *CONNECTED, hog], 200)
+
+    assert 600 in {row.pid for row in rows}
+    # Connected processes still get their share.
+    assert sum(row.connection_count > 0 for row in rows) >= 200 // 3
+
+
+def test_missing_values_never_rank_as_zero():
+    measured_zero = process_row(1, cpu=0.0)
+    unmeasured = process_row(2, cpu=0.0, unavailable_fields=["cpu_percent", "memory_bytes"])
+    stale = process_row(3, cpu=99.0, metrics_stale=True)
+
+    rows = select_processes([unmeasured, stale, measured_zero], 3)
+
+    assert [row.pid for row in rows][0] == 1
+    assert measured(unmeasured, "cpu_percent") is None
+    assert measured(stale, "cpu_percent") is None
+
+
+def test_history_keeps_fresh_heavy_processes_ahead_of_stale_rows(tmp_path, snapshot):
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    service.history_settings.process_sample_limit = 10
+    stale_hot = [process_row(pid, cpu=90.0, metrics_stale=True) for pid in range(1, 31)]
+    fresh = [process_row(700, cpu=50.0), process_row(701, cpu=0.0, memory_bytes=6 * 1024**3)]
+
+    service._queue_history_sample(snapshot.model_copy(update={"processes": [*stale_hot, *fresh]}))
+    observed = {item.pid: item for item in service._history_queue.get_nowait().processes}
+
+    assert observed[700].cpu_percent == 50.0
+    assert 701 in observed
+    assert all(item.cpu_percent is None for pid, item in observed.items() if pid < 700)
+
+
+def test_dashboard_history_and_ai_select_the_same_processes(tmp_path, snapshot):
+    rows = [
+        *[process_row(pid, cpu=1.0, connections=50 - pid) for pid in range(1, 30)],
+        *[process_row(pid, cpu=40.0 + pid % 7) for pid in range(100, 110)],
+        *[process_row(pid, cpu=0.0, memory_bytes=pid * 1024**3) for pid in range(200, 210)],
+        process_row(300, cpu=95.0, metrics_stale=True),
+    ]
+    current = snapshot.model_copy(update={"processes": rows})
+    service = TelemetryService(Database(tmp_path / "synthetic.db"))
+    service.history_settings.process_sample_limit = 15
+
+    service._queue_history_sample(current)
+    history = {item.pid for item in service._history_queue.get_nowait().processes}
+    ai = {item["pid"] for item in LocalAIAnalyst.context(current, False)["top_processes"]}
+
+    assert history == ai == {row.pid for row in select_processes(rows, 15)}
+    assert {104, 103, 209, 208} <= ai  # Busiest CPU and largest memory, all unconnected.
+    assert 300 not in ai
 
 
 def test_history_does_not_record_stale_process_values_as_current(tmp_path, snapshot):

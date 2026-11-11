@@ -21,6 +21,7 @@ import logging
 import os
 import struct
 import sys
+import time
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -58,6 +59,9 @@ _CREATE_TIME_TOLERANCE_SECONDS = 0.01
 _CPU_TIME_TOLERANCE_SECONDS = 0.05
 _WORKING_SET_TOLERANCE_BYTES = 32 * 1024 * 1024
 _MIN_PID_COVERAGE = 0.9
+# A process cannot use more CPU time than its lifetime on every logical CPU. The
+# grace absorbs tick-granular CPU accounting and small clock adjustments.
+_CPU_LIFETIME_GRACE_SECONDS = 2.0
 
 MAX_CONSECUTIVE_FAILURES = 3
 
@@ -69,8 +73,9 @@ class InvalidSnapshot(ValueError):
 class ProcessMetricReading(NamedTuple):
     # Creation time in seconds since the Unix epoch; None when Windows reports none.
     started: float | None
-    # User plus kernel CPU time consumed since the process started.
-    cpu_seconds: float
+    # User plus kernel CPU time consumed since the process started; None when the
+    # reported value is impossible for the process's lifetime.
+    cpu_seconds: float | None
     # Working set, which psutil reports as rss on Windows.
     rss: int
 
@@ -80,9 +85,17 @@ def native_supported() -> bool:
 
 
 def parse_process_snapshot(
-    data: bytes, *, max_rss: int | None = None
+    data: bytes,
+    *,
+    max_rss: int | None = None,
+    now: float | None = None,
+    logical_cpus: int | None = None,
 ) -> dict[int, ProcessMetricReading]:
-    """Parse SystemProcessInformation output, rejecting anything inconsistent."""
+    """Parse SystemProcessInformation output, rejecting anything inconsistent.
+
+    With ``now`` (Unix time) and ``logical_cpus``, a CPU time larger than the
+    process could have consumed since it started is reported as ``None``.
+    """
     readings: dict[int, ProcessMetricReading] = {}
     offset = 0
     for _ in range(len(data) // _PROCESS_ENTRY_SIZE + 1):
@@ -103,13 +116,16 @@ def parse_process_snapshot(
             raise InvalidSnapshot("invalid process time")
         if max_rss is not None and rss > max_rss:
             raise InvalidSnapshot("working set exceeds physical memory")
-        readings[pid] = ProcessMetricReading(
-            started=(
-                (created - _FILETIME_UNIX_EPOCH) / _TICKS_PER_SECOND if created else None
-            ),
-            cpu_seconds=(user + kernel) / _TICKS_PER_SECOND,
-            rss=rss,
-        )
+        started = (created - _FILETIME_UNIX_EPOCH) / _TICKS_PER_SECOND if created else None
+        cpu_seconds: float | None = (user + kernel) / _TICKS_PER_SECOND
+        if (
+            started is not None
+            and now is not None
+            and logical_cpus
+            and cpu_seconds > (now - started + _CPU_LIFETIME_GRACE_SECONDS) * logical_cpus
+        ):
+            cpu_seconds = None
+        readings[pid] = ProcessMetricReading(started=started, cpu_seconds=cpu_seconds, rss=rss)
         if next_entry == 0:
             return readings
         offset += next_entry
@@ -151,6 +167,7 @@ class WindowsProcessMetrics:
         self._own_process = None
         self._buffer_bytes = _INITIAL_BUFFER_BYTES
         self._physical_memory: int | None = None
+        self._logical_cpus: int | None = None
         self.consecutive_failures = 0
         self.last_error: str | None = None
         self.disabled_reason: str | None = None
@@ -164,8 +181,14 @@ class WindowsProcessMetrics:
             enumerated = set(self.psutil.pids())
             before = self._own_reading()
             data = self._query()
+            queried_at = time.time()
             after = self._own_reading()
-            readings = parse_process_snapshot(data, max_rss=self._max_rss())
+            readings = parse_process_snapshot(
+                data,
+                max_rss=self._max_rss(),
+                now=queried_at,
+                logical_cpus=self._cpu_count(),
+            )
             self._cross_check(readings, enumerated, before, after)
         except Exception as exc:
             # Any failure means there is no trustworthy snapshot; the collector falls
@@ -193,6 +216,14 @@ class WindowsProcessMetrics:
             except (AttributeError, OSError, psutil.Error, TypeError, ValueError):
                 return None
         return self._physical_memory
+
+    def _cpu_count(self) -> int | None:
+        if self._logical_cpus is None:
+            try:
+                self._logical_cpus = int(self.psutil.cpu_count() or 0) or None
+            except (AttributeError, OSError, psutil.Error, TypeError, ValueError):
+                return None
+        return self._logical_cpus
 
     def _query(self) -> bytes:
         function = self._nt_query or _nt_query_system_information()
@@ -232,7 +263,7 @@ class WindowsProcessMetrics:
             _CREATE_TIME_TOLERANCE_SECONDS
         ):
             raise InvalidSnapshot("creation time disagrees with psutil")
-        if not (
+        if own.cpu_seconds is None or not (
             before.cpu_seconds - _CPU_TIME_TOLERANCE_SECONDS
             <= own.cpu_seconds
             <= after.cpu_seconds + _CPU_TIME_TOLERANCE_SECONDS

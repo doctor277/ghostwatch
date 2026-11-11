@@ -1236,9 +1236,11 @@ makes that field unavailable instead of keeping an old value.
 
 `ProcessInfo` adds `metrics_observed`, `metrics_stale` (over 30 s old) and
 `cpu_window_seconds`. Existing fields are unchanged and the database schema is
-unchanged. Half of the 200 rows are reserved for the largest CPU and memory
-consumers. The AI context reserves 5 of its 15 rows for the busiest current
-measurements. Stale or unavailable values are sent to the AI and to history as
+unchanged. Half of the 200 rows were reserved for the largest CPU and memory
+consumers, and the AI context reserved 5 of its 15 rows for the busiest current
+measurements; both were replaced after review (see the
+[review corrections](#process-accuracy-review-corrections-2026-11-11)). Stale or
+unavailable values are sent to the AI and to history as
 `null`. The dashboard shows `—` for unavailable values, labels stale ones, sorts
 missing values last in both directions, and gives the sample time and averaging
 window in the drawer.
@@ -1288,6 +1290,74 @@ A replay of the five defect scenarios against `8fea111`, using a psutil-faithful
 fake, reproduced every defect. Playwright covers unavailable, stale and measured
 rows. Results are in
 [Current Beta Validation](CURRENT_BETA_VALIDATION.md#process-monitoring-accuracy---november-11-2026).
+
+## Process accuracy review corrections, 2026-11-11
+
+An independent review of `83343f3` returned six findings. All six were reproduced
+against `83343f3` before the corrections below, with synthetic data only.
+
+**Shared cause for the identity findings.** On Windows, psutil caches `name()`,
+`ppid()`, `exe()` and `create_time()` on each `Process` instance. `process_iter()`
+keeps an instance when its PID exits and is reused between two enumerations. The
+collector therefore reused one owner's psutil data for the next owner.
+
+1. **Name after PID reuse (high).** Native detection replaced the cache entry, but
+   the old instance's cached name and identity came back. Reads that must describe
+   the current owner now use a new `psutil.Process(pid)`. A detected reuse takes
+   its name from that instance. The enumerated instance is recorded as stale, and
+   its cached name is ignored until psutil replaces it.
+2. **Fallback CPU after PID reuse (high).** The fallback compared CPU counters
+   without checking the owner. With a higher counter it reported 40% for a process
+   that had just started. Fallback reads now take the creation time from the new
+   instance inside the same `oneshot()`, so protected processes still need one
+   query. A different creation time replaces the entry. CPU, memory and identity
+   are not attributed when the creation time is unavailable. psutil's `0` for the
+   kernel pseudo-processes counts as unavailable.
+3. **Known creation times not published (medium).** Every native or verified
+   creation time now sets `create_time`, without waiting for the identity rotation,
+   so history rows carry it from the first sample.
+4. **Heavy processes excluded (medium).** Ranking used stale and placeholder
+   values. Under `83343f3`:
+   - 100 stale 90% rows displaced a fresh 60% process;
+   - an idle 8 GiB unconnected process lost to 120 light-CPU processes;
+   - history kept stale rows, stored as `null`, instead of a fresh 50% process.
+
+   `app/monitoring/process_selection.py` now serves the dashboard bound, history
+   samples and AI context. It ranks only current measurements, so a stale or
+   unavailable value never outranks a real one, including a real 0. A third of the
+   rows each go to current CPU, current working set and connections, and the
+   remainder follows network order.
+5. **Impossible CPU accepted (medium).** The reader now reports a process's CPU time
+   as unavailable when it exceeds the process's lifetime times the logical CPU
+   count, plus 2 s of grace. The working set stays usable. The collector rejects a
+   delta above 105% of total capacity. That keeps legitimate full usage within
+   timing jitter. A rejected delta restarts measurement from that reading instead
+   of being clamped to 100%. Buffer, layout and cross-check validation are
+   unchanged.
+6. **Platform-specific layout test (low).** The test used `ctypes.c_ulong` and
+   `c_long`, which are 64-bit on LP64 platforms. It now uses explicit 32-bit and
+   64-bit types and runs only for 64-bit Windows.
+
+**Measurements on the development host.** Each figure is the median of 30 cycles,
+from three alternating runs of `83343f3` and the corrected collector.
+
+| Cycle | `83343f3` | Corrected |
+| --- | ---: | ---: |
+| Native sampling pass | 31.6 to 34.5 ms | 37.5 to 52.8 ms |
+| Native enumeration-only cycle | 12.6 to 14.4 ms | 13.7 to 17.6 ms |
+| Fallback sampling pass (one run each) | 154.2 ms | 156.8 ms |
+
+The native pass gained a few milliseconds. The identity read now verifies its new
+instance's creation time, which costs one whole-system query for a protected
+process. That is about 6 ms per 10-second pass.
+
+The one-thread burner read 5.3 to 6.3% on the native path, against a Windows
+perflib reference of 5.4 to 6.1%. A value was available from the second cycle
+onward (22 of 23 cycles). Over 600 full-pass cycles per path, handles stayed
+between 532 and 538 and memory stayed level.
+
+The new regressions failed against `83343f3` and pass now; results are in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#process-accuracy-review-corrections---november-11-2026).
 
 ## Open findings
 
@@ -1375,10 +1445,16 @@ These come from code review and have not been reproduced, unless noted.
 - On the native path, CPU is averaged over one collection interval (2 s by default),
   so it moves more between samples than a 10-second average.
 - Identity fields still use one read per 10-second pass, so on a host with about 400
-  processes the first full identity sweep takes about an hour. Under the fallback,
-  psutil can keep a `Process` instance across a PID reuse that happens between two
-  enumerations, so identity read through that instance can describe the earlier
-  process until the PID disappears.
+  processes the first full identity sweep takes about an hour.
+- Under the fallback alone, a PID reuse is noticed only when that PID's turn in the
+  rotation comes. Until then the row keeps the previous owner's name and values;
+  they age to stale, but are not re-attributed.
+- A PID reused within the few milliseconds between a native snapshot and a psutil
+  read is not distinguishable. The creation-time check makes this the only window.
 - psutil and the kernel snapshot report different creation times for the Idle and
-  System pseudo-processes (PIDs 0 and 4). The native time is now shown for System.
-  Its history identity therefore differs from rows stored before this change.
+  System pseudo-processes (PIDs 0 and 4). The native time is shown for System, so
+  its history identity differs from rows stored before this change. Under the
+  fallback alone, System has no creation time, so none of its metrics are attributed.
+- The CPU lifetime check uses the wall clock. If the clock moves back by more than
+  2 s, a young process's CPU reads as unavailable until the clock passes its
+  creation time again.

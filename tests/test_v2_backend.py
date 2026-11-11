@@ -226,12 +226,13 @@ def test_process_sampling_work_is_bounded():
             return "user"
 
         def create_time(self):
-            FakeProcesses.identity_calls += 1
+            FakeProcesses.creation_calls += 1
             return 1
 
     class FakeProcesses:
         metric_calls = 0
         identity_calls = 0
+        creation_calls = 0
 
         @staticmethod
         def process_iter(attrs, ad_value):
@@ -251,7 +252,9 @@ def test_process_sampling_work_is_bounded():
     result = collector.collect([], {})
     assert len(result) == 200
     assert FakeProcesses.metric_calls == 60
-    assert FakeProcesses.identity_calls == 5
+    assert FakeProcesses.identity_calls == 4
+    # Each of the 20 metric reads and the one identity read confirms its owner.
+    assert FakeProcesses.creation_calls == 21
 
 
 def test_process_collector_defaults_keep_windows_sampling_cost_bounded():
