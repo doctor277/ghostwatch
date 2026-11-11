@@ -318,8 +318,8 @@ class ProcessCollector:
     @staticmethod
     def _same_owner(left: float | None, right: float | None) -> bool:
         # Native and psutil FILETIME conversion can differ by one floating-point
-        # step. This allowance is only for cross-source identity metadata, never
-        # for deciding whether cached CPU counters belong to the same owner.
+        # step (measured for about a fifth of processes). One step is about 0.24 us
+        # at current timestamps, far shorter than any exit-and-reuse of a PID.
         return (
             left is not None and right is not None
             and abs(left - right) <= max(math.ulp(left), math.ulp(right))
@@ -330,9 +330,12 @@ class ProcessCollector:
     ) -> CachedProcess:
         """The cache entry for the PID's current owner, identified by creation time."""
         cached = self._cache[pid]
-        if cached.started != started:
+        # The same owner seen through the other source keeps its entry and CPU
+        # baseline. The first creation time is kept, so matches cannot chain.
+        if not self._same_owner(cached.started, started):
             cached = self._cache[pid] = self._new_entry("Unknown", now)
-        cached.started = started
+            cached.started = started
+        started = cached.started
         try:
             cached.create_time = datetime.fromtimestamp(started, UTC)
         except (OverflowError, OSError, ValueError):

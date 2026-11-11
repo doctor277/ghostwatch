@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import struct
 import sys
@@ -1323,6 +1324,123 @@ def test_fallback_close_creation_times_still_identify_different_owners():
     assert "cpu_percent" in row.unavailable_fields
     assert row.name == "new.exe"
     assert row.create_time == datetime.fromtimestamp(new.created, UTC)
+
+
+class OffsetNativeMetrics(FakeNativeMetrics):
+    """Native readings whose creation time is shifted, as FILETIME conversion can be."""
+
+    def __init__(self, processes, shift) -> None:
+        super().__init__(processes)
+        self.shift = shift
+
+    def read(self):
+        readings = super().read()
+        return readings and {
+            pid: reading._replace(started=self.shift(reading.started))
+            for pid, reading in readings.items()
+        }
+
+
+ONE_ULP = [
+    pytest.param(lambda value: math.nextafter(value, math.inf), id="native-one-ulp-later"),
+    pytest.param(lambda value: math.nextafter(value, -math.inf), id="native-one-ulp-earlier"),
+]
+CREATED = 1_794_425_522.9718287  # A creation time measured on the development host.
+
+
+def ulp_collector(shift, *, native_available):
+    clock = FakeClock()
+    process = FakeProcess(10, clock, created=CREATED, name="app.exe")
+    process.cpu_seconds = 50.0
+    reader = OffsetNativeMetrics([process], shift)
+    reader.available = native_available
+    system = PsutilLikeSystem(process)
+    collector = ProcessCollector(
+        system, native_metrics=reader, clock=clock, sampling_interval_seconds=INTERVAL
+    )
+    return collector, reader, process, clock
+
+
+@pytest.mark.parametrize("shift", ONE_ULP)
+def test_native_to_fallback_keeps_one_owner_across_a_one_ulp_difference(shift):
+    collector, reader, process, clock = ulp_collector(shift, native_available=True)
+    collector.collect([])
+    process.cpu_seconds += 1.0
+    clock.advance(2.0)
+    native_row = collector.collect([])[0]
+    assert native_row.cpu_percent == 50.0
+    assert native_row.executable == "C:\\synthetic\\app.exe"
+
+    reader.available = False
+    process.cpu_seconds += 4.0
+    clock.advance(8.0)
+    row = collector.collect([])[0]
+
+    assert collector.metric_source == "psutil"
+    # The native baseline carries over: 4 CPU-seconds in 8 s on one CPU.
+    assert row.cpu_percent == 50.0 and row.cpu_window_seconds == 8.0
+    assert (row.name, row.executable, row.username) == (
+        "app.exe", "C:\\synthetic\\app.exe", "synthetic"
+    )
+    assert row.create_time == native_row.create_time
+    assert not {"name", "executable", "username", "cpu_percent"} & set(row.unavailable_fields)
+
+
+@pytest.mark.parametrize("shift", ONE_ULP)
+def test_fallback_to_native_keeps_one_owner_across_a_one_ulp_difference(shift):
+    collector, reader, process, clock = ulp_collector(shift, native_available=False)
+    collector.collect([])
+    process.cpu_seconds += 2.0
+    clock.advance(INTERVAL)
+    fallback_row = collector.collect([])[0]
+    assert fallback_row.cpu_percent == 20.0
+    assert fallback_row.executable == "C:\\synthetic\\app.exe"
+
+    reader.available = True
+    process.cpu_seconds += 1.0
+    clock.advance(2.0)
+    row = collector.collect([])[0]
+
+    assert collector.metric_source == "native"
+    assert row.cpu_percent == 50.0 and row.cpu_window_seconds == 2.0
+    assert (row.executable, row.username, row.status, row.parent_pid) == (
+        "C:\\synthetic\\app.exe", "synthetic", "running", 1
+    )
+    assert row.create_time == fallback_row.create_time
+    assert not {"executable", "username", "status", "parent_pid", "cpu_percent"} & set(
+        row.unavailable_fields
+    )
+
+
+def test_pid_reuse_across_sources_is_still_rejected_microseconds_apart():
+    collector, reader, process, clock = ulp_collector(lambda value: value, native_available=True)
+    collector.collect([])
+    reader.available = False
+    new = reuse_pid(collector.psutil, None, clock, cpu_seconds=54.0, created_offset=0.000005)
+    clock.advance(INTERVAL)
+
+    row = collector.collect([])[0]
+
+    assert "cpu_percent" in row.unavailable_fields
+    # Only the new owner appears; its identity read ran in this same pass.
+    assert (row.name, row.executable) == ("new.exe", new.executable)
+    assert row.create_time == datetime.fromtimestamp(new.created, UTC)
+
+
+def test_one_ulp_matches_cannot_chain_into_a_larger_difference():
+    shifts = iter([CREATED, math.nextafter(math.nextafter(CREATED, math.inf), math.inf)])
+    collector, reader, process, clock = ulp_collector(
+        lambda value: next(shifts), native_available=True
+    )
+    process.created = math.nextafter(CREATED, math.inf)  # psutil: one ulp later.
+    collector.collect([])  # Native stores CREATED; the identity read matches within 1 ulp.
+
+    process.cpu_seconds += 1.0
+    clock.advance(2.0)
+    row = collector.collect([])[0]  # Native now two ulp from the stored time.
+
+    assert "cpu_percent" in row.unavailable_fields
+    assert row.executable is None
 
 
 @pytest.mark.parametrize("error", [psutil.AccessDenied, psutil.NoSuchProcess])

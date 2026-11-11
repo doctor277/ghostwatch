@@ -1395,12 +1395,12 @@ and ABI changes:
    its native working set and fixed name remain usable, while CPU, creation time and
    psutil identity stay unavailable. PID 0 remains excluded.
 
-Cached CPU counters require exact creation-time equality. The old 10 ms allowance
-could combine separate owners even when both boundary reads succeeded; a 5 microsecond
-reuse fixture now resets the baseline. Only cross-source optional metadata matching
-allows one floating-point step, because the native and psutil FILETIME conversions
-can round differently. Switching metric sources can conservatively restart CPU
-measurement when those representations differ.
+The old 10 ms creation-time allowance could combine separate owners even when both
+boundary reads succeeded; a 5 microsecond reuse fixture now resets the baseline.
+As committed in `a8f8de4`, cached CPU counters required exact equality, so switching
+metric sources restarted ownership whenever the native and psutil conversions
+rounded differently. The [one-ulp correction](#one-ulp-source-switch-correction-2026-11-11)
+below replaces that.
 
 The new tests also exercise the actual overview route and persist history batches
 to disposable SQLite databases, then read them back to check name, creation time and
@@ -1417,6 +1417,30 @@ This is not a claim of atomic psutil sampling or absolute PID-reuse safety.
 
 Validation and the focused performance comparison are recorded in
 [Current Beta Validation](CURRENT_BETA_VALIDATION.md#pid-ownership-correction-after-c6d7724---november-11-2026).
+
+## One-ulp source switch correction, 2026-11-11
+
+An independent review of `a8f8de4` found no mixed-owner data but demonstrated one
+defect. Native snapshots and psutil convert the same FILETIME creation time to a
+float separately. On the development host, 296 of 367 processes matched exactly and
+71 differed by exactly one floating-point step; none differed further. `_owner_entry`
+compared them exactly, so switching between the native and psutil paths treated those
+processes as new owners. The entry was reset, which discarded the CPU baseline and
+cleared the executable, user, status and parent PID until the identity rotation
+returned, and restarted `first_observed`. A live switch on 369 processes replaced 77
+entries in each direction.
+
+`_owner_entry` now uses `_same_owner`, which allows one floating-point step: about
+0.24 us at current timestamps, far shorter than any exit and reuse of a PID. The first
+stored creation time is kept, so repeated one-step matches cannot drift. Comparisons
+within one source (the fallback's before-and-after check) stay exact. After the
+change, the same live switch replaced 0 of 369 entries.
+
+New regressions use `math.nextafter` in both directions for native-to-fallback and
+fallback-to-native switches. They check that the CPU baseline carries over and that
+identity and creation time are kept. All four failed against `a8f8de4`. Guards keep
+the 5 microsecond reuse rejected within the fallback and across sources, and show
+that a two-step difference is still a new owner.
 
 ## Open findings
 
@@ -1498,9 +1522,14 @@ These come from code review and have not been reproduced, unless noted.
   block, at the offsets psutil also uses. Each snapshot is validated, but a layout
   change that still passed every check would go unnoticed.
 - On the psutil fallback, processes that need the restricted-access query are read
-  slowly. A first read of all 411 processes on the development host took 19 passes
-  (about 190 s), and a CPU value needs two reads. Rows report this as unavailable or
-  stale rather than estimating it.
+  slowly. The ownership check after each read adds a second creation-time query for
+  those processes. A first read of every process on the development host took 36
+  passes for 367 processes at `a8f8de4`, about 360 s, against 13 passes at
+  `c6d7724`. After the one-ulp correction it took 37 passes for 373 processes. After
+  the first pass, 355 of 367 rows (366 of 373 in the second run) were named `Unknown`,
+  because enumeration names are no longer trusted. A CPU value needs two
+  reads. These conservative checks favour correct attribution over fallback coverage.
+  Rows report the gap as unavailable or stale instead of guessing a name or value.
 - On the native path, CPU is averaged over one collection interval (2 s by default),
   so it moves more between samples than a 10-second average.
 - Identity fields still use one read per 10-second pass, so on a host with about 400
