@@ -57,6 +57,7 @@ from app.models import (
 )
 from app.monitoring.file_integrity import FileIntegrityCollector
 from app.monitoring.network import NetworkCollector
+from app.monitoring.process_selection import measured, select_processes
 from app.monitoring.processes import ProcessCollector
 from app.monitoring.system import SystemCollector
 from app.monitoring.windows_events import WindowsEventCollector
@@ -711,29 +712,17 @@ class TelemetryService:
                 pid=process.pid,
                 create_time=process.create_time,
                 name=process.name,
-                cpu_percent=(
-                    None
-                    if "cpu_percent" in process.unavailable_fields
-                    else process.cpu_percent
-                ),
-                memory_percent=(
-                    None
-                    if "memory_percent" in process.unavailable_fields
-                    else process.memory_percent
-                ),
+                # A stale value was measured earlier; it is not an observation at
+                # this sample's timestamp.
+                cpu_percent=measured(process, "cpu_percent"),
+                memory_percent=measured(process, "memory_percent"),
                 connection_count=process.connection_count,
                 status=process.status,
                 access_status=process.access_status,
             )
-            for process in sorted(
-                snapshot.processes,
-                key=lambda item: (
-                    item.cpu_percent,
-                    item.memory_percent,
-                    item.connection_count,
-                ),
-                reverse=True,
-            )[: self.history_settings.process_sample_limit]
+            for process in select_processes(
+                snapshot.processes, self.history_settings.process_sample_limit
+            )
         ]
         connection_summary = HistoricalConnectionSummary(
             timestamp=snapshot.system.timestamp,

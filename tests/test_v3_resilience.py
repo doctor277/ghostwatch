@@ -439,6 +439,7 @@ def surrogate_process():
 def test_surrogate_process_identity_stays_serializable():
     module = SimpleNamespace(
         process_iter=lambda *args, **kwargs: [surrogate_process()],
+        Process=lambda pid: surrogate_process(),
         cpu_count=lambda: 1,
         NoSuchProcess=psutil.NoSuchProcess,
         AccessDenied=psutil.AccessDenied,

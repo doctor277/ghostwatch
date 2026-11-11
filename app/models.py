@@ -359,6 +359,11 @@ class ProcessInfo(BaseModel):
     username: str | None = None
     first_observed: datetime | None = None
     last_observed: datetime | None = None
+    # last_observed is when the process was last enumerated; metrics_observed is when
+    # its CPU/memory values were last actually sampled (None = not yet sampled).
+    metrics_observed: datetime | None = None
+    metrics_stale: bool = False
+    cpu_window_seconds: float | None = None
     remote_endpoints: list[str] = Field(default_factory=list)
     access_status: Literal["available", "partial", "unavailable"] = "available"
     unavailable_fields: list[str] = Field(default_factory=list)

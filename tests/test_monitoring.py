@@ -173,8 +173,19 @@ class ValidProcess:
         "status": "running",
     }
 
+    def name(self):
+        return "sample.exe"
+
+    def create_time(self):
+        return 1_700_000_000.0
+
 
 class FakeProcessPsutil:
+    @staticmethod
+    def Process(pid):
+        assert pid == 7
+        return ValidProcess()
+
     @staticmethod
     def process_iter(attrs, ad_value):
         return [VanishingProcess(), ValidProcess()]

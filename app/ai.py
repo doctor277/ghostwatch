@@ -9,7 +9,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.models import AIAnalysisRequest, AIAnalysisResponse, AISettings, TelemetrySnapshot
+from app.monitoring.process_selection import measured, select_processes
 from app.privacy import redact_structure
+
+MAX_CONTEXT_PROCESSES = 15
 
 
 class AIServiceUnavailable(RuntimeError):
@@ -84,11 +87,11 @@ class LocalAIAnalyst:
                 {
                     "pid": process.pid,
                     "name": process.name,
-                    "cpu_percent": process.cpu_percent,
-                    "memory_percent": process.memory_percent,
+                    "cpu_percent": measured(process, "cpu_percent"),
+                    "memory_percent": measured(process, "memory_percent"),
                     "connection_count": process.connection_count,
                 }
-                for process in snapshot.processes[:15]
+                for process in select_processes(snapshot.processes, MAX_CONTEXT_PROCESSES)
             ],
             "baseline_deviations": [
                 item.model_dump(mode="json") for item in snapshot.baselines[:10]

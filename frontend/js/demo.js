@@ -15,6 +15,9 @@ export function createDemoData() {
     create_time: new Date(now - (index + 1) * 3600000).toISOString(),
     first_observed: new Date(now - 120000).toISOString(),
     last_observed: now.toISOString(),
+    metrics_observed: now.toISOString(),
+    metrics_stale: false,
+    cpu_window_seconds: 2,
     remote_endpoints: [`203.0.113.${10 + index}:443`],
     access_status: "available",
   }));
