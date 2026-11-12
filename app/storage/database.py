@@ -1945,17 +1945,22 @@ class Database:
             ("telemetry_samples", "timestamp", "<"),
             ("process_observations", "timestamp", "<"),
             ("connection_summaries", "timestamp", "<"),
-            ("telemetry_rollups", "bucket_end", "<="),
         ):
             connection.execute(
                 f"DELETE FROM {table} WHERE {column} {comparison} ?",  # noqa: S608
                 (cutoff_value,),
             )
-        connection.execute(
-            "DELETE FROM telemetry_compacted_keys WHERE NOT EXISTS ("
-            "SELECT 1 FROM telemetry_rollups AS rollups "
-            "WHERE rollups.bucket_start = telemetry_compacted_keys.bucket_start)"
-        )
+        expired_rollups = connection.execute(
+            "DELETE FROM telemetry_rollups WHERE bucket_end <= ?", (cutoff_value,)
+        ).rowcount
+        # Keys are orphaned only when their rollup is deleted (here or by compaction,
+        # which cleans its own). The scan covers every key, so skip it otherwise.
+        if expired_rollups:
+            connection.execute(
+                "DELETE FROM telemetry_compacted_keys WHERE NOT EXISTS ("
+                "SELECT 1 FROM telemetry_rollups AS rollups "
+                "WHERE rollups.bucket_start = telemetry_compacted_keys.bucket_start)"
+            )
         Database._cap_history_rows(connection, "telemetry_samples", max_samples)
         Database._cap_history_rows(connection, "connection_summaries", max_samples)
         process_row_limit = min(max_samples * 100, 2_000_000)
@@ -1965,6 +1970,14 @@ class Database:
     def _cap_history_rows(connection: sqlite3.Connection, table: str, limit: int) -> None:
         # Delete only the oldest excess rows. Selecting the rows to keep instead built a
         # set of up to `limit` row IDs and scanned the whole table on every history write.
+        # Rowids are distinct integers, so the row count cannot exceed their span; while
+        # the span is within the limit, skip the COUNT(*) scan. Separate subqueries keep
+        # SQLite's min/max index shortcut.
+        low, high = connection.execute(
+            f"SELECT (SELECT MIN(rowid) FROM {table}), (SELECT MAX(rowid) FROM {table})"  # noqa: S608
+        ).fetchone()
+        if low is None or high - low + 1 <= limit:
+            return
         count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         if count > limit:
             connection.execute(

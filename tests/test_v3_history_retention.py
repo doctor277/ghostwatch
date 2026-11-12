@@ -260,3 +260,48 @@ def test_failed_row_cap_rolls_back_the_whole_history_write(tmp_path):
     }
     assert stored(database.path, "telemetry_samples") == before
     assert integrity(database.path) == "ok"
+
+
+@pytest.mark.parametrize("table", CAPPED_TABLES)
+@pytest.mark.parametrize("over", [0, 5])
+def test_row_cap_is_exact_when_rowid_gaps_overstate_the_count(tmp_path, table, over):
+    database = initialized(tmp_path / "gaps.db")
+    limit = row_limit(table, 3)
+    with closing(sqlite3.connect(database.path)) as connection, connection:
+        insert(connection, table, [(seconds, seconds) for seconds in range(limit + 30)])
+        # Remove rows from the middle: the rowid span now exceeds the row count.
+        connection.execute(f"DELETE FROM {table} WHERE rowid % 7 = 3")  # noqa: S608
+        remaining = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        connection.execute(f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} ORDER BY timestamp DESC LIMIT ?)", (max(0, remaining - limit - over),))  # noqa: S608,E501
+    before = sorted(stored(database.path, table))
+    with closing(sqlite3.connect(database.path)) as connection, connection:
+        Database._prune_history_locked(connection, KEEP_ALL, 3)
+
+    after = stored(database.path, table)
+    assert len(after) == min(len(before), limit)
+    assert after == before[len(before) - len(after):]  # Only the oldest rows were removed.
+
+
+def test_expired_rollups_still_take_their_compacted_keys_with_them(tmp_path):
+    database = initialized(tmp_path / "keys.db")
+    old_bucket, kept_bucket = stamp(0), stamp(7200)
+    with closing(sqlite3.connect(database.path)) as connection, connection:
+        for bucket in (old_bucket, kept_bucket):
+            connection.execute(
+                "INSERT INTO telemetry_rollups (bucket_start, bucket_end, resolution_seconds, "
+                "sample_count, collector_status) VALUES (?, ?, 3600, 1, 'healthy')",
+                (bucket.isoformat(), (bucket + timedelta(hours=1)).isoformat()),
+            )
+            connection.executemany(
+                "INSERT INTO telemetry_compacted_keys (timestamp, sequence, bucket_start) "
+                "VALUES (?, ?, ?)",
+                [((bucket + timedelta(seconds=i)).isoformat(), i, bucket.isoformat()) for i in range(3)],
+            )
+        # No rollup expires yet: keys are left alone.
+        Database._prune_history_locked(connection, stamp(0), 3)
+        assert connection.execute("SELECT COUNT(*) FROM telemetry_compacted_keys").fetchone()[0] == 6
+        # The first rollup expires: its keys go, the other rollup's stay.
+        Database._prune_history_locked(connection, stamp(3600), 3)
+        buckets = {row[0] for row in connection.execute("SELECT bucket_start FROM telemetry_compacted_keys")}
+
+    assert buckets == {kept_bucket.isoformat()}
