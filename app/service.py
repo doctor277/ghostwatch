@@ -1194,7 +1194,16 @@ class TelemetryService:
             else self._writing_alert if alerts else self._writing_event
         )
         # A record being written may still be stored, so it is not lost yet.
-        key = next(item for item in queue if item != writing)
+        candidates = [item for item in queue if item != writing]
+        key = candidates[0]
+        if queue is self._pending_alerts:
+            # Grouped episodes hold one merged entry each and carry lifecycle
+            # state (a lost recovery leaves the row open), so evict others first.
+            key = next(
+                (item for item in candidates
+                 if queue[item].rule_id not in GROUPED_ALERT_RULES),
+                key,
+            )
         del queue[key]
         if alerts:
             self.dropped_alert_writes += 1

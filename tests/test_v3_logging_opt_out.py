@@ -13,7 +13,8 @@ import sqlite3
 
 import pytest
 
-from app.service import TelemetryService
+from app.models import Alert
+from app.service import MAX_PENDING_WRITES, TelemetryService
 from app.storage.database import Database
 from tests.test_v3_alert_lifecycle import (
     BREACH,
@@ -228,3 +229,100 @@ async def test_opting_out_again_cancels_a_pending_reconciliation(
 
     assert raw_alert_row(path, opened.id) == before
     assert service.storage.pending_writes == 0
+
+
+# --- Blocker 3: recovery during a storage outage (logging on) ----------------------
+
+
+async def test_recovery_during_an_outage_is_retried_once_storage_returns(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
+    break_storage(service, monkeypatch)
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 72, 76)
+    await settle(service)
+    assert service.storage.pending_writes >= 1
+    assert service._live_alert(opened.id).persistence_pending is True
+
+    mend_storage(service, monkeypatch)
+    await run(service, clock, 76, 80)
+    await settle(service)
+
+    [stored] = memory_rows(service)
+    assert stored.condition_active is False and stored.last_recovery == at(72)
+    assert stored.occurrence_count == opened.occurrence_count
+    assert service.storage.pending_writes == 0
+    assert len(memory_events(service)) == 1
+
+
+async def test_repeated_recovery_during_an_outage_keeps_one_ordered_row_per_episode(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
+    break_storage(service, monkeypatch)
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 72, 76)
+    system_sample.memory_percent = BREACH
+    await run(service, clock, 76, 100)  # A second episode opens during the outage...
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 100, 104)  # ...and also ends.
+    mend_storage(service, monkeypatch)
+    await run(service, clock, 104, 108)
+    await settle(service)
+
+    rows = {row.id: row for row in memory_rows(service)}
+    assert len(rows) == 2
+    assert all(row.condition_active is False for row in rows.values())
+    assert rows[opened.id].last_recovery == at(72)
+    assert rows[opened.id].occurrence_count == opened.occurrence_count
+    [second] = set(rows) - {opened.id}
+    assert rows[second].last_recovery == at(100)
+    assert len(memory_events(service)) == 2
+    assert service.storage.pending_writes == 0
+
+
+async def test_queue_saturation_evicts_other_records_before_episode_transitions(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
+    break_storage(service, monkeypatch)
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 72, 76)
+    for index in range(MAX_PENDING_WRITES):
+        service._queue_pending_alert(Alert(
+            id=f"synthetic-{index}", timestamp=at(80), severity="WARNING", source="Files",
+            metric="Synthetic file change", explanation="Synthetic", rule_id="file_integrity",
+        ))
+
+    assert opened.id in service._pending_alerts
+    assert service.dropped_alert_writes == 1
+    assert service.storage.dropped_alert_writes == 1
+
+    mend_storage(service, monkeypatch)
+    await run(service, clock, 76, 80)
+    await settle(service, passes=6)
+    [stored] = memory_rows(service)
+    assert stored.condition_active is False and stored.last_recovery == at(72)
+
+
+async def test_restart_with_a_recovery_still_queued_closes_the_episode_from_live_data(
+    tmp_path, system_sample, network_sample, monkeypatch
+):
+    # Queued writes are memory-only: a restart loses them by design. The stored row
+    # is then resumed, and the first readable sample closes it again.
+    service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
+    break_storage(service, monkeypatch)
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 72, 76)
+    assert service.storage.pending_writes >= 1
+    mend_storage(service, monkeypatch)
+    await service.stop()
+
+    again = await restarted(service, clock, system_sample, network_sample)
+    await run(again, clock, 200, 204)
+    await settle(again)
+
+    [stored] = memory_rows(again)
+    assert stored.condition_active is False and stored.last_recovery == at(200)
+    assert stored.occurrence_count == opened.occurrence_count
