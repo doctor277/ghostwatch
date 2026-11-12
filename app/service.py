@@ -1158,10 +1158,37 @@ class TelemetryService:
                 ("file_integrity", self._file_integrity_task),
             )
         }
-        stopped_unexpectedly = not self._stop.is_set() and "stopped" in workers.values()
-        degraded = monitoring == "stale" or "failed" in workers.values() or stopped_unexpectedly
+        stopping = self._stop.is_set()
+
+        def down(state: str) -> bool:
+            return state == "failed" or (state == "stopped" and not stopping)
+
+        storage = self.storage.model_copy(update=self._queue_health())
+        # Reasons, most severe first. Loss counters cover this process's lifetime,
+        # so a past loss keeps health degraded until restart.
+        reasons = [
+            reason for reason, present in (
+                ("telemetry_worker_down", down(workers["telemetry"])),
+                ("telemetry_stale", monitoring == "stale"),
+                ("background_worker_down", any(
+                    down(state) for name, state in workers.items() if name != "telemetry"
+                )),
+                ("storage_unavailable", not storage.persistence_available),
+                ("history_samples_dropped", storage.history_dropped_samples > 0),
+                ("alert_writes_dropped", storage.dropped_alert_writes > 0),
+                ("event_writes_dropped", storage.dropped_event_writes > 0),
+                ("records_rejected", self.rejected_writes > 0),
+            ) if present
+        ]
+        if "telemetry_worker_down" in reasons:
+            status = "unavailable"  # No new telemetry will arrive.
+        elif reasons:
+            status = "degraded"
+        else:
+            status = "ok"
         return {
-            "status": "degraded" if degraded else "ok",
+            "status": status,
+            "reasons": reasons,
             "monitoring": monitoring,
             "snapshot_age_seconds": age,
             "stale_after_seconds": stale_after,

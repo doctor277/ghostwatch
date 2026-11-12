@@ -68,8 +68,14 @@ async def health(request: Request) -> dict[str, object]:
     else:
         snapshot = "available"
     monitoring = service.monitoring_health()
+    status, reasons = monitoring["status"], monitoring["reasons"]
+    if snapshot == "unavailable":
+        reasons = [*reasons, "snapshot_unavailable"]
+        status = "degraded" if status == "ok" else status
+    # Always HTTP 200: the launcher's readiness check only needs a live server.
     return {
-        "status": monitoring["status"],
+        "status": status,
+        "reasons": reasons,
         "scope": "local-only",
         "monitoring": monitoring["monitoring"],
         "snapshot": snapshot,
