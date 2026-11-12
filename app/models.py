@@ -423,6 +423,10 @@ class StorageHealth(BaseModel):
     # Queued writes evicted at capacity since this process started.
     dropped_alert_writes: int = 0
     dropped_event_writes: int = 0
+    # History samples waiting for SQLite, and samples dropped since this process started
+    # (full queue, storage outage, or history disabled while queued).
+    history_queue_depth: int = 0
+    history_dropped_samples: int = 0
     last_success: datetime | None = None
     last_error_type: str | None = None
     schema_version: int | None = None

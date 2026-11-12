@@ -137,6 +137,8 @@ class TelemetryService:
             maxsize=1000
         )
         self.history_dropped_samples = 0
+        # When the latest snapshot was produced, for the health snapshot age.
+        self.latest_monotonic: float | None = None
         self.rejected_writes = 0
         self.dropped_alert_writes = 0
         self.dropped_event_writes = 0
@@ -945,6 +947,7 @@ class TelemetryService:
                 ),
             )
             self.latest = snapshot
+            self.latest_monotonic = time.monotonic()
             self._queue_history_sample(snapshot)
             self.history.append(
                 {
@@ -1121,7 +1124,53 @@ class TelemetryService:
             ),
             "dropped_alert_writes": self.dropped_alert_writes,
             "dropped_event_writes": self.dropped_event_writes,
+            "history_queue_depth": self._history_queue.qsize(),
+            "history_dropped_samples": self.history_dropped_samples,
         }
+
+    def monitoring_health(self) -> dict[str, object]:
+        """Snapshot age and worker liveness for /api/health."""
+        # The dashboard's freshness watchdog uses the same allowance.
+        stale_after = max(10.0, 3 * self.settings.refresh_interval + 5)
+        age = (
+            None
+            if self.latest is None or self.latest_monotonic is None
+            else round(time.monotonic() - self.latest_monotonic, 1)
+        )
+        if self.latest is None:
+            monitoring = "warming-up"
+        elif age is not None and age > stale_after:
+            monitoring = "stale"
+        else:
+            monitoring = "active"
+        workers = {
+            name: self._worker_state(task)
+            for name, task in (
+                ("telemetry", self._task),
+                ("history_writer", self._history_task),
+                ("windows_events", self._windows_task),
+                ("file_integrity", self._file_integrity_task),
+            )
+        }
+        stopped_unexpectedly = not self._stop.is_set() and "stopped" in workers.values()
+        degraded = monitoring == "stale" or "failed" in workers.values() or stopped_unexpectedly
+        return {
+            "status": "degraded" if degraded else "ok",
+            "monitoring": monitoring,
+            "snapshot_age_seconds": age,
+            "stale_after_seconds": stale_after,
+            "workers": workers,
+        }
+
+    @staticmethod
+    def _worker_state(task: Any) -> str:
+        if task is None:
+            return "not_started"
+        if not task.done():
+            return "running"
+        if not task.cancelled() and task.exception() is not None:
+            return "failed"
+        return "stopped"
 
     def _queue_pending(
         self, queue: OrderedDict[str, Any], key: str, value: Any

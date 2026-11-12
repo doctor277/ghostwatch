@@ -541,10 +541,11 @@ function renderSnapshot(snapshot) {
   text("#availability-note", unavailable.length ? `Unavailable: ${unavailable.join(", ")}` : "All primary metrics available.");
   const storage = snapshot.storage || {};
   const droppedWrites = (storage.dropped_alert_writes || 0) + (storage.dropped_event_writes || 0);
-  const droppedNote = droppedWrites ? ` · ${droppedWrites} WRITES DROPPED` : "";
+  const droppedSamples = storage.history_dropped_samples || 0;
+  const droppedNote = `${droppedWrites ? ` · ${droppedWrites} WRITES DROPPED` : ""}${droppedSamples ? ` · ${droppedSamples} HISTORY SAMPLES DROPPED` : ""}`;
   text("#storage-status", `STORAGE ${String(storage.status || "unknown").toUpperCase()}${droppedNote}`);
-  $("#storage-status").className = storage.persistence_available && !droppedWrites ? "status-good" : "status-warning";
-  $("#storage-status").title = droppedWrites ? "Queued writes dropped at capacity since GhostWatch started" : "";
+  $("#storage-status").className = storage.persistence_available && !droppedWrites && !droppedSamples ? "status-good" : "status-warning";
+  $("#storage-status").title = droppedWrites || droppedSamples ? `Queued writes and history samples dropped since GhostWatch started; ${storage.history_queue_depth || 0} history samples waiting` : "";
 
   renderRanks(snapshot.connection_rankings);
   renderConnections();

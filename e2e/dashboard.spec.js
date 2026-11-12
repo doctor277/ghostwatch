@@ -249,6 +249,10 @@ test("dropped writes stay visible while storage is healthy", async ({ page }) =>
   await expect(status).toHaveText("STORAGE HEALTHY · 5 WRITES DROPPED");
   await expect(status).toHaveClass("status-warning");
   await expect(status).toHaveAttribute("title", /since GhostWatch started/);
+  backend.state.snapshot.storage = { ...backend.state.snapshot.storage, history_dropped_samples: 7, history_queue_depth: 12 };
+  backend.sendSnapshot();
+  await expect(status).toHaveText("STORAGE HEALTHY · 5 WRITES DROPPED · 7 HISTORY SAMPLES DROPPED");
+  await expect(status).toHaveAttribute("title", /12 history samples waiting/);
 });
 
 test("frontend presents a safe settings persistence failure", async ({ page }) => {
