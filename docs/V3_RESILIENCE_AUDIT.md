@@ -1461,7 +1461,7 @@ or in a live measurement. Measurements were taken on the development host: Windo
 | Health (D8) | `/api/health` was `ok` whenever a snapshot existed, and history loss was invisible | Snapshot age, the watchdog allowance, worker states, `degraded` status, history queue depth and dropped samples. The dashboard shows dropped samples |
 | Dashboard | Recent events never refreshed; the same alert read WARNING in one view and HIGH in another | Overview events poll at most every 10 s while live; alert-derived events show the alert's label |
 | Alert retention | A burst of newer alerts could delete a still-active episode, whose next report recreated a partial row | Open grouped episodes are exempt, at most one per grouped rule (limit plus nine) |
-| Logging toggle | An episode that recovered while logging was off stayed ACTIVE in SQLite and was resumed after restart | The recovery of an already-stored episode is written (no new row or observation) |
+| Logging toggle | An episode that recovered while logging was off stayed ACTIVE in SQLite and was resumed after restart | Superseded on November 12 (below): writing that recovery broke the opt-out contract |
 | History writes (D1 follow-up) | `COUNT(*)` on every capped table and a scan over every compacted key on every write | Both are skipped when they provably cannot delete anything. Per write: 1M rows 116.2 to 30.5 ms; at the 2M cap 216.5 to 200.7 ms |
 
 Shutdown flush (investigation R4) had no tests; two now cover it and pass unchanged.
@@ -1479,8 +1479,29 @@ No schema migration was added.
 
 **Not done.** At the 2M process-row cap the exact `COUNT(*)` still runs on every write
 (about 160 ms). Removing it needs a persistent counter, which is a schema change and
-was not made. A recovery that happens while logging is off *and* storage is
-unavailable stays live-only. No eight-hour soak was run.
+was not made. No eight-hour soak was run. The independent QA review below found four
+blockers in this work; they are corrected there.
+
+## Independent QA corrections, 2026-11-12
+
+An independent review of the 13 stabilization commits returned BLOCK with four
+reproduced defects. Each was reproduced against `321fa7a` in a test that failed before
+its fix. Commits are local only on `feat/v3-final-stabilization`.
+
+| Blocker | Reproduction | Root cause | Correction |
+| --- | --- | --- | --- |
+| 1. `TIME_WAIT` in network metrics | 5 `TIME_WAIT` + 2 established sockets: active 2, closing 5, but 7 destinations and 7 new connections. Each close also counted as a new PID 0 connection, then a second disappearance | The first fix excluded closing sockets from active counts only; destinations, per-PID endpoints and lifecycle keys still used every socket | Closing sockets feed only `closing_connections` and the detail table (as not-new rows). A close is counted once, when the open key disappears. Destination diversity counts open sockets only |
+| 2. Logging opt-out | With logging off, a recovery rewrote the stored row's timestamps, explanation and evidence | `45dccb5` redefined the setting. The settings label ("Enable local event logging"), the V2 architecture notes and finding F2 above (PATCH while off is live-only) all define logging off as no alert or event writes | No writes while off; recovery stays in memory. Turning logging back on marks stored episodes that are no longer open live as ended, changing `condition_active` only, with no time, explanation or evidence from the opt-out. With logging off at startup, a stored open episode is not resumed: the next readable sample closes it in live state as "not confirmed after restart", and a breach is a new episode |
+| 3. Recovery lost in an outage | Recovery during an outage, storage healthy again, SQLite still ACTIVE, `pending_writes` 0 | The logging-off write of `45dccb5` returned early when storage was down. With logging on, the bounded queue evicted oldest-first, so a burst of other alerts could evict a queued recovery | The logging-off path no longer writes (blocker 2); the reconciliation after re-enabling goes through the flush path, waits out an outage, counts in `pending_writes` and is cancelled by a new opt-out. Queue eviction drops non-episode entries first; losses still count in `dropped_alert_writes` |
+| 4. Health hid data loss | `history_dropped_samples=4` and `persistence_available=False` both gave `status: ok` | The aggregate considered only staleness and worker liveness | `status` is `unavailable` when the telemetry worker is down, `degraded` for staleness, a stopped background worker, unavailable storage, an unencodable snapshot, or any write dropped or rejected since start, else `ok`. A `reasons` list names each cause. HTTP 200 is kept for the launcher |
+
+**Policy.** Event logging off means no alert or event data is written. The only write
+it leads to is made after logging is turned back on, and changes one column of rows
+that already exist. Queued writes, including that reconciliation, are memory-only: a
+crash or restart before they run loses them, and the first readable sample after
+restart closes the stored episode again (with logging on, that closure is stored).
+
+**Network collector cost.** The reviewer's 100,000-socket slowdown is a follow-up, not a release blocker, and no redesign was made. One synthetic `collect()` run at 100,000 sockets gave medians of 0.8-1.6 s at `639fdfd`, `321fa7a` and the corrected code. It ran alongside the test suite, so it cannot rank the three versions. A quiet-machine measurement is still to be done. Enumeration is linear in socket count and runs on a worker thread.
 
 ## Open findings
 
