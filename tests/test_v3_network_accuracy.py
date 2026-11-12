@@ -88,3 +88,54 @@ def test_bounded_detail_rows_keep_established_connections_ahead_of_time_wait():
     # Other open TCP states, then listeners, then UDP endpoints, then closed sockets.
     assert statuses[40:43] == ["CLOSE_WAIT", "LISTEN", "NONE"]
     assert statuses[43:] == ["TIME_WAIT"] * 7
+
+
+def test_closed_sockets_do_not_feed_destination_or_lifecycle_metrics():
+    # Independent review reproduction: 5 TIME_WAIT + 2 established sockets.
+    time_wait = [
+        sock("TIME_WAIT", 0, remote=(f"198.51.100.{i}", 443), local_port=40000 + i)
+        for i in range(5)
+    ]
+    established = [
+        sock("ESTABLISHED", 1200, remote=(f"203.0.113.{i}", 443), local_port=51000 + i)
+        for i in range(2)
+    ]
+    collector = NetworkCollector(psutil_with(time_wait + established), clock=lambda: 1)
+
+    sample, details = collector.collect()
+
+    assert sample.active_connections == 2
+    assert sample.closing_connections == 5
+    assert sample.unique_remote_destinations == 2
+    assert sample.new_connections == 2
+    assert sample.disappeared_connections == 0
+    assert 0 not in collector.remote_endpoints_by_pid
+    assert collector.remote_endpoints_by_pid[1200] == ["203.0.113.0:443", "203.0.113.1:443"]
+    flags = {item.status: item.is_new for item in details}
+    assert flags == {"ESTABLISHED": True, "TIME_WAIT": False}
+
+
+def test_closing_a_connection_counts_one_disappearance_and_no_new_connection():
+    remote = ("203.0.113.5", 443)
+    samples = [
+        [sock("ESTABLISHED", 1200, remote=remote, local_port=51000)],
+        # Windows moves the closed endpoint to PID 0 while it waits out TIME_WAIT.
+        [sock("TIME_WAIT", 0, remote=remote, local_port=51000)],
+        [],
+    ]
+    connections: list = []
+    provider = psutil_with(connections)
+    collector = NetworkCollector(provider, clock=lambda: 1)
+
+    observed = []
+    for batch in samples:
+        connections[:] = batch
+        sample, _ = collector.collect()
+        observed.append(
+            (sample.new_connections, sample.disappeared_connections,
+             sample.unique_remote_destinations, len(collector.recently_closed))
+        )
+
+    assert observed == [(1, 0, 1, 0), (0, 1, 0, 1), (0, 0, 0, 1)]
+    assert collector.recently_closed[0].pid == 1200
+

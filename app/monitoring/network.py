@@ -252,6 +252,14 @@ class NetworkCollector:
                 if protocol == "TCP" and status == "ESTABLISHED":
                     established += 1
                     established_by_pid[pid] += 1
+                if is_closing:
+                    # A closed endpoint is neither a destination in use nor a new
+                    # connection: its open predecessor was counted when it opened,
+                    # and the closure is counted once when that open key disappears.
+                    detail_candidates.append(
+                        (4, len(detail_candidates), (key, pid, status, protocol, None, False))
+                    )
+                    continue
                 if remote_address != "—":
                     remote_destinations.add(remote_address)
                     destinations_by_pid[pid].add(remote_address)
@@ -272,9 +280,7 @@ class NetworkCollector:
                 is_new = seen is None
                 if is_new and tracked:
                     new_count += 1
-                if is_closing:
-                    rank = 4
-                elif protocol == "UDP":
+                if protocol == "UDP":
                     rank = 3
                 else:
                     rank = _TCP_DETAIL_RANK.get(status, 1)
