@@ -5,7 +5,7 @@ import logging
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -914,6 +914,25 @@ class Database:
             except (ValueError, TypeError) as exc:
                 LOGGER.warning("Active alert could not be restored (%s)", type(exc).__name__)
         return alerts
+
+    def close_ended_episodes(self, still_open: Iterable[str]) -> int:
+        """Mark stored open episodes ended, except those still open live.
+
+        Changes condition_active only, so no detail of how or when an episode ended
+        (for example while event logging was off) is written.
+        """
+        keep = list(still_open)
+        rules = tuple(THRESHOLD_ALERT_RULES)
+        rule_marks = ", ".join("?" for _ in rules)
+        # NOT IN () is not valid SQL, and NOT IN (NULL) matches nothing.
+        keep_clause = f" AND id NOT IN ({', '.join('?' for _ in keep)})" if keep else ""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE alerts SET condition_active = 0 WHERE condition_active = 1 "  # noqa: S608 - placeholders only
+                f"AND rule_id IN ({rule_marks}){keep_clause}",
+                (*rules, *keep),
+            )
+            return cursor.rowcount
 
     def get_alert(self, alert_id: str) -> Alert | None:
         with self._lock, self._connect() as connection:

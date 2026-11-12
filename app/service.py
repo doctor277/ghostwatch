@@ -161,6 +161,9 @@ class TelemetryService:
         self._alert_persistence_lock = asyncio.Lock()
         self._alert_persistence_task: asyncio.Task[bool | None] | None = None
         self._logging_generation = 0
+        # Set when logging is turned back on: stored episodes that ended during the
+        # opt-out are marked ended (condition_active only) on the next flush.
+        self._close_ended_episodes = False
         self._history_generation = 0
         self._configuration_generations: dict[str, int] = {}
         self._incident_refresh_sequence = 0
@@ -230,7 +233,10 @@ class TelemetryService:
         active_alerts = await asyncio.to_thread(
             self.database.active_threshold_alerts
         )
-        for restoration in self.detection_engine.restore_active(active_alerts):
+        # With logging off, a stored episode may have ended unrecorded: never resume it.
+        for restoration in self.detection_engine.restore_active(
+            active_alerts, resume=self.settings.event_logging_enabled
+        ):
             self._restore_threshold_episode(restoration)
 
     def _restore_threshold_episode(self, restoration: EpisodeRestoration) -> None:
@@ -913,8 +919,6 @@ class TelemetryService:
                     await self._persist_alert(alert)
                     if event is not None:
                         await self._persist_event(event)
-                elif alert.rule_id in GROUPED_ALERT_RULES and alert.condition_active is False:
-                    await self._persist_recovery_transition(alert)
 
             alerts = await self.list_alerts(50)
             self._sequence += 1
@@ -1122,7 +1126,7 @@ class TelemetryService:
         return {
             "pending_writes": (
                 len(self._pending_alerts) + len(self._pending_events)
-                + len(self._pending_alert_updates)
+                + len(self._pending_alert_updates) + int(self._close_ended_episodes)
             ),
             "dropped_alert_writes": self.dropped_alert_writes,
             "dropped_event_writes": self.dropped_event_writes,
@@ -1321,32 +1325,6 @@ class TelemetryService:
             return False
         return bool(await self._run_alert_persistence(lambda: self._write_alert(alert, generation)))
 
-    async def _persist_recovery_transition(self, alert: Alert) -> None:
-        """With logging off, record only that an already-stored episode recovered.
-
-        Otherwise the stored row stays active and is resumed after a restart. No row
-        is created (require_existing) and no observation is added (count 0, last
-        occurrence kept), so the opt-out still stores nothing new.
-        """
-        if not self.storage.persistence_available:
-            return
-        transition = alert.model_copy(update={"occurrence_count": 0, "last_occurrence": None})
-
-        async def write() -> bool:
-            try:
-                await asyncio.to_thread(
-                    self.database.add_alert, transition, self.settings.alert_retention, True
-                )
-            except InvalidRecordError as exc:
-                self._reject_write(exc)
-                return False
-            except Exception as exc:
-                self._mark_storage_failure(exc)
-                return False
-            return True
-
-        await self._run_alert_persistence(write)
-
     async def _write_alert(self, alert: Alert, generation: int) -> bool:
         if not self.settings.event_logging_enabled or generation != self._logging_generation:
             self._clear_pending_flag(alert.id)
@@ -1444,7 +1422,10 @@ class TelemetryService:
             return
         if recovering:
             self._mark_storage_success(version)
-        if self._pending_alerts or self._pending_events or self._pending_alert_updates:
+        if (
+            self._pending_alerts or self._pending_events or self._pending_alert_updates
+            or self._close_ended_episodes
+        ):
             await self._flush_pending()
 
     async def _load_missed_state(self) -> None:
@@ -1458,6 +1439,7 @@ class TelemetryService:
             self._discard_pending_writes()
 
     def _discard_pending_writes(self) -> None:
+        self._close_ended_episodes = False
         self._pending_alerts.clear()
         self._pending_events.clear()
         self._pending_alert_updates.clear()
@@ -1482,6 +1464,18 @@ class TelemetryService:
             return
         if not self.storage.persistence_available or self._persisted_state_missing:
             return
+        if self._close_ended_episodes:
+            still_open = {
+                episode for rule in THRESHOLD_ALERT_RULES
+                if (episode := self.detection_engine.active_episode_id(rule)) is not None
+            }
+            try:
+                await asyncio.to_thread(self.database.close_ended_episodes, still_open)
+            except Exception as exc:
+                self._mark_storage_failure(exc)
+                return
+            self._close_ended_episodes = False
+            self.storage = self.storage.model_copy(update=self._queue_health())
         for alert_id in list(self._pending_alerts):
             if not self.settings.event_logging_enabled:
                 self._discard_pending_writes()
@@ -1760,11 +1754,16 @@ class TelemetryService:
     async def update_settings(self, settings: Settings) -> Settings:
         try:
             await asyncio.to_thread(self.database.save_settings, settings)
+            was_logging = self.settings.event_logging_enabled
             # A saved opt-out takes effect even if the maintenance below fails.
             self._apply_saved_configuration("settings", settings)
             if not settings.event_logging_enabled:
                 self._logging_generation += 1
                 self._discard_pending_writes()
+            elif not was_logging:
+                # Episodes that ended during the opt-out are still stored as open.
+                self._close_ended_episodes = True
+                self.storage = self.storage.model_copy(update=self._queue_health())
             await asyncio.to_thread(
                 self.database.enforce_retention, settings.alert_retention
             )
