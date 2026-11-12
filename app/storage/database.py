@@ -860,10 +860,18 @@ class Database:
 
     @staticmethod
     def _enforce_retention(connection: sqlite3.Connection, retention: int) -> None:
+        # An open grouped episode only reports once per cooldown, so a burst of newer
+        # alerts could delete it while active; its next report would then recreate a
+        # partial row without its count or operator state. Open episodes are kept,
+        # at most one slot per grouped rule, so retention stays bounded.
+        rules = sorted(GROUPED_ALERT_RULES)
+        placeholders = ", ".join("?" for _ in rules)
         connection.execute(
             "DELETE FROM alerts WHERE id NOT IN "
-            "(SELECT id FROM alerts ORDER BY timestamp DESC LIMIT ?)",
-            (retention,),
+            "(SELECT id FROM alerts ORDER BY timestamp DESC LIMIT ?) "
+            "AND id NOT IN (SELECT id FROM alerts WHERE condition_active = 1 "
+            f"AND rule_id IN ({placeholders}) ORDER BY timestamp DESC LIMIT ?)",
+            (retention, *rules, len(rules)),
         )
 
     def list_alerts(self, limit: int = 100, include_dismissed: bool = False) -> list[Alert]:

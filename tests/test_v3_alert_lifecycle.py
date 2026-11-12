@@ -511,7 +511,14 @@ async def test_active_metadata_survives_display_eviction_and_recovery(
     if mode == "logging_disabled":
         assert restarted.database.get_alert(opened.id) == stored
     elif "retention" in mode:
-        assert restarted.database.get_alert(opened.id) is None
+        # Retention keeps the open episode through the burst, so SQLite and live
+        # state agree after recovery instead of losing the record.
+        kept = restarted.database.get_alert(opened.id)
+        assert (kept.occurrence_count, kept.first_occurrence, kept.last_occurrence) == (
+            2, at(10), at(70)
+        )
+        assert (kept.acknowledged, kept.dismissed, kept.condition_active) == (True, True, False)
+        assert kept.last_recovery == at(1000)
         assert len(restarted.database.list_alerts(1000, True)) == 50
     else:
         assert restarted.database.get_alert(opened.id).occurrence_count == 2
@@ -685,7 +692,7 @@ async def test_provisional_identity_cannot_be_written_into_incident_history(
     assert restarted.database.get_alert(opened.id).incident_id == incident.id
 
 
-async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline(
+async def test_retention_keeps_an_open_episode_for_its_reconciled_delta(
     tmp_path, system_sample, network_sample, monkeypatch
 ):
     path = tmp_path / "synthetic.db"
@@ -707,14 +714,15 @@ async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline
         await run(restarted, clock, 1072, 1074)
     await run(restarted, clock, 1074, 1076)
 
-    # Queued Defender writes prune A before its positive-count recovery delta.
-    assert restarted.database.get_alert(opened.id) is None
+    # Queued Defender writes no longer prune open episode A before its positive-count
+    # recovery delta, so the stored record matches the live one.
     current = restarted._live_alert(opened.id)
-    assert current.occurrence_count == 4
-    assert (current.first_occurrence, current.last_occurrence) == (at(10), at(1070))
-    assert current.last_recovery == at(1072)
-    assert current.condition_active is False
-    assert current.acknowledged is True
+    for record in (current, restarted.database.get_alert(opened.id)):
+        assert record.occurrence_count == 4
+        assert (record.first_occurrence, record.last_occurrence) == (at(10), at(1070))
+        assert record.last_recovery == at(1072)
+        assert record.condition_active is False
+        assert record.acknowledged is True
     assert len(restarted.database.list_alerts(1000, True)) == 50
     assert restarted.storage.pending_writes == 0
 
@@ -1155,6 +1163,10 @@ async def test_retention_expired_episode_is_not_recreated_by_recovery(
             id=f"synthetic-new-{index}", timestamp=at(11) + timedelta(milliseconds=index),
             severity="WARNING", source="synthetic", metric="synthetic", explanation="synthetic"
         ), 50)
+    # Retention now keeps open episodes; a row expired before that (or removed outside
+    # the service) must still not be recreated as an incomplete record.
+    with service.database._connect() as connection:
+        connection.execute("DELETE FROM alerts WHERE id = ?", (opened.id,))
     assert service.database.get_alert(opened.id) is None
 
     system_sample.memory_percent = CLEAR
