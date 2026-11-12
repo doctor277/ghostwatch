@@ -138,4 +138,3 @@ def test_closing_a_connection_counts_one_disappearance_and_no_new_connection():
 
     assert observed == [(1, 0, 1, 0), (0, 1, 0, 1), (0, 0, 0, 1)]
     assert collector.recently_closed[0].pid == 1200
-
