@@ -10,7 +10,8 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
 | Local-only results, remaining PID ownership corrections | The local correction following `c6d7724`; see [below](#pid-ownership-correction-after-c6d7724---november-11-2026) | 802 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, other operating systems, 32-bit Python, other browser engines |
-| Local-only results, final stabilization | The commits after `639fdfd` on `feat/v3-final-stabilization`; see [below](#final-stabilization---november-11-2026) | 844 passed with one warning on Python 3.11.9. 46 passed on synthetic Chromium. Bounded live runs (60 s to 5 min) against real collectors | Hosted CI, Python 3.13, any other browser engine, an eight-hour soak |
+| Local-only results, independent QA corrections | `664ff59` and this documentation change on `feat/v3-final-stabilization`; see [below](#independent-qa-corrections---november-12-2026) | 865 passed, 0 failed, 0 skipped, with one warning on Python 3.11.9. 46 passed on synthetic Chromium (one worker). Release archive checked | Hosted CI, Python 3.13, any other browser engine, an eight-hour soak, a live run of these commits |
+| Local-only results, final stabilization | The commits after `639fdfd` on `feat/v3-final-stabilization`; see [below](#final-stabilization---november-11-2026) | 844 passed with one warning on Python 3.11.9. 46 passed on synthetic Chromium. Bounded live runs (60 s to 5 min) against real collectors | The QA corrections below, hosted CI, Python 3.13, any other browser engine, an eight-hour soak |
 | Local-only results, process accuracy review corrections | The correction following `83343f3` on `fix/v3-process-accuracy`; see [below](#process-accuracy-review-corrections---november-11-2026) | 779 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, process monitoring accuracy | `83343f3`, based on `8fea111`; see [below](#process-monitoring-accuracy---november-11-2026) | 764 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | The review corrections, hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, final lifecycle state corrections | The correction following `cf62570` on `fix/v3-alert-lifecycle`; see [below](#final-lifecycle-state-corrections-after-cf62570) | 716 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
@@ -69,7 +70,9 @@ restart when stored state is available. A confirmed recovery closes that episode
 new qualifying breach receives a distinct ID immediately after its configured
 duration, independently of the earlier cooldown. This preserves historical incident
 links. Startup hydrates saved counts, occurrence timestamps and operator state before
-applying recovery, including when logging is disabled. Repeated observations cannot
+applying recovery, including when logging is disabled (superseded on November 12:
+with logging disabled at startup, a stored open episode is closed as not confirmed
+instead of being resumed; see the QA corrections). Repeated observations cannot
 replace the original timeline detection. A recovery-only delta does not recreate a
 retention-expired database row.
 
@@ -160,6 +163,72 @@ No push, merge, release build, hosted CI, Python 3.13 or non-Windows run is part
 this correction. PID-based psutil reads remain non-atomic; boundary checks fail
 closed on detectable ownership uncertainty, with timestamp-resolution limits
 documented in the resilience audit.
+
+## Independent QA corrections - November 12, 2026
+
+Local work on `feat/v3-final-stabilization`, following `321fa7a`. No push, merge or
+release is authorized. An independent review of the final stabilization returned BLOCK
+with four reproduced defects; their root causes and corrections are in the
+[resilience audit](V3_RESILIENCE_AUDIT.md#independent-qa-corrections-2026-11-12).
+
+| Commit | Change |
+| --- | --- |
+| `8bbca7f` | Closed (`TIME_WAIT`) sockets no longer feed destination or lifecycle metrics |
+| `c9366f4` | Logging off writes no alert or event data; re-enabling marks ended episodes ended (`condition_active` only); a restart with logging off does not resume a stored episode |
+| `42a3df4` | Queue saturation evicts other alerts before episode transitions |
+| `2c9e1a7` | `/api/health` reports `degraded` or `unavailable` for storage failure and data loss, with `reasons` |
+| `d0cf648` | Trailing blank line flagged by `git diff --check` |
+| `cec9e50` | Audit record of the four blockers |
+| `664ff59` | Test expectation found by this validation (below) |
+
+Environment: Windows 11 Home 10.0.26300, 16 logical CPUs, 15.7 GB RAM, Python 3.11.9
+(pytest 9.1.1, psutil 7.1.0, FastAPI 0.157.0), Node 22.23.2, Playwright 1.64.1. Other
+applications stayed open during the runs and were not stopped.
+
+| Check | Result |
+| --- | --- |
+| Complete pytest suite, fresh private `--basetemp`, JUnit outside the repository | `865 passed, 0 failed, 0 skipped, 0 errors, 1 warning` in 165.28 s on `664ff59` |
+| Complete Playwright suite, run afterwards with one worker | `46 passed, 0 failed, 0 skipped` (44 desktop, 2 mobile Chromium) in 1.5 min |
+| Ruff over the repository | `All checks passed!` |
+| Python compilation of `app`, `scripts` and `tests` | Passed |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| `git diff --check 639fdfd..HEAD` and working tree | Passed |
+| Default-deny release archive, built outside the repository and not published | 130 files, zip integrity passed, SHA-256 `ad91c242dbb7d6e869eaa002a11107853187ec33a4ec34a960574668aaeba9af`. No databases, logs, caches, environments, `data/` or test output; no profile paths, e-mail addresses or secret patterns. The only name matches are the approved `Rafi Dahoui` copyright and author lines. The one image is the approved synthetic screenshot. `LICENSE` is MIT |
+
+**Failures found and how they were resolved.** The first complete pytest run on
+`cec9e50` was stopped by a memory watchdog at about 75% (other applications brought
+available memory down to 351 MiB; the pytest process tree peaked at 106 MiB). Before
+the stop it reported one failure:
+`test_v3_persistence_races.py::test_update_failing_after_logging_returns_is_not_queued`.
+`c9366f4` makes re-enabling logging schedule the stored-episode reconciliation, which
+correctly stays pending while storage is degraded, so `pending_writes` was 1. The
+test's guarantee was unchanged and is now asserted directly in `664ff59`: the update from
+before the opt-out is not queued and never stored, and the reconciliation clears when
+storage returns. The complete rerun above passed with available memory at no less
+than 905 MiB. An earlier run on November 12 was stopped by Claude Code for low system
+memory and produced no result.
+
+**Synthetic socket benchmark.** `NetworkCollector.collect()` with synthetic sockets
+and no production data. Each revision ran in a fresh process, interleaved over two
+rounds, with the median of 7 collections after one warm-up. It ran with no test suite
+running; background CPU was 6-46% before each case.
+
+| Sockets (`TIME_WAIT` share) | `639fdfd` (base) | `321fa7a` (stabilization) | `664ff59` (this change) |
+| --- | --- | --- | --- |
+| 10,000 (0%) | 38.9 / 44.6 ms | 71.3 / 62.6 ms | 67.9 / 45.6 ms |
+| 10,000 (60%) | 43.5 / 44.1 ms | 44.2 / 55.1 ms | 34.3 / 41.1 ms |
+| 100,000 (0%) | 344.4 / 348.5 ms | 557.7 / 557.5 ms | 509.5 / 517.6 ms |
+| 100,000 (60%) | 328.0 / 310.8 ms | 447.9 / 473.1 ms | 397.7 / 416.5 ms |
+
+The reviewer's slowdown is confirmed at 100,000 sockets: about 50% over the base with
+all sockets open, and about 27% with 60% in `TIME_WAIT`. The stabilization's ranked,
+bounded detail selection builds a candidate for every socket. Collection runs on a
+worker thread, and the live hosts measured so far had about 600 sockets. This is a
+follow-up and not changed here. The 10,000-socket figures overlap between rounds
+and do not rank the revisions.
+
+Not part of this record: hosted CI, Python 3.13, other browser engines, a live
+`scripts/live_smoke.py` run of these commits, and the eight-hour soak.
 
 ## Final stabilization - November 11, 2026
 

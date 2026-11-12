@@ -1501,7 +1501,7 @@ that already exist. Queued writes, including that reconciliation, are memory-onl
 crash or restart before they run loses them, and the first readable sample after
 restart closes the stored episode again (with logging on, that closure is stored).
 
-**Network collector cost.** The reviewer's 100,000-socket slowdown is a follow-up, not a release blocker, and no redesign was made. One synthetic `collect()` run at 100,000 sockets gave medians of 0.8-1.6 s at `639fdfd`, `321fa7a` and the corrected code. It ran alongside the test suite, so it cannot rank the three versions. A quiet-machine measurement is still to be done. Enumeration is linear in socket count and runs on a worker thread.
+**Network collector cost.** The reviewer's 100,000-socket slowdown is a follow-up, not a release blocker, and no redesign was made. Measured with no test suite running (see [validation](CURRENT_BETA_VALIDATION.md#independent-qa-corrections---november-12-2026)): at 100,000 synthetic sockets a collection takes about 345 ms at `639fdfd`, 558 ms at `321fa7a` and 510-518 ms at `664ff59` with all sockets open, so the slowdown is real, about 50% over the base. It comes from building a ranked detail candidate for every socket. Collection runs on a worker thread, and the live hosts measured so far had about 600 sockets.
 
 ## Open findings
 
