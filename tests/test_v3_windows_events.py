@@ -69,6 +69,57 @@ def test_windows_collector_is_incremental_and_deduplicates_records():
     assert second.events == []
 
 
+def scm_event_xml(record_id: int, event_id: int, *params: str) -> str:
+    """Service Control Manager event shaped like the real System log: positional params."""
+    data = "".join(
+        f'<Data Name="param{index}">{value}</Data>' for index, value in enumerate(params, 1)
+    )
+    return f"""
+    <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+      <System>
+        <Provider Name="Service Control Manager" />
+        <EventID Qualifiers="49152">{event_id}</EventID><Level>2</Level>
+        <TimeCreated SystemTime="2026-11-07T05:21:08.0000000Z" />
+        <EventRecordID>{record_id}</EventRecordID>
+      </System>
+      <EventData>{data}</EventData>
+    </Event>
+    """
+
+
+@pytest.mark.parametrize(
+    ("event_id", "params", "expected"),
+    [
+        # 7009/7011: param1 is the timeout in milliseconds, param2 the service.
+        (7009, ("30000", "Example Asset Service"), "Example Asset Service"),
+        (7011, ("30000", "Example Update Service"), "Example Update Service"),
+        # The other service-failure events name the service first.
+        (7000, ("Example Driver Service", "%%2"), "Example Driver Service"),
+        (7001, ("Example Service", "Example Dependency"), "Example Service"),
+        (7023, ("Example Service", "%%1067"), "Example Service"),
+        (7024, ("Example Service", "%%3"), "Example Service"),
+        (7031, ("Example Service", "1", "60000", "1", "Restart the service"), "Example Service"),
+        (7034, ("Example Energy Service", "3"), "Example Energy Service"),
+        # A timeout without its service name is not reported as a name.
+        (7009, ("30000",), None),
+    ],
+)
+def test_service_failure_events_name_the_service_not_the_timeout(event_id, params, expected):
+    def runner(command, **_kwargs):
+        xml = f"<Events>{scm_event_xml(10, event_id, *params)}</Events>"
+        return subprocess.CompletedProcess(command, 0, stdout=xml, stderr="")
+
+    collector = WindowsEventCollector(runner, platform_name="nt")
+    settings = WindowsEventSettings(defender_enabled=False, application_enabled=False)
+
+    event = collector.collect({}, settings).events[0]
+
+    assert event.category == "service_failure"
+    assert event.service_name == expected
+    # The full parameters stay available as evidence in the summary.
+    assert all(value in event.summary for value in params)
+
+
 def test_windows_collector_reports_permission_failure_without_raising():
     def denied(command, **_kwargs):
         return subprocess.CompletedProcess(command, 5, stdout="", stderr="Access is denied.")
