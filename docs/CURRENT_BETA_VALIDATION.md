@@ -10,6 +10,7 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
 | Local-only results, remaining PID ownership corrections | The local correction following `c6d7724`; see [below](#pid-ownership-correction-after-c6d7724---november-11-2026) | 802 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, other operating systems, 32-bit Python, other browser engines |
+| Local-only results, final stabilization | The commits after `639fdfd` on `feat/v3-final-stabilization`; see [below](#final-stabilization---november-11-2026) | 844 passed with one warning on Python 3.11.9. 46 passed on synthetic Chromium. Bounded live runs (60 s to 5 min) against real collectors | Hosted CI, Python 3.13, any other browser engine, an eight-hour soak |
 | Local-only results, process accuracy review corrections | The correction following `83343f3` on `fix/v3-process-accuracy`; see [below](#process-accuracy-review-corrections---november-11-2026) | 779 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, process monitoring accuracy | `83343f3`, based on `8fea111`; see [below](#process-monitoring-accuracy---november-11-2026) | 764 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | The review corrections, hosted CI, Python 3.13, any other browser engine, 32-bit Python |
 | Local-only results, final lifecycle state corrections | The correction following `cf62570` on `fix/v3-alert-lifecycle`; see [below](#final-lifecycle-state-corrections-after-cf62570) | 716 passed with one warning on Python 3.11.9. 42 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine |
@@ -159,6 +160,52 @@ No push, merge, release build, hosted CI, Python 3.13 or non-Windows run is part
 this correction. PID-based psutil reads remain non-atomic; boundary checks fail
 closed on detectable ownership uncertainty, with timestamp-resolution limits
 documented in the resilience audit.
+
+## Final stabilization - November 11, 2026
+
+Local work on `feat/v3-final-stabilization`, based on `639fdfd` (merged `main`). No push,
+merge or release is authorized. The defects corrected, their reproductions and the
+measurements are in the
+[resilience audit](V3_RESILIENCE_AUDIT.md#final-stabilization-2026-11-11).
+
+Each correction is a separate local commit with its own regression. Tests were added
+first and failed before the fix, except for the shutdown-flush tests, which guard
+existing behavior. Lifecycle tests that encoded the old retention and logging-off
+behavior now assert the corrected outcome, and the no-recreation guarantee is kept.
+
+| Check | Result |
+| --- | --- |
+| Complete pytest suite, with JUnit output outside the repository | `844 passed, 0 failed, 0 skipped, 1 warning` in 144.70 s |
+| Complete Playwright suite | `46 passed, 0 failed, 0 skipped`, desktop and mobile Chromium |
+| Ruff over the repository | `All checks passed!` |
+| Python compilation of `app`, `scripts` and `tests` | Passed |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| PowerShell parse of `start.ps1` | 0 errors |
+| Diff whitespace, relative links and profile-path checks | Passed |
+| Default-deny release archive (built outside the repository, not published) | 129 files; no databases, logs, environments, private paths or e-mail addresses |
+
+Live runs used `scripts/live_smoke.py` against a temporary database: real collectors,
+loopback only, standard user, Windows 11 with 16 logical CPUs.
+
+| Live check | 5-minute run | 2-minute rerun |
+| --- | --- | --- |
+| WebSocket frames, sequence gaps | 147, 0 | 59, 0 |
+| Frame interval p50 / max | 2.06 / 2.19 s | 2.07 / 2.14 s |
+| Health status; snapshot age max; history dropped | `ok`; 2.0 s; 0 | `ok`; 2.1 s; 0 |
+| System CPU vs `GetSystemTimes`, 5 s windows (frame skew up to 2 s) | MAE 2.15, p95 4.97 points | MAE 2.68, p95 5.05 points |
+| Memory vs psutil | MAE 0.05 points | MAE 0.06 points |
+| GhostWatch CPU / RSS / handles | not measured (harness error, corrected in the rerun) / 74-84 MiB / 755-896 | 0.26% of the machine / 70-72 MiB / 696-713 |
+| Collection duration p50 / p95 | 56 / 97 ms | 56 / 76 ms |
+| Host, cross-origin and loopback checks | All passed | All passed |
+| Shutdown and database | Graceful CTRL_BREAK; integrity `ok`; 147 samples stored | Integrity `ok`; 60 samples stored |
+
+uvicorn exits with code 3 after a graceful CTRL_BREAK shutdown because it re-raises
+the signal. Aligned with frame times, system CPU against `GetSystemTimes` had a mean
+absolute error of 0.85 points over 30 cycles on rotating executor threads (see the
+audit).
+
+No production data, hosted CI, Python 3.13 run or eight-hour soak is part of this
+record. The soak command is `scripts/live_smoke.py --seconds 28800`.
 
 ## Process accuracy review corrections - November 11, 2026
 

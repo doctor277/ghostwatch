@@ -1442,6 +1442,46 @@ identity and creation time are kept. All four failed against `a8f8de4`. Guards k
 the 5 microsecond reuse rejected within the fallback and across sources, and show
 that a two-step difference is still a new owner.
 
+## Final stabilization, 2026-11-11
+
+Local work on `feat/v3-final-stabilization`, based on `639fdfd` (merged `main`). No push
+or merge is authorized. Defects come from the November 8 live reliability investigation
+(D1-D12) and the open lifecycle follow-ups. D1, D2, D5 and D6 were already fixed on
+`main`. Each remaining defect was reproduced first, in a test that failed before its fix
+or in a live measurement. Measurements were taken on the development host: Windows 11,
+16 logical CPUs, standard user. Results are in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#final-stabilization---november-11-2026).
+
+| Area | Defect reproduced | Correction |
+| --- | --- | --- |
+| Service events (D4) | SCM 7009/7011 put the timeout in `param1` (confirmed on the live System log); alerts named the service `30000` | The parameter is chosen per event ID; the other service-failure IDs are unchanged |
+| Sockets (D7, D9) | Windows lists closed TCP endpoints in `TIME_WAIT` under PID 0. PID 0 was named "System", every socket counted as active, and `TIME_WAIT` rows filled the 250-row table | New `closing_connections`; `active_connections`, per-process counts and rankings cover open sockets only; PID 0 is "No owner (PID 0)"; the table holds established connections first and shows "N of M". Live: 227 open, 369 `TIME_WAIT`, all 70 established in the table |
+| System CPU (D3) | `psutil.cpu_percent(interval=None)` keeps one baseline per thread; executor rotation gave false 0.0 readings | The collector keeps its own `cpu_times()` baseline; the first sample is unavailable. Against aligned `GetSystemTimes` windows: MAE 4.73 to 0.85 points, max 19.77 to 1.64 |
+| Clean start (D10) | Every clean start logged "Persistent storage recovered" | Recovery is announced only after a recorded failure |
+| Health (D8) | `/api/health` was `ok` whenever a snapshot existed, and history loss was invisible | Snapshot age, the watchdog allowance, worker states, `degraded` status, history queue depth and dropped samples. The dashboard shows dropped samples |
+| Dashboard | Recent events never refreshed; the same alert read WARNING in one view and HIGH in another | Overview events poll at most every 10 s while live; alert-derived events show the alert's label |
+| Alert retention | A burst of newer alerts could delete a still-active episode, whose next report recreated a partial row | Open grouped episodes are exempt, at most one per grouped rule (limit plus nine) |
+| Logging toggle | An episode that recovered while logging was off stayed ACTIVE in SQLite and was resumed after restart | The recovery of an already-stored episode is written (no new row or observation) |
+| History writes (D1 follow-up) | `COUNT(*)` on every capped table and a scan over every compacted key on every write | Both are skipped when they provably cannot delete anything. Per write: 1M rows 116.2 to 30.5 ms; at the 2M cap 216.5 to 200.7 ms |
+
+Shutdown flush (investigation R4) had no tests; two now cover it and pass unchanged.
+`scripts/live_smoke.py` runs the real collectors against a temporary database. A
+5-minute run produced 147 frames with no sequence gaps, health `ok`, snapshot age at
+most 2.0 s, no dropped history, all Host/Origin/loopback checks passing, and an intact
+database after graceful shutdown. GhostWatch used 0.26% of the machine's CPU on
+average (measured in a corrected 2-minute rerun) and 70-84 MiB RSS.
+
+**Compatibility.** All API changes are additive (`closing_connections`, StorageHealth
+history fields, health fields), and `/api/health` keeps HTTP 200. `active_connections`
+changes meaning once: history and the rolling baseline recorded before this change
+include `TIME_WAIT` sockets, so the baseline shows a temporary deviation after upgrade.
+No schema migration was added.
+
+**Not done.** At the 2M process-row cap the exact `COUNT(*)` still runs on every write
+(about 160 ms). Removing it needs a persistent counter, which is a schema change and
+was not made. A recovery that happens while logging is off *and* storage is
+unavailable stays live-only. No eight-hour soak was run.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -1465,10 +1505,10 @@ These come from code review and have not been reproduced, unless noted.
   unlinked IDs at 10,000 x 100. See
   [the benchmark](#synthetic-persistence-benchmark-2026-11-07).
 - Surrogates in monitored folder paths submitted through the API are untested.
-- Each history write still counts every capped table. At 2,000,000 process rows that
-  count took about 0.2 to 0.6 s at the median, with the `Database` lock held, and the `telemetry_compacted_keys`
-  cleanup adds about 0.23 s at the default 7-day size. See
-  [History row-cap retention](#history-row-cap-retention-2026-11-09).
+- Once a capped table is at its limit, each history write still counts it: about 160 ms at
+  2,000,000 process rows, with the `Database` lock held. Below the limit, and for the
+  compacted-key cleanup, the scans are now skipped; see
+  [Final stabilization](#final-stabilization-2026-11-11).
 
 ## Known limitations
 
@@ -1497,7 +1537,6 @@ These come from code review and have not been reproduced, unless noted.
   restarts during an outage loses that evidence.
 - An update to an evicted alert reaches the database only if its row already exists.
 - The storage recovery notice is not stored when the event queue is full.
-- `history_dropped_samples` is counted but not shown by `/api/health`.
 - An update saved by the next pass after a first write is lost if the process stops
   first. The queue is memory only.
 - `Database.add_alert` accepts observation deltas. Calling it again for an observation
