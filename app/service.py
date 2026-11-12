@@ -1089,7 +1089,8 @@ class TelemetryService:
         self._remember_live_alert(alert)
 
     def _mark_storage_success(self, version: int | None = None) -> None:
-        recovered = not self.storage.persistence_available
+        # Only a recorded outage is a recovery; a clean first start is not.
+        recovered = self.storage.last_error_type is not None
         self.storage = StorageHealth(
             status="healthy",
             persistence_available=True,
