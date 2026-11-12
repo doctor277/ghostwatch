@@ -13,6 +13,9 @@ const state = {
   monitoredFolders: [],
   fileIntegrityEvents: [],
   events: [],
+  // Overview rows; refreshed while snapshots arrive, independently of the full log.
+  recentEvents: [],
+  recentEventsAt: 0,
   incidents: [],
   processSort: { key: "cpu_percent", direction: -1 },
   alertSeverity: "ALL",
@@ -469,16 +472,32 @@ function renderBaselines(items) {
   });
 }
 
+const RECENT_EVENTS_REFRESH_MS = 10000;
+let recentEventsRequest = null;
+
+// Recent events are not part of the snapshot; poll a small page while telemetry is live.
+function refreshRecentEvents() {
+  if (state.demo || recentEventsRequest || Date.now() - state.recentEventsAt < RECENT_EVENTS_REFRESH_MS) return;
+  state.recentEventsAt = Date.now();
+  recentEventsRequest = fetch("/api/events?limit=6")
+    .then((response) => (response.ok ? response.json() : null))
+    .then((events) => {
+      if (events && !state.demo) { state.recentEvents = events; renderOverviewEvents(); }
+    })
+    .catch(() => {})
+    .finally(() => { recentEventsRequest = null; });
+}
+
 function renderOverviewEvents() {
   const body = $("#overview-events");
   body.replaceChildren();
-  state.events.slice(0, 6).forEach((event) => {
+  state.recentEvents.slice(0, 6).forEach((event) => {
     const row = body.insertRow();
     makeCell(row, new Date(event.timestamp).toLocaleTimeString());
     makeCell(row, event.severity, event.severity === "LOW" ? "positive" : "");
     makeCell(row, event.title);
   });
-  if (!state.events.length) emptyTable(body, 3, "No retained events available");
+  if (!state.recentEvents.length) emptyTable(body, 3, "No retained events available");
 }
 
 function renderSnapshot(snapshot) {
@@ -917,7 +936,11 @@ function renderTimeline() {
 async function loadEvents() {
   if (!state.demo) {
     const response = await fetch("/api/events?limit=1000");
-    if (response.ok) state.events = await response.json();
+    if (response.ok) {
+      state.events = await response.json();
+      state.recentEvents = state.events.slice(0, 6);
+      state.recentEventsAt = Date.now();
+    }
   }
   renderTimeline();
   renderOverviewEvents();
@@ -1164,6 +1187,7 @@ function enterDemo() {
   const demo = createDemoData();
   state.history = [];
   state.events = demo.events;
+  state.recentEvents = demo.events.slice(0, 6);
   state.incidents = demo.incidents;
   $("#demo-banner").hidden = false;
   text("#mode-label", "DEMO");
@@ -1174,7 +1198,7 @@ function enterDemo() {
 
 async function exitDemo() {
   state.demo = false;
-  state.history = []; state.events = []; state.incidents = []; state.selectedIncident = null;
+  state.history = []; state.events = []; state.recentEvents = []; state.incidents = []; state.selectedIncident = null;
   $("#demo-banner").hidden = true;
   text("#mode-label", "LIVE");
   showSocketStatus("CONNECTING");
@@ -1199,7 +1223,7 @@ function startSocket() {
   state.socket?.disconnect();
   if (state.demo) return;
   state.socket = new TelemetrySocket(
-    (snapshot) => { if (!state.demo) renderSnapshot(snapshot); },
+    (snapshot) => { if (!state.demo) { renderSnapshot(snapshot); refreshRecentEvents(); } },
     (status) => { if (!state.demo) showSocketStatus(status); },
     () => state.settings?.refresh_interval,
   );
