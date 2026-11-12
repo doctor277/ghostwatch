@@ -144,6 +144,13 @@ function renderConnections() {
       makeCell(row, duration(item.duration_seconds));
     });
   }
+  const network = state.snapshot?.network;
+  if (network && isAvailable(network, "active_connections")) {
+    const total = network.active_connections + (network.closing_connections ?? 0);
+    text("#network-detail-count", `Table holds ${state.snapshot.connections.length} of ${total} sockets: established first, closed TIME_WAIT last`);
+  } else {
+    text("#network-detail-count", "Socket totals unavailable");
+  }
   const closed = $("#closed-table");
   closed.replaceChildren();
   const recent = state.snapshot?.recently_closed_connections || [];
@@ -495,7 +502,7 @@ function renderSnapshot(snapshot) {
   text("#metric-download", isAvailable(network, "bytes_recv_per_second") ? rate(network.bytes_recv_per_second) : "UNAVAILABLE");
   text("#metric-upload", isAvailable(network, "bytes_sent_per_second") ? rate(network.bytes_sent_per_second) : "UNAVAILABLE");
   text("#metric-connections", isAvailable(network, "active_connections") ? network.active_connections : "UNAVAILABLE");
-  text("#metric-established", isAvailable(network, "established_connections") ? `${network.established_connections} established` : "Established count unavailable");
+  text("#metric-established", isAvailable(network, "established_connections") ? `${network.established_connections} established${isAvailable(network, "closing_connections") ? ` · ${network.closing_connections ?? 0} closed (TIME_WAIT) not counted` : ""}` : "Established count unavailable");
   text("#metric-processes", isAvailable(system, "process_count") ? system.process_count : "UNAVAILABLE");
   text("#metric-duration", `${snapshot.collection_duration_ms.toFixed(1)} ms`);
   text("#metric-uptime", `Uptime ${isAvailable(system, "uptime_seconds") ? uptime(system.uptime_seconds) : "unavailable"}`);
@@ -503,7 +510,7 @@ function renderSnapshot(snapshot) {
   $("#memory-meter").style.width = isAvailable(system, "memory_percent") ? `${system.memory_percent}%` : "0%";
   text("#legend-download", isAvailable(network, "bytes_recv_per_second") ? rate(network.bytes_recv_per_second) : "—");
   text("#legend-upload", isAvailable(network, "bytes_sent_per_second") ? rate(network.bytes_sent_per_second) : "—");
-  text("#network-total", isAvailable(network, "active_connections") ? network.active_connections : "—");
+  text("#network-total", isAvailable(network, "active_connections") && isAvailable(network, "closing_connections") ? network.active_connections + (network.closing_connections ?? 0) : "—");
   text("#network-established", isAvailable(network, "established_connections") ? network.established_connections : "—");
   text("#network-destinations", isAvailable(network, "unique_remote_destinations") ? network.unique_remote_destinations : "—");
   text("#network-new", network.new_connections ?? "—");

@@ -270,7 +270,10 @@ class NetworkSample(BaseModel):
     bytes_recv_per_second: float
     upload_mbps: float
     download_mbps: float
+    # Open sockets: every state except closed TCP endpoints (TIME_WAIT and similar).
     active_connections: int
+    # Closed TCP endpoints the OS still lists; not part of active_connections.
+    closing_connections: int = 0
     established_connections: int
     unique_remote_destinations: int = 0
     new_connections: int = 0

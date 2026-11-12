@@ -794,6 +794,7 @@ class TelemetryService:
                 "upload_mbps",
                 "download_mbps",
                 "active_connections",
+                "closing_connections",
                 "established_connections",
                 "unique_remote_destinations",
             ],

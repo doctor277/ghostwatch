@@ -65,6 +65,18 @@ test("process search, sorting, drawer, and keyboard close work", async ({ page }
   await expect(page.locator("#process-drawer")).not.toHaveClass(/open/);
 });
 
+test("network view separates closed sockets and discloses the bounded table", async ({ page }) => {
+  const network = backend.state.snapshot.network;
+  const total = network.active_connections + network.closing_connections;
+  await expect(page.locator("#metric-connections")).toHaveText(String(network.active_connections));
+  await expect(page.locator("#metric-established")).toContainText(`${network.closing_connections} closed (TIME_WAIT) not counted`);
+  await page.locator('[data-view="network"]').click();
+  await expect(page.locator("#network-total")).toHaveText(String(total));
+  await expect(page.locator("#network-detail-count")).toHaveText(
+    `Table holds ${backend.state.snapshot.connections.length} of ${total} sockets: established first, closed TIME_WAIT last`,
+  );
+});
+
 test("process metrics distinguish unavailable, stale, and measured values", async ({ page }) => {
   const [measured, unmeasured, stale] = backend.state.snapshot.processes;
   Object.assign(unmeasured, {
