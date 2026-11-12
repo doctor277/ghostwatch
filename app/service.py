@@ -913,6 +913,8 @@ class TelemetryService:
                     await self._persist_alert(alert)
                     if event is not None:
                         await self._persist_event(event)
+                elif alert.rule_id in GROUPED_ALERT_RULES and alert.condition_active is False:
+                    await self._persist_recovery_transition(alert)
 
             alerts = await self.list_alerts(50)
             self._sequence += 1
@@ -1318,6 +1320,32 @@ class TelemetryService:
             self._queue_with_operator_state(alert)
             return False
         return bool(await self._run_alert_persistence(lambda: self._write_alert(alert, generation)))
+
+    async def _persist_recovery_transition(self, alert: Alert) -> None:
+        """With logging off, record only that an already-stored episode recovered.
+
+        Otherwise the stored row stays active and is resumed after a restart. No row
+        is created (require_existing) and no observation is added (count 0, last
+        occurrence kept), so the opt-out still stores nothing new.
+        """
+        if not self.storage.persistence_available:
+            return
+        transition = alert.model_copy(update={"occurrence_count": 0, "last_occurrence": None})
+
+        async def write() -> bool:
+            try:
+                await asyncio.to_thread(
+                    self.database.add_alert, transition, self.settings.alert_retention, True
+                )
+            except InvalidRecordError as exc:
+                self._reject_write(exc)
+                return False
+            except Exception as exc:
+                self._mark_storage_failure(exc)
+                return False
+            return True
+
+        await self._run_alert_persistence(write)
 
     async def _write_alert(self, alert: Alert, generation: int) -> bool:
         if not self.settings.event_logging_enabled or generation != self._logging_generation:

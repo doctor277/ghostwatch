@@ -118,6 +118,16 @@ class HeldWrite:
         return self.write(*args)
 
 
+def assert_recovery_only(row, stored, recovery):
+    """With logging off, a stored episode records its recovery and nothing else."""
+    assert row.condition_active is False and row.last_recovery == recovery
+    for field in (
+        "occurrence_count", "first_occurrence", "last_occurrence",
+        "acknowledged", "dismissed", "incident_id",
+    ):
+        assert getattr(row, field) == getattr(stored, field), field
+
+
 async def settle(service, passes=3):
     for _ in range(passes):
         await service._maybe_recover_storage()
@@ -467,8 +477,12 @@ async def test_delayed_restore_reconciles_provisional_episode_and_queued_events(
     assert recovered.acknowledged is True
     if logging:
         assert restarted.database.get_alert(opened.id) == recovered
-    else:
+    elif recover_before_restore:
+        # The recovery happened while storage was unavailable and logging was off,
+        # so it stays live-only (no write queue exists under the opt-out).
         assert restarted.database.get_alert(opened.id) == stored
+    else:
+        assert_recovery_only(restarted.database.get_alert(opened.id), stored, at(1076))
     assert restarted.database.get_incident(incident.id).related_alerts == [opened.id]
     assert restarted.storage.pending_writes == 0
     assert len(restarted.live_alerts) <= MAX_LIVE_ALERTS
@@ -509,7 +523,7 @@ async def test_active_metadata_survives_display_eviction_and_recovery(
     assert opened.id not in {a.id for a in restarted.latest.alerts}
     await settle(restarted)
     if mode == "logging_disabled":
-        assert restarted.database.get_alert(opened.id) == stored
+        assert_recovery_only(restarted.database.get_alert(opened.id), stored, at(1000))
     elif "retention" in mode:
         # Retention keeps the open episode through the burst, so SQLite and live
         # state agree after recovery instead of losing the record.
@@ -622,7 +636,10 @@ async def test_historical_operator_read_cannot_replace_active_episode_after_evic
     )
     assert recovered.first_occurrence == at(1012)
     assert recovered.last_recovery == at(1014)
-    assert restarted.database.get_alert(old.id).condition_active is True
+    # Logging is off: the old stored episode records its recovery; the new episode
+    # is never stored.
+    stored_old = restarted.database.get_alert(old.id)
+    assert stored_old.condition_active is False and stored_old.last_recovery == at(1000)
     assert restarted.database.get_alert(new.id) is None
 
 
@@ -1085,7 +1102,7 @@ async def test_restart_recovery_without_logging_preserves_episode_metadata(
     )
     assert (live.acknowledged, live.dismissed) == (True, dismissed)
     assert (opened.id in {item.id for item in restarted.latest.alerts}) is not dismissed
-    assert restarted.database.get_alert(opened.id) == stored
+    assert_recovery_only(restarted.database.get_alert(opened.id), stored, at(1000))
 
 
 async def test_restart_continuing_episode_does_not_duplicate_timeline(
@@ -1187,3 +1204,34 @@ async def test_retention_expired_episode_is_not_recreated_by_recovery(
     assert len(service.database.list_alerts(1000, include_dismissed=True)) == 50
     assert len(memory_events(service)) == 1
     assert service.storage.pending_writes == 0
+
+
+@pytest.mark.parametrize("reenable", [False, True], ids=["logging-off", "logging-re-enabled"])
+async def test_logging_toggle_never_leaves_a_recovered_episode_stored_as_active(
+    tmp_path, system_sample, network_sample, reenable
+):
+    clock = Clock()
+    system_sample.memory_percent = BREACH
+    service = await monitored(tmp_path / "synthetic.db", clock, system_sample, network_sample)
+    await run(service, clock, 0, 72)
+    await settle(service)
+    [opened] = memory_rows(service)
+    assert opened.condition_active is True
+
+    await service.update_settings(service.settings.model_copy(update={"event_logging_enabled": False}))
+    system_sample.memory_percent = CLEAR
+    await run(service, clock, 72, 74)  # Recovers while logging is off.
+    if reenable:
+        await service.update_settings(
+            service.settings.model_copy(update={"event_logging_enabled": True})
+        )
+    await settle(service)
+
+    live = service._live_alert(opened.id)
+    assert live.condition_active is False and live.last_recovery == at(72)
+    [stored] = memory_rows(service)
+    # The stored row may lack the live-only recovery details, but it must not claim
+    # the episode is still active: that row would be resumed after a restart.
+    assert stored.condition_active is False
+    assert stored.last_recovery == at(72)
+    assert stored.occurrence_count == opened.occurrence_count
