@@ -240,8 +240,17 @@ async def test_update_failing_after_logging_returns_is_not_queued(service, monke
     held.released.set()
     await task
 
-    assert service.storage.pending_writes == 0
+    # The update from before the opt-out is not queued. Turning logging back on
+    # schedules only the stored-episode reconciliation, which waits for storage.
+    assert not service._pending_alert_updates and not service._pending_alerts
+    assert service._close_ended_episodes is True
+    assert service.storage.pending_writes == 1
     assert live(service).persistence_pending is False
+
+    monkeypatch.undo()
+    await service._maybe_recover_storage()
+    assert service.storage.pending_writes == 0
+    assert stored(service).acknowledged is False
 
 
 @pytest.mark.parametrize("available", [True, False], ids=["healthy", "degraded"])
