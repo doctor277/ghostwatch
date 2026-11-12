@@ -472,6 +472,15 @@ function renderBaselines(items) {
   });
 }
 
+// Alert-derived events are stored on the event scale (INFO -> LOW, WARNING -> HIGH);
+// show them with the label the same alert has in the Alerts view.
+const ALERT_EVENT_LABELS = { LOW: "INFO", HIGH: "WARNING", CRITICAL: "CRITICAL" };
+
+function eventSeverityLabel(event) {
+  const fromAlert = event.event_type === "alert" || event.event_type === "demo_alert";
+  return (fromAlert && ALERT_EVENT_LABELS[event.severity]) || event.severity;
+}
+
 const RECENT_EVENTS_REFRESH_MS = 10000;
 let recentEventsRequest = null;
 
@@ -494,7 +503,7 @@ function renderOverviewEvents() {
   state.recentEvents.slice(0, 6).forEach((event) => {
     const row = body.insertRow();
     makeCell(row, new Date(event.timestamp).toLocaleTimeString());
-    makeCell(row, event.severity, event.severity === "LOW" ? "positive" : "");
+    makeCell(row, eventSeverityLabel(event), event.severity === "LOW" ? "positive" : "");
     makeCell(row, event.title);
   });
   if (!state.recentEvents.length) emptyTable(body, 3, "No retained events available");
@@ -912,7 +921,7 @@ function renderTimeline() {
   events.forEach((event) => {
     const row = body.insertRow();
     makeCell(row, new Date(event.timestamp).toLocaleString());
-    makeCell(row, event.severity, event.severity === "LOW" ? "positive" : "");
+    makeCell(row, eventSeverityLabel(event), event.severity === "LOW" ? "positive" : "");
     makeCell(row, event.event_type);
     makeCell(row, event.title);
     makeCell(row, event.summary);

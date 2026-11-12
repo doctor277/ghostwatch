@@ -65,6 +65,14 @@ test("process search, sorting, drawer, and keyboard close work", async ({ page }
   await expect(page.locator("#process-drawer")).not.toHaveClass(/open/);
 });
 
+test("alert-derived events use the alert's own severity label", async ({ page }) => {
+  const alertsById = Object.fromEntries(backend.state.snapshot.alerts.map((alert) => [alert.id, alert]));
+  const shown = backend.state.events.slice(0, 6).map((event) => alertsById[event.related_id]?.severity);
+  const cells = page.locator("#overview-events tr td:nth-child(2)");
+  await expect(cells).toHaveText(shown);
+  await expect(cells.first()).not.toHaveText(/^(LOW|HIGH)$/);
+});
+
 test("network view separates closed sockets and discloses the bounded table", async ({ page }) => {
   const network = backend.state.snapshot.network;
   const total = network.active_connections + network.closing_connections;
