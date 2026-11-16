@@ -135,6 +135,22 @@ test("threshold alerts show their lifecycle state", async ({ page }) => {
   await expect(page.locator("#nav-alert-count")).toHaveText("0");
 });
 
+test("an episode ended without an observed recovery is not shown as recovered", async ({ page }) => {
+  const now = new Date().toISOString();
+  backend.state.snapshot.alerts = [{
+    id: "synthetic-unconfirmed-alert", timestamp: now, severity: "CRITICAL", source: "System",
+    metric: "Memory 95.0%", explanation: "Ended: not confirmed after restart.",
+    acknowledged: false, dismissed: false, rule_id: "memory", evidence: { observed_percent: 95, threshold_percent: 90 },
+    persistence_pending: false, first_occurrence: now, last_occurrence: now, occurrence_count: 2,
+    condition_active: false, last_recovery: null,
+  }];
+  backend.sendSnapshot();
+  await page.locator('[data-view="alerts"]').click();
+  await expect(page.locator("#alert-list")).toContainText("STATE: ENDED");
+  await expect(page.locator("#alert-list")).toContainText("Last recovery: none observed");
+  await expect(page.locator("#alert-list")).not.toContainText("RECOVERED");
+});
+
 test("settings persist across a browser reload", async ({ page }) => {
   await page.locator('[data-view="settings"]').click();
   await page.locator('#settings-form [name="refresh_interval"]').fill("5");

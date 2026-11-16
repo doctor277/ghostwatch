@@ -161,9 +161,10 @@ class TelemetryService:
         self._alert_persistence_lock = asyncio.Lock()
         self._alert_persistence_task: asyncio.Task[bool | None] | None = None
         self._logging_generation = 0
-        # Set when logging is turned back on: stored episodes that ended during the
-        # opt-out are marked ended (condition_active only) on the next flush.
-        self._close_ended_episodes = False
+        # Stored episodes the previous run recorded as open at a clean stop: the only
+        # ones that may be continued. None until this run has read that record.
+        self._continuing_episodes: frozenset[str] | None = None
+        self._session_open = False
         self._history_generation = 0
         self._configuration_generations: dict[str, int] = {}
         self._incident_refresh_sequence = 0
@@ -230,13 +231,20 @@ class TelemetryService:
             self.database.load_baseline_state
         )
         self.baseline_engine.restore_state(baseline_state)
+        if self._continuing_episodes is None:
+            self._continuing_episodes = await asyncio.to_thread(
+                self.database.begin_monitoring_session
+            )
+            self._session_open = True
         active_alerts = await asyncio.to_thread(
             self.database.active_threshold_alerts
         )
-        # With logging off, a stored episode may have ended unrecorded: never resume it.
-        for restoration in self.detection_engine.restore_active(
-            active_alerts, resume=self.settings.event_logging_enabled
-        ):
+        # A stored episode continues only if the previous run stopped cleanly with it
+        # open. With logging off, one may have ended unrecorded: never resume it.
+        resumable = (
+            self._continuing_episodes if self.settings.event_logging_enabled else frozenset()
+        )
+        for restoration in self.detection_engine.restore_active(active_alerts, resumable):
             self._restore_threshold_episode(restoration)
 
     def _restore_threshold_episode(self, restoration: EpisodeRestoration) -> None:
@@ -306,6 +314,14 @@ class TelemetryService:
     async def _start_workers(self) -> None:
         if not self.storage.persistence_available:
             await self.initialize_storage()
+        if self._continuing_episodes is not None and not self._session_open:
+            # Started again after a recorded stop: a later process loss must not
+            # reuse that record. Nothing is resumed; the engine already holds state.
+            try:
+                await asyncio.to_thread(self.database.begin_monitoring_session)
+                self._session_open = True
+            except Exception as exc:
+                self._mark_storage_failure(exc)
         self._stop.clear()
         self._history_task = asyncio.create_task(
             self._history_writer(), name="ghostwatch-history-writer"
@@ -358,12 +374,38 @@ class TelemetryService:
             self._history_queue.get_nowait()
             self._history_queue.task_done()
             self.history_dropped_samples += 1
+        await self._end_monitoring_session()
         async with self._clients_lock:
             clients = list(self.clients)
         for client in clients:
             await self.unregister_client(client)
             with suppress(Exception):
                 await asyncio.wait_for(client.close(code=1001), timeout=self.send_timeout)
+
+    def _open_episode_ids(self) -> set[str]:
+        return {
+            episode for rule in THRESHOLD_ALERT_RULES
+            if (episode := self.detection_engine.active_episode_id(rule)) is not None
+        }
+
+    async def _end_monitoring_session(self) -> None:
+        """Record a clean stop and the episodes the next start may continue.
+
+        Only episodes open in the engine are listed, so one whose recovery is still
+        queued, or that was never confirmed after startup, is not continued. If this
+        write fails the record stays "running" and the next start resumes nothing.
+        """
+        if not self._session_open:
+            return
+        # With logging off nothing is resumed anyway, and live-only episode
+        # identities from the opt-out must not reach disk.
+        episodes = self._open_episode_ids() if self.settings.event_logging_enabled else set()
+        try:
+            await asyncio.to_thread(self.database.end_monitoring_session, episodes)
+        except Exception as exc:
+            LOGGER.warning("Clean stop could not be recorded (%s)", type(exc).__name__)
+            return
+        self._session_open = False
 
     async def register_client(self, client: WebSocket) -> bool:
         async with self._clients_lock:
@@ -1126,7 +1168,7 @@ class TelemetryService:
         return {
             "pending_writes": (
                 len(self._pending_alerts) + len(self._pending_events)
-                + len(self._pending_alert_updates) + int(self._close_ended_episodes)
+                + len(self._pending_alert_updates)
             ),
             "dropped_alert_writes": self.dropped_alert_writes,
             "dropped_event_writes": self.dropped_event_writes,
@@ -1458,10 +1500,7 @@ class TelemetryService:
             return
         if recovering:
             self._mark_storage_success(version)
-        if (
-            self._pending_alerts or self._pending_events or self._pending_alert_updates
-            or self._close_ended_episodes
-        ):
+        if self._pending_alerts or self._pending_events or self._pending_alert_updates:
             await self._flush_pending()
 
     async def _load_missed_state(self) -> None:
@@ -1475,7 +1514,6 @@ class TelemetryService:
             self._discard_pending_writes()
 
     def _discard_pending_writes(self) -> None:
-        self._close_ended_episodes = False
         self._pending_alerts.clear()
         self._pending_events.clear()
         self._pending_alert_updates.clear()
@@ -1500,18 +1538,6 @@ class TelemetryService:
             return
         if not self.storage.persistence_available or self._persisted_state_missing:
             return
-        if self._close_ended_episodes:
-            still_open = {
-                episode for rule in THRESHOLD_ALERT_RULES
-                if (episode := self.detection_engine.active_episode_id(rule)) is not None
-            }
-            try:
-                await asyncio.to_thread(self.database.close_ended_episodes, still_open)
-            except Exception as exc:
-                self._mark_storage_failure(exc)
-                return
-            self._close_ended_episodes = False
-            self.storage = self.storage.model_copy(update=self._queue_health())
         for alert_id in list(self._pending_alerts):
             if not self.settings.event_logging_enabled:
                 self._discard_pending_writes()
@@ -1789,17 +1815,24 @@ class TelemetryService:
 
     async def update_settings(self, settings: Settings) -> Settings:
         try:
-            await asyncio.to_thread(self.database.save_settings, settings)
-            was_logging = self.settings.event_logging_enabled
-            # A saved opt-out takes effect even if the maintenance below fails.
-            self._apply_saved_configuration("settings", settings)
-            if not settings.event_logging_enabled:
-                self._logging_generation += 1
-                self._discard_pending_writes()
-            elif not was_logging:
-                # Episodes that ended during the opt-out are still stored as open.
-                self._close_ended_episodes = True
-                self.storage = self.storage.model_copy(update=self._queue_health())
+            if settings.event_logging_enabled and not self.settings.event_logging_enabled:
+                # Episodes that ended during the opt-out are still stored as open. They
+                # are closed in the transaction that saves the setting, so success is
+                # never reported (or a crash survived) with them resumable. Holding the
+                # collection lock keeps a recovery from landing between the snapshot of
+                # open episodes and the commit.
+                async with self._collection_lock:
+                    await asyncio.to_thread(
+                        self.database.save_settings, settings, self._open_episode_ids()
+                    )
+                    self._apply_saved_configuration("settings", settings)
+            else:
+                await asyncio.to_thread(self.database.save_settings, settings)
+                # A saved opt-out takes effect even if the maintenance below fails.
+                self._apply_saved_configuration("settings", settings)
+                if not settings.event_logging_enabled:
+                    self._logging_generation += 1
+                    self._discard_pending_writes()
             await asyncio.to_thread(
                 self.database.enforce_retention, settings.alert_retention
             )

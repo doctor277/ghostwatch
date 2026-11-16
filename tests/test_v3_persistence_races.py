@@ -240,11 +240,10 @@ async def test_update_failing_after_logging_returns_is_not_queued(service, monke
     held.released.set()
     await task
 
-    # The update from before the opt-out is not queued. Turning logging back on
-    # schedules only the stored-episode reconciliation, which waits for storage.
+    # The update from before the opt-out is not queued, and turning logging back on
+    # committed its episode reconciliation with the setting, so nothing is pending.
     assert not service._pending_alert_updates and not service._pending_alerts
-    assert service._close_ended_episodes is True
-    assert service.storage.pending_writes == 1
+    assert service.storage.pending_writes == 0
     assert live(service).persistence_pending is False
 
     monkeypatch.undo()

@@ -2,9 +2,10 @@
 
 Contract (Settings "Enable local event logging", docs/V3_RESILIENCE_AUDIT.md): while
 logging is off, nothing about alerts or events is written to SQLite; live state keeps
-working. When logging is turned back on, stored episodes that ended during the opt-out
-are marked ended (condition_active only), without any time, explanation or evidence
-from the opt-out period.
+working. Turning logging back on saves the setting and marks stored episodes that ended
+during the opt-out as ended (condition_active only) in one transaction, without any
+time, explanation or evidence from the opt-out period. If that transaction fails, the
+setting is not changed. Restart behavior is covered in test_v3_episode_restart.py.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import sqlite3
 import pytest
 
 from app.models import Alert
-from app.service import MAX_PENDING_WRITES, TelemetryService
+from app.service import MAX_PENDING_WRITES, StorageUnavailableError, TelemetryService
 from app.storage.database import Database
 from tests.test_v3_alert_lifecycle import (
     BREACH,
@@ -65,7 +66,7 @@ async def restarted(service, clock, system_sample, network_sample):
 
 
 def break_storage(service, monkeypatch):
-    for name in ("add_alert", "add_event", "close_ended_episodes"):
+    for name in ("add_alert", "add_event", "save_settings"):
         monkeypatch.setattr(service.database, name, outage)
     service._mark_storage_failure(sqlite3.OperationalError("synthetic outage"))
 
@@ -149,7 +150,7 @@ async def test_restart_with_logging_off_does_not_resume_an_unconfirmed_episode(
 
     stale = again._live_alert(opened.id)
     assert stale.condition_active is False
-    assert stale.last_recovery == at(200)
+    assert stale.last_recovery is None  # The recovery seen while off is not recorded.
     assert "not confirmed" in stale.explanation
     live_open = again.detection_engine.active_episode_id("memory")
     if breached_at_restart:
@@ -184,33 +185,7 @@ async def test_restart_after_reenabling_does_not_resume_an_ended_episode(
     assert rows[new_id].first_occurrence == at(210)
 
 
-async def test_reconciliation_after_reenabling_waits_out_a_storage_outage(
-    tmp_path, system_sample, network_sample, monkeypatch
-):
-    service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
-    await set_logging(service, False)
-    system_sample.memory_percent = CLEAR
-    await run(service, clock, 72, 80)
-    await set_logging(service, True)
-    # update_settings succeeded; the reconciliation write is what fails.
-    break_storage(service, monkeypatch)
-    await run(service, clock, 80, 84)
-    await settle(service)
-    # The reconciliation is pending and counted, alongside queued outage events.
-    assert service._close_ended_episodes is True
-    assert service.storage.pending_writes >= 1
-    assert memory_rows(service)[0].condition_active is True
-
-    mend_storage(service, monkeypatch)
-    await run(service, clock, 84, 88)
-    await settle(service)
-
-    [stored] = memory_rows(service)
-    assert stored == opened.model_copy(update={"condition_active": False})
-    assert service.storage.pending_writes == 0
-
-
-async def test_opting_out_again_cancels_a_pending_reconciliation(
+async def test_opting_out_after_a_refused_reenable_writes_nothing(
     tmp_path, system_sample, network_sample, monkeypatch
 ):
     service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
@@ -219,8 +194,9 @@ async def test_opting_out_again_cancels_a_pending_reconciliation(
     await set_logging(service, False)
     system_sample.memory_percent = CLEAR
     await run(service, clock, 72, 80)
-    await set_logging(service, True)
     break_storage(service, monkeypatch)
+    with pytest.raises(StorageUnavailableError):
+        await set_logging(service, True)
     await run(service, clock, 80, 84)
     mend_storage(service, monkeypatch)
     await set_logging(service, False)
@@ -306,11 +282,12 @@ async def test_queue_saturation_evicts_other_records_before_episode_transitions(
     assert stored.condition_active is False and stored.last_recovery == at(72)
 
 
-async def test_restart_with_a_recovery_still_queued_closes_the_episode_from_live_data(
+async def test_restart_with_a_recovery_still_queued_closes_the_episode_as_unconfirmed(
     tmp_path, system_sample, network_sample, monkeypatch
 ):
-    # Queued writes are memory-only: a restart loses them by design. The stored row
-    # is then resumed, and the first readable sample closes it again.
+    # Queued writes are memory-only: a restart loses them by design. The stop records
+    # only episodes still open live, so the stored row is not resumed. The first
+    # readable sample closes it as not confirmed; the lost recovery is not re-invented.
     service, clock, opened = await open_stored_episode(tmp_path, system_sample, network_sample)
     break_storage(service, monkeypatch)
     system_sample.memory_percent = CLEAR
@@ -324,5 +301,6 @@ async def test_restart_with_a_recovery_still_queued_closes_the_episode_from_live
     await settle(again)
 
     [stored] = memory_rows(again)
-    assert stored.condition_active is False and stored.last_recovery == at(200)
+    assert stored.condition_active is False and "not confirmed" in stored.explanation
+    assert stored.last_recovery is None
     assert stored.occurrence_count == opened.occurrence_count

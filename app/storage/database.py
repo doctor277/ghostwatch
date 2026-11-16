@@ -40,6 +40,8 @@ from app.time_utils import as_utc, parse_utc, utc_iso
 
 LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 3
+# schema_meta row recording how the last run ended; see begin_monitoring_session.
+SESSION_KEY = "monitoring_session"
 ROLLUP_METRICS = (
     "cpu_percent",
     "memory_percent",
@@ -651,9 +653,19 @@ class Database:
             LOGGER.warning("Stored settings were invalid; safe defaults were restored")
             return Settings()
 
-    def save_settings(self, settings: Settings) -> None:
+    def save_settings(
+        self, settings: Settings, still_open: Iterable[str] | None = None
+    ) -> None:
+        """Save settings; with still_open, also close stored episodes not in it.
+
+        Both commit in one transaction, so turning event logging back on can never be
+        stored without the episodes that ended during the opt-out being marked ended.
+        """
         payload = settings.model_dump_json()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if still_open is not None:
+                self._close_ended_episodes(connection, still_open)
             connection.execute(
                 "INSERT INTO settings (id, payload) VALUES (?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
@@ -915,7 +927,8 @@ class Database:
                 LOGGER.warning("Active alert could not be restored (%s)", type(exc).__name__)
         return alerts
 
-    def close_ended_episodes(self, still_open: Iterable[str]) -> int:
+    @staticmethod
+    def _close_ended_episodes(connection: sqlite3.Connection, still_open: Iterable[str]) -> None:
         """Mark stored open episodes ended, except those still open live.
 
         Changes condition_active only, so no detail of how or when an episode ended
@@ -926,13 +939,50 @@ class Database:
         rule_marks = ", ".join("?" for _ in rules)
         # NOT IN () is not valid SQL, and NOT IN (NULL) matches nothing.
         keep_clause = f" AND id NOT IN ({', '.join('?' for _ in keep)})" if keep else ""
+        connection.execute(
+            f"UPDATE alerts SET condition_active = 0 WHERE condition_active = 1 "  # noqa: S608 - placeholders only
+            f"AND rule_id IN ({rule_marks}){keep_clause}",
+            (*rules, *keep),
+        )
+
+    def begin_monitoring_session(self) -> frozenset[str]:
+        """Mark a run as started; return the episodes the previous run left open.
+
+        Only a run that stopped cleanly records which stored episodes it still saw
+        open. Any other ending (process loss, or a stop that could not be recorded)
+        leaves "running", so no stored episode can be proven to continue.
+        """
         with self._lock, self._connect() as connection:
-            cursor = connection.execute(
-                f"UPDATE alerts SET condition_active = 0 WHERE condition_active = 1 "  # noqa: S608 - placeholders only
-                f"AND rule_id IN ({rule_marks}){keep_clause}",
-                (*rules, *keep),
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = ?", (SESSION_KEY,)
+            ).fetchone()
+            self._save_session(connection, {"state": "running"})
+        try:
+            record = json.loads(row["value"]) if row is not None else None
+        except (json.JSONDecodeError, TypeError):
+            record = None
+        if not isinstance(record, dict) or record.get("state") != "stopped":
+            return frozenset()
+        episodes = record.get("open_episodes")
+        if not isinstance(episodes, list) or not all(isinstance(item, str) for item in episodes):
+            LOGGER.warning("Stored monitoring session was invalid; no episode is resumed")
+            return frozenset()
+        return frozenset(episodes)
+
+    def end_monitoring_session(self, open_episodes: Iterable[str]) -> None:
+        with self._lock, self._connect() as connection:
+            self._save_session(
+                connection, {"state": "stopped", "open_episodes": sorted(open_episodes)}
             )
-            return cursor.rowcount
+
+    @staticmethod
+    def _save_session(connection: sqlite3.Connection, record: dict[str, object]) -> None:
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SESSION_KEY, json.dumps(record)),
+        )
 
     def get_alert(self, alert_id: str) -> Alert | None:
         with self._lock, self._connect() as connection:
