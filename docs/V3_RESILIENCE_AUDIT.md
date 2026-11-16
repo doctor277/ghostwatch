@@ -1500,8 +1500,66 @@ it leads to is made after logging is turned back on, and changes one column of r
 that already exist. Queued writes, including that reconciliation, are memory-only: a
 crash or restart before they run loses them, and the first readable sample after
 restart closes the stored episode again (with logging on, that closure is stored).
+*Superseded by the [restart blocker corrections](#restart-blocker-corrections-2026-11-16):
+independent verification showed that a crash in that window resumed the stale episode.
+The reconciliation now commits with the setting, and a stored episode is resumed only
+after a recorded clean stop.*
 
 **Network collector cost.** The reviewer's 100,000-socket slowdown is a follow-up, not a release blocker, and no redesign was made. Measured with no test suite running (see [validation](CURRENT_BETA_VALIDATION.md#independent-qa-corrections---november-12-2026)): at 100,000 synthetic sockets a collection takes about 345 ms at `639fdfd`, 558 ms at `321fa7a` and 510-518 ms at `664ff59` with all sockets open, so the slowdown is real, about 50% over the base. It comes from building a ranked detail candidate for every socket. Collection runs on a worker thread, and the live hosts measured so far had about 600 sockets.
+
+## Restart blocker corrections, 2026-11-16
+
+Independent verification confirmed the four corrections above and reproduced two more
+release blockers. Both were reproduced on disposable SQLite databases at `376253f`
+before any change, by abandoning the service object without `stop()` or a flush to
+simulate process loss, then starting a new service on the same file with memory still
+breached. In both cases the old row stayed `condition_active = 1` and the breach after
+restart continued its identity (occurrence count 2 became 3).
+
+| Blocker | Reproduction | Root cause | Correction |
+| --- | --- | --- | --- |
+| 1. Re-enable reconciliation was memory-only | Active episode stored; logging off; recovery while off; logging on (`update_settings` returned success); process loss before the next flush; restart breached | Re-enabling set an in-memory flag, and the close ran on a later flush. Startup resumed every stored open episode when logging was on | `Database.save_settings(settings, still_open)` closes stored open episodes not open live and saves the setting in one `BEGIN IMMEDIATE` transaction. The service holds the collection lock around the snapshot and commit, so a recovery cannot land between them. If the transaction fails, the API reports the failure and logging stays off in memory and on disk. The deferred flag and its flush step are removed |
+| 2. Outage recovery lost across restart | Active episode stored; storage unavailable; recovery queued in memory; process loss before replay; restart breached | Startup could not tell a clean restart from process loss, so it resumed the stored row as if the episode had continued | A `monitoring_session` row in the existing `schema_meta` table (no schema change). Startup reads it and writes `running` in one transaction. A clean `stop()` writes `stopped` with the IDs of the episodes the engine still has open. Only those are resumed, and only with logging on. Any other stored open episode is "not confirmed": its first readable sample closes it, and a breach is a new episode |
+
+**Not-confirmed closure.** A stored episode that is not resumed is closed with
+`condition_active = 0`, occurrence delta 0, and the explanation "Ended: not confirmed
+after restart". Its timestamp, evidence, `last_recovery`, counts, first and last
+occurrence, acknowledge and dismiss state and incident link are kept as stored. No
+recovery time or evidence is taken from the restart sample. The closure adds no
+timeline event, so the only new detection event is the new episode's own. It is
+written only with logging on, through the normal queue, so it waits out an outage; with
+logging off it stays live-only. Until the rule's metric is readable the episode is left
+as stored and nothing is linked to it. The dashboard shows `STATE: ENDED` instead of
+`RECOVERED` for an ended episode without a recorded recovery.
+
+**What a clean stop records.** Only episodes open in the detection engine are listed.
+An episode whose recovery is still queued, or that was never confirmed after the last
+start, is not listed and so is not resumed. With logging off the list is empty, so no
+live-only episode identity from the opt-out reaches disk. If the record cannot be
+written, it stays `running` and the next start resumes nothing. A start after a stop
+in the same process writes `running` again. A malformed record resumes nothing.
+
+**Policy and limits.**
+
+- Queued transitions remain memory-only. Abrupt process loss (a crash, a killed
+  process, power loss) still loses any recovery, count or operator change not yet
+  written. What changes is that the next start no longer continues a stored episode it
+  cannot vouch for. There is no exactly-once persistence or crash-recovery guarantee.
+- The conservative policy has a cost: after any unclean exit, a breach that really did
+  continue is recorded as a closed "not confirmed" episode plus a new one with its own
+  timeline event. The first start after upgrading from a build without this record is
+  treated the same way.
+- Continuity across a clean restart still assumes nothing happened in the unobserved
+  gap between runs. A run that never reached SQLite (storage unavailable from start to
+  exit) leaves no record, so the next start relies on the last run that did.
+- A clear sample at the first readable sample after a clean restart is unchanged: it
+  is an observed clear and records `last_recovery`.
+
+Regression coverage is `tests/test_v3_episode_restart.py` and one Playwright case.
+Existing tests that restarted without stopping the first service now call `stop()`
+where they test a clean restart. Tests that asserted the old crash-resume behavior or a
+`last_recovery` taken from the restart sample were updated to the contract above, and
+the deferred-reconciliation outage test was replaced by the fail-closed one.
 
 ## Open findings
 
@@ -1558,6 +1616,9 @@ These come from code review and have not been reproduced, unless noted.
   restarts during an outage loses that evidence.
 - An update to an evicted alert reaches the database only if its row already exists.
 - The storage recovery notice is not stored when the event queue is full.
+- Queued alert transitions are memory-only and do not survive abrupt process loss.
+  After an unclean exit, stored open episodes are closed as "not confirmed" instead of
+  resumed; see [Restart blocker corrections](#restart-blocker-corrections-2026-11-16).
 - An update saved by the next pass after a first write is lost if the process stops
   first. The queue is memory only.
 - `Database.add_alert` accepts observation deltas. Calling it again for an observation

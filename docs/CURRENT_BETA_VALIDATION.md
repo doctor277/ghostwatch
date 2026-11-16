@@ -10,6 +10,7 @@ This document records GhostWatch V3 local-beta evidence in three separate groups
 | --- | --- | --- | --- |
 | Latest published CI | `c162eed` only, [hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) | Windows Python 3.11.9: 601 passed. Windows Python 3.13.17: 601 passed. Synthetic Chromium: 17 passed. Ruff, compilation and JavaScript syntax passed. One known Starlette/httpx deprecation warning per Python job | Any later commit |
 | Local-only results, remaining PID ownership corrections | The local correction following `c6d7724`; see [below](#pid-ownership-correction-after-c6d7724---november-11-2026) | 802 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, other operating systems, 32-bit Python, other browser engines |
+| Local-only results, restart blocker corrections | `bd6e44c` and this documentation change on `feat/v3-final-stabilization`; see [below](#restart-blocker-corrections---november-16-2026) | 881 passed, 0 failed, 0 skipped, with one warning on Python 3.11.9. 47 passed on synthetic Chromium (one worker). Release archive checked | Hosted CI, Python 3.13, any other browser engine, an eight-hour soak, a live run of these commits, a real killed process (process loss is simulated in tests) |
 | Local-only results, independent QA corrections | `664ff59` and this documentation change on `feat/v3-final-stabilization`; see [below](#independent-qa-corrections---november-12-2026) | 865 passed, 0 failed, 0 skipped, with one warning on Python 3.11.9. 46 passed on synthetic Chromium (one worker). Release archive checked | Hosted CI, Python 3.13, any other browser engine, an eight-hour soak, a live run of these commits |
 | Local-only results, final stabilization | The commits after `639fdfd` on `feat/v3-final-stabilization`; see [below](#final-stabilization---november-11-2026) | 844 passed with one warning on Python 3.11.9. 46 passed on synthetic Chromium. Bounded live runs (60 s to 5 min) against real collectors | The QA corrections below, hosted CI, Python 3.13, any other browser engine, an eight-hour soak |
 | Local-only results, process accuracy review corrections | The correction following `83343f3` on `fix/v3-process-accuracy`; see [below](#process-accuracy-review-corrections---november-11-2026) | 779 passed with one warning on Python 3.11.9. 43 passed on synthetic Chromium | Hosted CI, Python 3.13, any other browser engine, 32-bit Python |
@@ -77,7 +78,9 @@ replace the original timeline detection. A recovery-only delta does not recreate
 retention-expired database row.
 
 No installation or configuration change is required. Existing beta active records
-continue under their stored IDs. The
+continue under their stored IDs (superseded on November 16: a stored open episode
+continues only after a recorded clean stop, so the first start after upgrading closes
+it as not confirmed; see the restart blocker corrections). The
 [correction notes](V3_RESILIENCE_AUDIT.md#alert-episode-correction-after-codex-review-2026-11-10)
 describe the five root causes, regression scenarios, retention policy and remaining
 limitations.
@@ -163,6 +166,55 @@ No push, merge, release build, hosted CI, Python 3.13 or non-Windows run is part
 this correction. PID-based psutil reads remain non-atomic; boundary checks fail
 closed on detectable ownership uncertainty, with timestamp-resolution limits
 documented in the resilience audit.
+
+## Restart blocker corrections - November 16, 2026
+
+Local work on `feat/v3-final-stabilization`, following `376253f`. No push, merge or
+release is authorized. Independent verification confirmed the four QA corrections
+below and reproduced two remaining restart blockers. Root causes, the correction and
+the policy are in the
+[resilience audit](V3_RESILIENCE_AUDIT.md#restart-blocker-corrections-2026-11-16).
+
+| Commit | Change |
+| --- | --- |
+| `bd6e44c` | Re-enabling logging closes ended episodes in the same transaction as the setting, or fails and leaves logging off. A stored open episode is resumed only after a recorded clean stop listed it as open; otherwise it is closed as not confirmed without an invented recovery, and a breach is a new episode. The dashboard shows `ENDED` for an ended episode without a recorded recovery |
+
+**Reproduction before the change.** A scratch script outside the repository used
+disposable SQLite files and abandoned the first service without `stop()` or a flush.
+At `376253f`, for both blockers, the stored row was still `condition_active = 1` after
+restart and the new breach continued its ID (occurrence count 2 became 3). With
+`bd6e44c` the same script showed the old row ended (count 2 kept) and a new ID with
+count 1. The 17 new cases in `tests/test_v3_episode_restart.py` were run first against
+`376253f`: 16 failed and 1 passed. The behavioral failures were the reconciliation not
+being durable when the setting returned, enabling during an outage not failing, the
+enable not waiting for an in-progress collection, `last_recovery` taken from the
+restart sample, the stale ID being resumed, and an unreadable first sample resuming
+it. The others failed because the new storage API (`save_settings` with `still_open`,
+and the session record) did not exist. The one that passed is
+the clean-stop case, whose behavior is meant to be unchanged.
+
+Environment: Windows 11 Home 10.0.26300, Python 3.11.9 (pytest 9.1.1, psutil 7.1.0,
+FastAPI 0.157.0), Node 22.23.2, Playwright 1.64.1. Suites ran one at a time.
+
+| Check | Result |
+| --- | --- |
+| New regressions, alert lifecycle, logging opt-out and persistence race files | `141 passed` |
+| Complete pytest suite, fresh private `--basetemp`, JUnit outside the repository | `881 passed, 0 failed, 0 skipped, 0 errors, 1 warning` (the known Starlette/httpx deprecation) in 328.42 s |
+| Complete Playwright suite, one worker | `47 passed, 0 failed, 0 skipped` (45 desktop, 2 mobile Chromium) in 2.1 min |
+| Ruff over the repository | `All checks passed!` |
+| Python compilation of `app`, `scripts` and `tests` | Passed |
+| JavaScript syntax checks | `9 files passed, 0 failed` |
+| `git diff --check` | Passed |
+| Default-deny release archive, built outside the repository and not published | 131 files (the new test file is the one addition), zip integrity passed. No databases, logs, caches, environments, `data/` or test output; no profile paths, e-mail addresses or private keys. The one image is the approved synthetic screenshot, unchanged. `LICENSE` is MIT |
+
+**Test changes.** One test was removed: the deferred-reconciliation outage test, whose
+behavior no longer exists. The fail-closed test replaces it. Tests that restarted
+without stopping the first service now call `stop()` where they test a clean restart.
+Tests that asserted crash-resume, a resumed pre-session beta identity, or a
+`last_recovery` taken from the restart sample now assert the new contract.
+
+Not part of this record: hosted CI, Python 3.13, other browser engines, a live
+`scripts/live_smoke.py` run, a real killed process, and the eight-hour soak.
 
 ## Independent QA corrections - November 12, 2026
 
