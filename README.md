@@ -68,6 +68,10 @@ Requirements:
 
 The launcher creates `.venv`, verifies the Python version, installs dependencies when the requirements hash changes, checks port `8765`, starts Uvicorn on `127.0.0.1`, waits for the health endpoint, and opens the dashboard. Use `-NoBrowser` to suppress automatic browser launch. Press `Ctrl+C` in the launcher window to stop GhostWatch.
 
+### Upgrading an existing installation
+
+No migration or configuration step is needed, and the database schema version is unchanged. Stop GhostWatch with `Ctrl+C` before upgrading. An open threshold alert continues across a restart only if GhostWatch recorded a clean stop. Earlier builds recorded none, so on the first start after the upgrade any alert still open is closed as **ENDED** ("not confirmed after restart"). A breach that is still present opens a new alert with its own timeline entry. The closed alert keeps its evidence, timestamps, occurrence count, acknowledge and dismiss state, and incident link. It is never shown as recovered, because no recovery was observed. The same applies after any crash or forced termination. Details: [restart blocker corrections](docs/V3_RESILIENCE_AUDIT.md#restart-blocker-corrections-2026-11-16).
+
 ### Demo Mode
 
 Open **Settings** and select **Enter Demo Mode**. A yellow banner identifies the data as synthetic and not saved. Demo Mode does not scan local folders or persist its observations, making it the safest way to explore the complete interface.
@@ -158,7 +162,7 @@ Report suspected vulnerabilities privately as described in [SECURITY.md](SECURIT
 - History row caps bound the database size and can hold less than the configured retention hours. At about 2,700 process rows per minute, the 2,000,000-row process cap covers roughly 12 hours.
 - Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
 - Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI through `c162eed` only; it has not run on the later local commits.
-- Pending alert, event, and operator writes are held in bounded memory. Abrupt termination can lose them, so GhostWatch gives no durable exactly-once guarantee across a crash.
+- Pending alert, event, and operator writes are held in bounded memory. Abrupt termination can lose them, so GhostWatch gives no durable exactly-once guarantee across a crash. After an unclean exit, open threshold alerts are closed as not confirmed instead of continued, so a condition that never cleared appears as two alerts.
 - The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification. Bounded live runs of up to five minutes have been executed; no 30-60 minute stability run or eight-hour soak has been executed.
 - Historical RC2-RC5 and V2 documents are retained for engineering traceability and do not describe the current beta state.
 

@@ -413,7 +413,10 @@ function renderAlerts() {
       const last = alert.last_occurrence ? new Date(alert.last_occurrence).toLocaleString() : "unknown";
       const recovery = alert.last_recovery ? new Date(alert.last_recovery).toLocaleString() : "none observed";
       // An episode can end without an observed recovery (not confirmed after restart).
-      const ended = alert.last_recovery ? "RECOVERED" : "ENDED";
+      // A recovery recorded before the last occurrence belongs to an earlier cycle.
+      const recovered = alert.last_recovery
+        && (!alert.last_occurrence || new Date(alert.last_recovery) >= new Date(alert.last_occurrence));
+      const ended = recovered ? "RECOVERED" : "ENDED";
       copy.append(element("div", "evidence", `STATE: ${alert.condition_active === false ? ended : "ACTIVE"} · First: ${first} · Last: ${last} · Occurrences: ${alert.occurrence_count || 0} · Last recovery: ${recovery}`));
     }
     if (alert.persistence_pending) copy.append(element("div", "evidence", "PERSISTENCE PENDING · live memory state"));

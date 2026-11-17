@@ -151,6 +151,22 @@ test("an episode ended without an observed recovery is not shown as recovered", 
   await expect(page.locator("#alert-list")).not.toContainText("RECOVERED");
 });
 
+test("a recovery from an earlier cycle does not mark an unconfirmed end as recovered", async ({ page }) => {
+  const now = Date.now();
+  backend.state.snapshot.alerts = [{
+    id: "synthetic-legacy-alert", timestamp: new Date(now).toISOString(), severity: "CRITICAL", source: "System",
+    metric: "Memory 95.0%", explanation: "Ended: not confirmed after restart.",
+    acknowledged: true, dismissed: false, rule_id: "memory", evidence: { observed_percent: 95, threshold_percent: 90 },
+    persistence_pending: false, first_occurrence: new Date(now - 600000).toISOString(),
+    last_occurrence: new Date(now - 60000).toISOString(), occurrence_count: 3,
+    condition_active: false, last_recovery: new Date(now - 300000).toISOString(),
+  }];
+  backend.sendSnapshot();
+  await page.locator('[data-view="alerts"]').click();
+  await expect(page.locator("#alert-list")).toContainText("STATE: ENDED");
+  await expect(page.locator("#alert-list")).not.toContainText("RECOVERED");
+});
+
 test("settings persist across a browser reload", async ({ page }) => {
   await page.locator('[data-view="settings"]').click();
   await page.locator('#settings-form [name="refresh_interval"]').fill("5");

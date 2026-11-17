@@ -178,6 +178,8 @@ the policy are in the
 | Commit | Change |
 | --- | --- |
 | `bd6e44c` | Re-enabling logging closes ended episodes in the same transaction as the setting, or fails and leaves logging off. A stored open episode is resumed only after a recorded clean stop listed it as open; otherwise it is closed as not confirmed without an invented recovery, and a breach is a new episode. The dashboard shows `ENDED` for an ended episode without a recorded recovery |
+| `a5f0817` | Audit and validation record |
+| (this change) | The dashboard reads `RECOVERED` only for a recovery at or after the last occurrence, so an older episode's earlier-cycle recovery cannot mark an unconfirmed end as recovered (one Playwright case). README and audit document the upgrade behavior |
 
 **Reproduction before the change.** A scratch script outside the repository used
 disposable SQLite files and abandoned the first service without `stop()` or a flush.
@@ -204,6 +206,7 @@ FastAPI 0.157.0), Node 22.23.2, Playwright 1.64.1. Suites ran one at a time.
 | Ruff over the repository | `All checks passed!` |
 | Python compilation of `app`, `scripts` and `tests` | Passed |
 | JavaScript syntax checks | `9 files passed, 0 failed` |
+| Label follow-up: complete Playwright suite, one worker | `48 passed, 0 failed, 0 skipped` in 1.7 min. The new case failed against the `bd6e44c` dashboard and passes with the change. JavaScript syntax, `git diff --check` and 95 packaging, release and frontend tests passed. The backend is unchanged, so the 881-test pytest result stands |
 | `git diff --check` | Passed |
 | Default-deny release archive, built outside the repository and not published | 131 files (the new test file is the one addition), zip integrity passed. No databases, logs, caches, environments, `data/` or test output; no profile paths, e-mail addresses or private keys. The one image is the approved synthetic screenshot, unchanged. `LICENSE` is MIT |
 

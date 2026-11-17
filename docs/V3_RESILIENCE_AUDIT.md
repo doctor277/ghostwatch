@@ -1530,7 +1530,18 @@ timeline event, so the only new detection event is the new episode's own. It is
 written only with logging on, through the normal queue, so it waits out an outage; with
 logging off it stays live-only. Until the rule's metric is readable the episode is left
 as stored and nothing is linked to it. The dashboard shows `STATE: ENDED` instead of
-`RECOVERED` for an ended episode without a recorded recovery.
+`RECOVERED` unless a recovery was recorded at or after the episode's last occurrence. An
+episode from an older build can carry a real recovery from an earlier cycle (those
+builds reopened the same ID); that timestamp is kept as history but does not make an
+unconfirmed end read as recovered.
+
+**Upgrading an existing installation.** No migration or configuration step is needed,
+and `SCHEMA_VERSION` stays 3. Earlier builds never wrote `monitoring_session`, so the
+first start after upgrading treats every stored open threshold episode as not
+confirmed, as after a crash. Each one is closed at its first readable sample with its
+history intact, and a breach still present opens a new episode with its own timeline
+event. Later clean stops record the session normally. The README's quick start
+describes this for users.
 
 **What a clean stop records.** Only episodes open in the detection engine are listed.
 An episode whose recovery is still queued, or that was never confirmed after the last
