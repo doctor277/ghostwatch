@@ -5,7 +5,7 @@ import logging
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +40,8 @@ from app.time_utils import as_utc, parse_utc, utc_iso
 
 LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 3
+# schema_meta row recording how the last run ended; see begin_monitoring_session.
+SESSION_KEY = "monitoring_session"
 ROLLUP_METRICS = (
     "cpu_percent",
     "memory_percent",
@@ -651,9 +653,19 @@ class Database:
             LOGGER.warning("Stored settings were invalid; safe defaults were restored")
             return Settings()
 
-    def save_settings(self, settings: Settings) -> None:
+    def save_settings(
+        self, settings: Settings, still_open: Iterable[str] | None = None
+    ) -> None:
+        """Save settings; with still_open, also close stored episodes not in it.
+
+        Both commit in one transaction, so turning event logging back on can never be
+        stored without the episodes that ended during the opt-out being marked ended.
+        """
         payload = settings.model_dump_json()
         with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if still_open is not None:
+                self._close_ended_episodes(connection, still_open)
             connection.execute(
                 "INSERT INTO settings (id, payload) VALUES (?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
@@ -860,10 +872,18 @@ class Database:
 
     @staticmethod
     def _enforce_retention(connection: sqlite3.Connection, retention: int) -> None:
+        # An open grouped episode only reports once per cooldown, so a burst of newer
+        # alerts could delete it while active; its next report would then recreate a
+        # partial row without its count or operator state. Open episodes are kept,
+        # at most one slot per grouped rule, so retention stays bounded.
+        rules = sorted(GROUPED_ALERT_RULES)
+        placeholders = ", ".join("?" for _ in rules)
         connection.execute(
             "DELETE FROM alerts WHERE id NOT IN "
-            "(SELECT id FROM alerts ORDER BY timestamp DESC LIMIT ?)",
-            (retention,),
+            "(SELECT id FROM alerts ORDER BY timestamp DESC LIMIT ?) "
+            "AND id NOT IN (SELECT id FROM alerts WHERE condition_active = 1 "
+            f"AND rule_id IN ({placeholders}) ORDER BY timestamp DESC LIMIT ?)",
+            (retention, *rules, len(rules)),
         )
 
     def list_alerts(self, limit: int = 100, include_dismissed: bool = False) -> list[Alert]:
@@ -906,6 +926,63 @@ class Database:
             except (ValueError, TypeError) as exc:
                 LOGGER.warning("Active alert could not be restored (%s)", type(exc).__name__)
         return alerts
+
+    @staticmethod
+    def _close_ended_episodes(connection: sqlite3.Connection, still_open: Iterable[str]) -> None:
+        """Mark stored open episodes ended, except those still open live.
+
+        Changes condition_active only, so no detail of how or when an episode ended
+        (for example while event logging was off) is written.
+        """
+        keep = list(still_open)
+        rules = tuple(THRESHOLD_ALERT_RULES)
+        rule_marks = ", ".join("?" for _ in rules)
+        # NOT IN () is not valid SQL, and NOT IN (NULL) matches nothing.
+        keep_clause = f" AND id NOT IN ({', '.join('?' for _ in keep)})" if keep else ""
+        connection.execute(
+            f"UPDATE alerts SET condition_active = 0 WHERE condition_active = 1 "  # noqa: S608 - placeholders only
+            f"AND rule_id IN ({rule_marks}){keep_clause}",
+            (*rules, *keep),
+        )
+
+    def begin_monitoring_session(self) -> frozenset[str]:
+        """Mark a run as started; return the episodes the previous run left open.
+
+        Only a run that stopped cleanly records which stored episodes it still saw
+        open. Any other ending (process loss, or a stop that could not be recorded)
+        leaves "running", so no stored episode can be proven to continue.
+        """
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = ?", (SESSION_KEY,)
+            ).fetchone()
+            self._save_session(connection, {"state": "running"})
+        try:
+            record = json.loads(row["value"]) if row is not None else None
+        except (json.JSONDecodeError, TypeError):
+            record = None
+        if not isinstance(record, dict) or record.get("state") != "stopped":
+            return frozenset()
+        episodes = record.get("open_episodes")
+        if not isinstance(episodes, list) or not all(isinstance(item, str) for item in episodes):
+            LOGGER.warning("Stored monitoring session was invalid; no episode is resumed")
+            return frozenset()
+        return frozenset(episodes)
+
+    def end_monitoring_session(self, open_episodes: Iterable[str]) -> None:
+        with self._lock, self._connect() as connection:
+            self._save_session(
+                connection, {"state": "stopped", "open_episodes": sorted(open_episodes)}
+            )
+
+    @staticmethod
+    def _save_session(connection: sqlite3.Connection, record: dict[str, object]) -> None:
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SESSION_KEY, json.dumps(record)),
+        )
 
     def get_alert(self, alert_id: str) -> Alert | None:
         with self._lock, self._connect() as connection:
@@ -1937,17 +2014,22 @@ class Database:
             ("telemetry_samples", "timestamp", "<"),
             ("process_observations", "timestamp", "<"),
             ("connection_summaries", "timestamp", "<"),
-            ("telemetry_rollups", "bucket_end", "<="),
         ):
             connection.execute(
                 f"DELETE FROM {table} WHERE {column} {comparison} ?",  # noqa: S608
                 (cutoff_value,),
             )
-        connection.execute(
-            "DELETE FROM telemetry_compacted_keys WHERE NOT EXISTS ("
-            "SELECT 1 FROM telemetry_rollups AS rollups "
-            "WHERE rollups.bucket_start = telemetry_compacted_keys.bucket_start)"
-        )
+        expired_rollups = connection.execute(
+            "DELETE FROM telemetry_rollups WHERE bucket_end <= ?", (cutoff_value,)
+        ).rowcount
+        # Keys are orphaned only when their rollup is deleted (here or by compaction,
+        # which cleans its own). The scan covers every key, so skip it otherwise.
+        if expired_rollups:
+            connection.execute(
+                "DELETE FROM telemetry_compacted_keys WHERE NOT EXISTS ("
+                "SELECT 1 FROM telemetry_rollups AS rollups "
+                "WHERE rollups.bucket_start = telemetry_compacted_keys.bucket_start)"
+            )
         Database._cap_history_rows(connection, "telemetry_samples", max_samples)
         Database._cap_history_rows(connection, "connection_summaries", max_samples)
         process_row_limit = min(max_samples * 100, 2_000_000)
@@ -1957,6 +2039,14 @@ class Database:
     def _cap_history_rows(connection: sqlite3.Connection, table: str, limit: int) -> None:
         # Delete only the oldest excess rows. Selecting the rows to keep instead built a
         # set of up to `limit` row IDs and scanned the whole table on every history write.
+        # Rowids are distinct integers, so the row count cannot exceed their span; while
+        # the span is within the limit, skip the COUNT(*) scan. Separate subqueries keep
+        # SQLite's min/max index shortcut.
+        low, high = connection.execute(
+            f"SELECT (SELECT MIN(rowid) FROM {table}), (SELECT MAX(rowid) FROM {table})"  # noqa: S608
+        ).fetchone()
+        if low is None or high - low + 1 <= limit:
+            return
         count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         if count > limit:
             connection.execute(

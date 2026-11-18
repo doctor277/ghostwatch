@@ -270,7 +270,10 @@ class NetworkSample(BaseModel):
     bytes_recv_per_second: float
     upload_mbps: float
     download_mbps: float
+    # Open sockets: every state except closed TCP endpoints (TIME_WAIT and similar).
     active_connections: int
+    # Closed TCP endpoints the OS still lists; not part of active_connections.
+    closing_connections: int = 0
     established_connections: int
     unique_remote_destinations: int = 0
     new_connections: int = 0
@@ -420,6 +423,10 @@ class StorageHealth(BaseModel):
     # Queued writes evicted at capacity since this process started.
     dropped_alert_writes: int = 0
     dropped_event_writes: int = 0
+    # History samples waiting for SQLite, and samples dropped since this process started
+    # (full queue, storage outage, or history disabled while queued).
+    history_queue_depth: int = 0
+    history_dropped_samples: int = 0
     last_success: datetime | None = None
     last_error_type: str | None = None
     schema_version: int | None = None

@@ -13,6 +13,9 @@ const state = {
   monitoredFolders: [],
   fileIntegrityEvents: [],
   events: [],
+  // Overview rows; refreshed while snapshots arrive, independently of the full log.
+  recentEvents: [],
+  recentEventsAt: 0,
   incidents: [],
   processSort: { key: "cpu_percent", direction: -1 },
   alertSeverity: "ALL",
@@ -143,6 +146,13 @@ function renderConnections() {
       makeCell(row, item.address_scope);
       makeCell(row, duration(item.duration_seconds));
     });
+  }
+  const network = state.snapshot?.network;
+  if (network && isAvailable(network, "active_connections")) {
+    const total = network.active_connections + (network.closing_connections ?? 0);
+    text("#network-detail-count", `Table holds ${state.snapshot.connections.length} of ${total} sockets: established first, closed TIME_WAIT last`);
+  } else {
+    text("#network-detail-count", "Socket totals unavailable");
   }
   const closed = $("#closed-table");
   closed.replaceChildren();
@@ -402,7 +412,12 @@ function renderAlerts() {
       const first = alert.first_occurrence ? new Date(alert.first_occurrence).toLocaleString() : "unknown";
       const last = alert.last_occurrence ? new Date(alert.last_occurrence).toLocaleString() : "unknown";
       const recovery = alert.last_recovery ? new Date(alert.last_recovery).toLocaleString() : "none observed";
-      copy.append(element("div", "evidence", `STATE: ${alert.condition_active === false ? "RECOVERED" : "ACTIVE"} · First: ${first} · Last: ${last} · Occurrences: ${alert.occurrence_count || 0} · Last recovery: ${recovery}`));
+      // An episode can end without an observed recovery (not confirmed after restart).
+      // A recovery recorded before the last occurrence belongs to an earlier cycle.
+      const recovered = alert.last_recovery
+        && (!alert.last_occurrence || new Date(alert.last_recovery) >= new Date(alert.last_occurrence));
+      const ended = recovered ? "RECOVERED" : "ENDED";
+      copy.append(element("div", "evidence", `STATE: ${alert.condition_active === false ? ended : "ACTIVE"} · First: ${first} · Last: ${last} · Occurrences: ${alert.occurrence_count || 0} · Last recovery: ${recovery}`));
     }
     if (alert.persistence_pending) copy.append(element("div", "evidence", "PERSISTENCE PENDING · live memory state"));
     const actions = element("div", "alert-actions");
@@ -462,16 +477,41 @@ function renderBaselines(items) {
   });
 }
 
+// Alert-derived events are stored on the event scale (INFO -> LOW, WARNING -> HIGH);
+// show them with the label the same alert has in the Alerts view.
+const ALERT_EVENT_LABELS = { LOW: "INFO", HIGH: "WARNING", CRITICAL: "CRITICAL" };
+
+function eventSeverityLabel(event) {
+  const fromAlert = event.event_type === "alert" || event.event_type === "demo_alert";
+  return (fromAlert && ALERT_EVENT_LABELS[event.severity]) || event.severity;
+}
+
+const RECENT_EVENTS_REFRESH_MS = 10000;
+let recentEventsRequest = null;
+
+// Recent events are not part of the snapshot; poll a small page while telemetry is live.
+function refreshRecentEvents() {
+  if (state.demo || recentEventsRequest || Date.now() - state.recentEventsAt < RECENT_EVENTS_REFRESH_MS) return;
+  state.recentEventsAt = Date.now();
+  recentEventsRequest = fetch("/api/events?limit=6")
+    .then((response) => (response.ok ? response.json() : null))
+    .then((events) => {
+      if (events && !state.demo) { state.recentEvents = events; renderOverviewEvents(); }
+    })
+    .catch(() => {})
+    .finally(() => { recentEventsRequest = null; });
+}
+
 function renderOverviewEvents() {
   const body = $("#overview-events");
   body.replaceChildren();
-  state.events.slice(0, 6).forEach((event) => {
+  state.recentEvents.slice(0, 6).forEach((event) => {
     const row = body.insertRow();
     makeCell(row, new Date(event.timestamp).toLocaleTimeString());
-    makeCell(row, event.severity, event.severity === "LOW" ? "positive" : "");
+    makeCell(row, eventSeverityLabel(event), event.severity === "LOW" ? "positive" : "");
     makeCell(row, event.title);
   });
-  if (!state.events.length) emptyTable(body, 3, "No retained events available");
+  if (!state.recentEvents.length) emptyTable(body, 3, "No retained events available");
 }
 
 function renderSnapshot(snapshot) {
@@ -495,7 +535,7 @@ function renderSnapshot(snapshot) {
   text("#metric-download", isAvailable(network, "bytes_recv_per_second") ? rate(network.bytes_recv_per_second) : "UNAVAILABLE");
   text("#metric-upload", isAvailable(network, "bytes_sent_per_second") ? rate(network.bytes_sent_per_second) : "UNAVAILABLE");
   text("#metric-connections", isAvailable(network, "active_connections") ? network.active_connections : "UNAVAILABLE");
-  text("#metric-established", isAvailable(network, "established_connections") ? `${network.established_connections} established` : "Established count unavailable");
+  text("#metric-established", isAvailable(network, "established_connections") ? `${network.established_connections} established${isAvailable(network, "closing_connections") ? ` · ${network.closing_connections ?? 0} closed (TIME_WAIT) not counted` : ""}` : "Established count unavailable");
   text("#metric-processes", isAvailable(system, "process_count") ? system.process_count : "UNAVAILABLE");
   text("#metric-duration", `${snapshot.collection_duration_ms.toFixed(1)} ms`);
   text("#metric-uptime", `Uptime ${isAvailable(system, "uptime_seconds") ? uptime(system.uptime_seconds) : "unavailable"}`);
@@ -503,7 +543,7 @@ function renderSnapshot(snapshot) {
   $("#memory-meter").style.width = isAvailable(system, "memory_percent") ? `${system.memory_percent}%` : "0%";
   text("#legend-download", isAvailable(network, "bytes_recv_per_second") ? rate(network.bytes_recv_per_second) : "—");
   text("#legend-upload", isAvailable(network, "bytes_sent_per_second") ? rate(network.bytes_sent_per_second) : "—");
-  text("#network-total", isAvailable(network, "active_connections") ? network.active_connections : "—");
+  text("#network-total", isAvailable(network, "active_connections") && isAvailable(network, "closing_connections") ? network.active_connections + (network.closing_connections ?? 0) : "—");
   text("#network-established", isAvailable(network, "established_connections") ? network.established_connections : "—");
   text("#network-destinations", isAvailable(network, "unique_remote_destinations") ? network.unique_remote_destinations : "—");
   text("#network-new", network.new_connections ?? "—");
@@ -534,10 +574,11 @@ function renderSnapshot(snapshot) {
   text("#availability-note", unavailable.length ? `Unavailable: ${unavailable.join(", ")}` : "All primary metrics available.");
   const storage = snapshot.storage || {};
   const droppedWrites = (storage.dropped_alert_writes || 0) + (storage.dropped_event_writes || 0);
-  const droppedNote = droppedWrites ? ` · ${droppedWrites} WRITES DROPPED` : "";
+  const droppedSamples = storage.history_dropped_samples || 0;
+  const droppedNote = `${droppedWrites ? ` · ${droppedWrites} WRITES DROPPED` : ""}${droppedSamples ? ` · ${droppedSamples} HISTORY SAMPLES DROPPED` : ""}`;
   text("#storage-status", `STORAGE ${String(storage.status || "unknown").toUpperCase()}${droppedNote}`);
-  $("#storage-status").className = storage.persistence_available && !droppedWrites ? "status-good" : "status-warning";
-  $("#storage-status").title = droppedWrites ? "Queued writes dropped at capacity since GhostWatch started" : "";
+  $("#storage-status").className = storage.persistence_available && !droppedWrites && !droppedSamples ? "status-good" : "status-warning";
+  $("#storage-status").title = droppedWrites || droppedSamples ? `Queued writes and history samples dropped since GhostWatch started; ${storage.history_queue_depth || 0} history samples waiting` : "";
 
   renderRanks(snapshot.connection_rankings);
   renderConnections();
@@ -885,7 +926,7 @@ function renderTimeline() {
   events.forEach((event) => {
     const row = body.insertRow();
     makeCell(row, new Date(event.timestamp).toLocaleString());
-    makeCell(row, event.severity, event.severity === "LOW" ? "positive" : "");
+    makeCell(row, eventSeverityLabel(event), event.severity === "LOW" ? "positive" : "");
     makeCell(row, event.event_type);
     makeCell(row, event.title);
     makeCell(row, event.summary);
@@ -909,7 +950,11 @@ function renderTimeline() {
 async function loadEvents() {
   if (!state.demo) {
     const response = await fetch("/api/events?limit=1000");
-    if (response.ok) state.events = await response.json();
+    if (response.ok) {
+      state.events = await response.json();
+      state.recentEvents = state.events.slice(0, 6);
+      state.recentEventsAt = Date.now();
+    }
   }
   renderTimeline();
   renderOverviewEvents();
@@ -1156,6 +1201,7 @@ function enterDemo() {
   const demo = createDemoData();
   state.history = [];
   state.events = demo.events;
+  state.recentEvents = demo.events.slice(0, 6);
   state.incidents = demo.incidents;
   $("#demo-banner").hidden = false;
   text("#mode-label", "DEMO");
@@ -1166,7 +1212,7 @@ function enterDemo() {
 
 async function exitDemo() {
   state.demo = false;
-  state.history = []; state.events = []; state.incidents = []; state.selectedIncident = null;
+  state.history = []; state.events = []; state.recentEvents = []; state.incidents = []; state.selectedIncident = null;
   $("#demo-banner").hidden = true;
   text("#mode-label", "LIVE");
   showSocketStatus("CONNECTING");
@@ -1191,7 +1237,7 @@ function startSocket() {
   state.socket?.disconnect();
   if (state.demo) return;
   state.socket = new TelemetrySocket(
-    (snapshot) => { if (!state.demo) renderSnapshot(snapshot); },
+    (snapshot) => { if (!state.demo) { renderSnapshot(snapshot); refreshRecentEvents(); } },
     (status) => { if (!state.demo) showSocketStatus(status); },
     () => state.settings?.refresh_interval,
   );

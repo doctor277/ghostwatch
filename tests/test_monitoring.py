@@ -17,9 +17,11 @@ class FakeSystemPsutil:
     def virtual_memory():
         return SimpleNamespace(percent=62.5, used=625, total=1000)
 
-    @staticmethod
-    def cpu_percent(interval=None):
-        return 17.4
+    times = SimpleNamespace(user=10.0, system=2.0, idle=68.0)
+
+    @classmethod
+    def cpu_times(cls, percpu=False):
+        return cls.times
 
     @staticmethod
     def disk_usage(path):
@@ -36,8 +38,16 @@ class FakeSystemPsutil:
 
 def test_system_collector_collects_cpu_and_memory(monkeypatch):
     monkeypatch.setattr("app.monitoring.system.time.time", lambda: 101.0)
-    sample = SystemCollector(FakeSystemPsutil).collect()
-    assert sample.cpu_percent == 17.4
+    collector = SystemCollector(FakeSystemPsutil)
+    first = collector.collect()
+    assert "cpu_percent" in first.unavailable_metrics  # No interval measured yet.
+    monkeypatch.setattr(
+        FakeSystemPsutil, "times", SimpleNamespace(user=15.0, system=5.0, idle=80.0)
+    )
+    sample = collector.collect()
+    # 8 busy of 20 CPU-seconds since the first sample.
+    assert sample.cpu_percent == 40.0
+    assert "cpu_percent" not in sample.unavailable_metrics
     assert sample.memory_percent == 62.5
     assert sample.process_count == 3
     assert sample.uptime_seconds == 100
@@ -324,7 +334,7 @@ class FailedSystemPsutil:
     def virtual_memory():
         raise OSError("unavailable")
 
-    cpu_percent = virtual_memory
+    cpu_times = virtual_memory
     disk_usage = virtual_memory
     pids = virtual_memory
     boot_time = virtual_memory

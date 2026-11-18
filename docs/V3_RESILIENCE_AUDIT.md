@@ -1442,6 +1442,136 @@ identity and creation time are kept. All four failed against `a8f8de4`. Guards k
 the 5 microsecond reuse rejected within the fallback and across sources, and show
 that a two-step difference is still a new owner.
 
+## Final stabilization, 2026-11-11
+
+Local work on `feat/v3-final-stabilization`, based on `639fdfd` (merged `main`). No push
+or merge is authorized. Defects come from the November 8 live reliability investigation
+(D1-D12) and the open lifecycle follow-ups. D1, D2, D5 and D6 were already fixed on
+`main`. Each remaining defect was reproduced first, in a test that failed before its fix
+or in a live measurement. Measurements were taken on the development host: Windows 11,
+16 logical CPUs, standard user. Results are in
+[Current Beta Validation](CURRENT_BETA_VALIDATION.md#final-stabilization---november-11-2026).
+
+| Area | Defect reproduced | Correction |
+| --- | --- | --- |
+| Service events (D4) | SCM 7009/7011 put the timeout in `param1` (confirmed on the live System log); alerts named the service `30000` | The parameter is chosen per event ID; the other service-failure IDs are unchanged |
+| Sockets (D7, D9) | Windows lists closed TCP endpoints in `TIME_WAIT` under PID 0. PID 0 was named "System", every socket counted as active, and `TIME_WAIT` rows filled the 250-row table | New `closing_connections`; `active_connections`, per-process counts and rankings cover open sockets only; PID 0 is "No owner (PID 0)"; the table holds established connections first and shows "N of M". Live: 227 open, 369 `TIME_WAIT`, all 70 established in the table |
+| System CPU (D3) | `psutil.cpu_percent(interval=None)` keeps one baseline per thread; executor rotation gave false 0.0 readings | The collector keeps its own `cpu_times()` baseline; the first sample is unavailable. Against aligned `GetSystemTimes` windows: MAE 4.73 to 0.85 points, max 19.77 to 1.64 |
+| Clean start (D10) | Every clean start logged "Persistent storage recovered" | Recovery is announced only after a recorded failure |
+| Health (D8) | `/api/health` was `ok` whenever a snapshot existed, and history loss was invisible | Snapshot age, the watchdog allowance, worker states, `degraded` status, history queue depth and dropped samples. The dashboard shows dropped samples |
+| Dashboard | Recent events never refreshed; the same alert read WARNING in one view and HIGH in another | Overview events poll at most every 10 s while live; alert-derived events show the alert's label |
+| Alert retention | A burst of newer alerts could delete a still-active episode, whose next report recreated a partial row | Open grouped episodes are exempt, at most one per grouped rule (limit plus nine) |
+| Logging toggle | An episode that recovered while logging was off stayed ACTIVE in SQLite and was resumed after restart | Superseded on November 12 (below): writing that recovery broke the opt-out contract |
+| History writes (D1 follow-up) | `COUNT(*)` on every capped table and a scan over every compacted key on every write | Both are skipped when they provably cannot delete anything. Per write: 1M rows 116.2 to 30.5 ms; at the 2M cap 216.5 to 200.7 ms |
+
+Shutdown flush (investigation R4) had no tests; two now cover it and pass unchanged.
+`scripts/live_smoke.py` runs the real collectors against a temporary database. A
+5-minute run produced 147 frames with no sequence gaps, health `ok`, snapshot age at
+most 2.0 s, no dropped history, all Host/Origin/loopback checks passing, and an intact
+database after graceful shutdown. GhostWatch used 0.26% of the machine's CPU on
+average (measured in a corrected 2-minute rerun) and 70-84 MiB RSS.
+
+**Compatibility.** All API changes are additive (`closing_connections`, StorageHealth
+history fields, health fields), and `/api/health` keeps HTTP 200. `active_connections`
+changes meaning once: history and the rolling baseline recorded before this change
+include `TIME_WAIT` sockets, so the baseline shows a temporary deviation after upgrade.
+No schema migration was added.
+
+**Not done.** At the 2M process-row cap the exact `COUNT(*)` still runs on every write
+(about 160 ms). Removing it needs a persistent counter, which is a schema change and
+was not made. No eight-hour soak was run. The independent QA review below found four
+blockers in this work; they are corrected there.
+
+## Independent QA corrections, 2026-11-12
+
+An independent review of the 13 stabilization commits returned BLOCK with four
+reproduced defects. Each was reproduced against `321fa7a` in a test that failed before
+its fix. Commits are local only on `feat/v3-final-stabilization`.
+
+| Blocker | Reproduction | Root cause | Correction |
+| --- | --- | --- | --- |
+| 1. `TIME_WAIT` in network metrics | 5 `TIME_WAIT` + 2 established sockets: active 2, closing 5, but 7 destinations and 7 new connections. Each close also counted as a new PID 0 connection, then a second disappearance | The first fix excluded closing sockets from active counts only; destinations, per-PID endpoints and lifecycle keys still used every socket | Closing sockets feed only `closing_connections` and the detail table (as not-new rows). A close is counted once, when the open key disappears. Destination diversity counts open sockets only |
+| 2. Logging opt-out | With logging off, a recovery rewrote the stored row's timestamps, explanation and evidence | `45dccb5` redefined the setting. The settings label ("Enable local event logging"), the V2 architecture notes and finding F2 above (PATCH while off is live-only) all define logging off as no alert or event writes | No writes while off; recovery stays in memory. Turning logging back on marks stored episodes that are no longer open live as ended, changing `condition_active` only, with no time, explanation or evidence from the opt-out. With logging off at startup, a stored open episode is not resumed: the next readable sample closes it in live state as "not confirmed after restart", and a breach is a new episode |
+| 3. Recovery lost in an outage | Recovery during an outage, storage healthy again, SQLite still ACTIVE, `pending_writes` 0 | The logging-off write of `45dccb5` returned early when storage was down. With logging on, the bounded queue evicted oldest-first, so a burst of other alerts could evict a queued recovery | The logging-off path no longer writes (blocker 2); the reconciliation after re-enabling goes through the flush path, waits out an outage, counts in `pending_writes` and is cancelled by a new opt-out. Queue eviction drops non-episode entries first; losses still count in `dropped_alert_writes` |
+| 4. Health hid data loss | `history_dropped_samples=4` and `persistence_available=False` both gave `status: ok` | The aggregate considered only staleness and worker liveness | `status` is `unavailable` when the telemetry worker is down, `degraded` for staleness, a stopped background worker, unavailable storage, an unencodable snapshot, or any write dropped or rejected since start, else `ok`. A `reasons` list names each cause. HTTP 200 is kept for the launcher |
+
+**Policy.** Event logging off means no alert or event data is written. The only write
+it leads to is made after logging is turned back on, and changes one column of rows
+that already exist. Queued writes, including that reconciliation, are memory-only: a
+crash or restart before they run loses them, and the first readable sample after
+restart closes the stored episode again (with logging on, that closure is stored).
+*Superseded by the [restart blocker corrections](#restart-blocker-corrections-2026-11-16):
+independent verification showed that a crash in that window resumed the stale episode.
+The reconciliation now commits with the setting, and a stored episode is resumed only
+after a recorded clean stop.*
+
+**Network collector cost.** The reviewer's 100,000-socket slowdown is a follow-up, not a release blocker, and no redesign was made. Measured with no test suite running (see [validation](CURRENT_BETA_VALIDATION.md#independent-qa-corrections---november-12-2026)): at 100,000 synthetic sockets a collection takes about 345 ms at `639fdfd`, 558 ms at `321fa7a` and 510-518 ms at `664ff59` with all sockets open, so the slowdown is real, about 50% over the base. It comes from building a ranked detail candidate for every socket. Collection runs on a worker thread, and the live hosts measured so far had about 600 sockets.
+
+## Restart blocker corrections, 2026-11-16
+
+Independent verification confirmed the four corrections above and reproduced two more
+release blockers. Both were reproduced on disposable SQLite databases at `376253f`
+before any change, by abandoning the service object without `stop()` or a flush to
+simulate process loss, then starting a new service on the same file with memory still
+breached. In both cases the old row stayed `condition_active = 1` and the breach after
+restart continued its identity (occurrence count 2 became 3).
+
+| Blocker | Reproduction | Root cause | Correction |
+| --- | --- | --- | --- |
+| 1. Re-enable reconciliation was memory-only | Active episode stored; logging off; recovery while off; logging on (`update_settings` returned success); process loss before the next flush; restart breached | Re-enabling set an in-memory flag, and the close ran on a later flush. Startup resumed every stored open episode when logging was on | `Database.save_settings(settings, still_open)` closes stored open episodes not open live and saves the setting in one `BEGIN IMMEDIATE` transaction. The service holds the collection lock around the snapshot and commit, so a recovery cannot land between them. If the transaction fails, the API reports the failure and logging stays off in memory and on disk. The deferred flag and its flush step are removed |
+| 2. Outage recovery lost across restart | Active episode stored; storage unavailable; recovery queued in memory; process loss before replay; restart breached | Startup could not tell a clean restart from process loss, so it resumed the stored row as if the episode had continued | A `monitoring_session` row in the existing `schema_meta` table (no schema change). Startup reads it and writes `running` in one transaction. A clean `stop()` writes `stopped` with the IDs of the episodes the engine still has open. Only those are resumed, and only with logging on. Any other stored open episode is "not confirmed": its first readable sample closes it, and a breach is a new episode |
+
+**Not-confirmed closure.** A stored episode that is not resumed is closed with
+`condition_active = 0`, occurrence delta 0, and the explanation "Ended: not confirmed
+after restart". Its timestamp, evidence, `last_recovery`, counts, first and last
+occurrence, acknowledge and dismiss state and incident link are kept as stored. No
+recovery time or evidence is taken from the restart sample. The closure adds no
+timeline event, so the only new detection event is the new episode's own. It is
+written only with logging on, through the normal queue, so it waits out an outage; with
+logging off it stays live-only. Until the rule's metric is readable the episode is left
+as stored and nothing is linked to it. The dashboard shows `STATE: ENDED` instead of
+`RECOVERED` unless a recovery was recorded at or after the episode's last occurrence. An
+episode from an older build can carry a real recovery from an earlier cycle (those
+builds reopened the same ID); that timestamp is kept as history but does not make an
+unconfirmed end read as recovered.
+
+**Upgrading an existing installation.** No migration or configuration step is needed,
+and `SCHEMA_VERSION` stays 3. Earlier builds never wrote `monitoring_session`, so the
+first start after upgrading treats every stored open threshold episode as not
+confirmed, as after a crash. Each one is closed at its first readable sample with its
+history intact, and a breach still present opens a new episode with its own timeline
+event. Later clean stops record the session normally. The README's quick start
+describes this for users.
+
+**What a clean stop records.** Only episodes open in the detection engine are listed.
+An episode whose recovery is still queued, or that was never confirmed after the last
+start, is not listed and so is not resumed. With logging off the list is empty, so no
+live-only episode identity from the opt-out reaches disk. If the record cannot be
+written, it stays `running` and the next start resumes nothing. A start after a stop
+in the same process writes `running` again. A malformed record resumes nothing.
+
+**Policy and limits.**
+
+- Queued transitions remain memory-only. Abrupt process loss (a crash, a killed
+  process, power loss) still loses any recovery, count or operator change not yet
+  written. What changes is that the next start no longer continues a stored episode it
+  cannot vouch for. There is no exactly-once persistence or crash-recovery guarantee.
+- The conservative policy has a cost: after any unclean exit, a breach that really did
+  continue is recorded as a closed "not confirmed" episode plus a new one with its own
+  timeline event. The first start after upgrading from a build without this record is
+  treated the same way.
+- Continuity across a clean restart still assumes nothing happened in the unobserved
+  gap between runs. A run that never reached SQLite (storage unavailable from start to
+  exit) leaves no record, so the next start relies on the last run that did.
+- A clear sample at the first readable sample after a clean restart is unchanged: it
+  is an observed clear and records `last_recovery`.
+
+Regression coverage is `tests/test_v3_episode_restart.py` and one Playwright case.
+Existing tests that restarted without stopping the first service now call `stop()`
+where they test a clean restart. Tests that asserted the old crash-resume behavior or a
+`last_recovery` taken from the restart sample were updated to the contract above, and
+the deferred-reconciliation outage test was replaced by the fail-closed one.
+
 ## Open findings
 
 These come from code review and have not been reproduced, unless noted.
@@ -1465,10 +1595,10 @@ These come from code review and have not been reproduced, unless noted.
   unlinked IDs at 10,000 x 100. See
   [the benchmark](#synthetic-persistence-benchmark-2026-11-07).
 - Surrogates in monitored folder paths submitted through the API are untested.
-- Each history write still counts every capped table. At 2,000,000 process rows that
-  count took about 0.2 to 0.6 s at the median, with the `Database` lock held, and the `telemetry_compacted_keys`
-  cleanup adds about 0.23 s at the default 7-day size. See
-  [History row-cap retention](#history-row-cap-retention-2026-11-09).
+- Once a capped table is at its limit, each history write still counts it: about 160 ms at
+  2,000,000 process rows, with the `Database` lock held. Below the limit, and for the
+  compacted-key cleanup, the scans are now skipped; see
+  [Final stabilization](#final-stabilization-2026-11-11).
 
 ## Known limitations
 
@@ -1497,7 +1627,9 @@ These come from code review and have not been reproduced, unless noted.
   restarts during an outage loses that evidence.
 - An update to an evicted alert reaches the database only if its row already exists.
 - The storage recovery notice is not stored when the event queue is full.
-- `history_dropped_samples` is counted but not shown by `/api/health`.
+- Queued alert transitions are memory-only and do not survive abrupt process loss.
+  After an unclean exit, stored open episodes are closed as "not confirmed" instead of
+  resumed; see [Restart blocker corrections](#restart-blocker-corrections-2026-11-16).
 - An update saved by the next pass after a first write is lost if the process stops
   first. The queue is memory only.
 - `Database.add_alert` accepts observation deltas. Calling it again for an observation

@@ -338,6 +338,7 @@ async def test_restart_continues_an_active_breach(tmp_path, system_sample, netwo
     await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
 
     clock = Clock(1000.0)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = await monitored(path, clock, system_sample, network_sample)
     await run(restarted, clock, 1000, 1012)
 
@@ -360,6 +361,7 @@ async def test_restart_records_a_recovery_missed_while_stopped(
     [opened] = memory_rows(first)
 
     system_sample.memory_percent = CLEAR
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = await monitored(path, Clock(1000.0), system_sample, network_sample)
     await restarted.collect_once()
 
@@ -429,6 +431,7 @@ async def test_delayed_restore_reconciles_provisional_episode_and_queued_events(
     [original_event] = memory_events(first)
 
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = disconnected_service(path, clock, system_sample, network_sample)
     with monkeypatch.context() as patch:
         patch.setattr(restarted.database, "initialize", outage)
@@ -442,6 +445,21 @@ async def test_delayed_restore_reconciles_provisional_episode_and_queued_events(
             system_sample.memory_percent = CLEAR
             await run(restarted, clock, 1072, 1074)
     await run(restarted, clock, 1074, 1076)
+
+    if not logging:
+        # Logging is off, so the stored episode may have ended unrecorded. It is
+        # closed as not confirmed at the first sample after restore, and never
+        # merged with the episode observed after restart, which stays live-only.
+        stale = restarted._live_alert(opened.id)
+        assert stale.condition_active is False and "not confirmed" in stale.explanation
+        assert stale.last_recovery is None  # No recovery was observed.
+        assert stale.occurrence_count == stored.occurrence_count
+        assert (stale.acknowledged, stale.incident_id) == (True, incident.id)
+        assert restarted.database.get_alert(opened.id) == stored
+        assert restarted.database.get_alert(provisional.id) is None
+        assert memory_events(restarted) == [original_event]
+        assert restarted.storage.pending_writes == 0
+        return
 
     rows = [a for a in await restarted.list_alerts(1000, True) if a.rule_id == "memory"]
     assert len(rows) == 1
@@ -491,6 +509,7 @@ async def test_active_metadata_survives_display_eviction_and_recovery(
         "alert_retention": 50 if "retention" in mode else 1000,
     }))
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = await monitored(path, clock, system_sample, network_sample)
     await defender_burst(restarted, 1000)
     assert len(restarted.live_alerts) == MAX_LIVE_ALERTS
@@ -505,13 +524,22 @@ async def test_active_metadata_survives_display_eviction_and_recovery(
         2, at(10), at(70)
     )
     assert (live.acknowledged, live.dismissed, live.condition_active) == (True, True, False)
-    assert live.last_recovery == at(1000)
+    # With logging off the stored episode is not resumed, so the clear sample is not
+    # its observed recovery: it is closed as not confirmed.
+    assert live.last_recovery == (None if mode == "logging_disabled" else at(1000))
     assert opened.id not in {a.id for a in restarted.latest.alerts}
     await settle(restarted)
     if mode == "logging_disabled":
         assert restarted.database.get_alert(opened.id) == stored
     elif "retention" in mode:
-        assert restarted.database.get_alert(opened.id) is None
+        # Retention keeps the open episode through the burst, so SQLite and live
+        # state agree after recovery instead of losing the record.
+        kept = restarted.database.get_alert(opened.id)
+        assert (kept.occurrence_count, kept.first_occurrence, kept.last_occurrence) == (
+            2, at(10), at(70)
+        )
+        assert (kept.acknowledged, kept.dismissed, kept.condition_active) == (True, True, False)
+        assert kept.last_recovery == at(1000)
         assert len(restarted.database.list_alerts(1000, True)) == 50
     else:
         assert restarted.database.get_alert(opened.id).occurrence_count == 2
@@ -537,6 +565,7 @@ async def test_delayed_restore_does_not_merge_a_breach_after_an_observed_clear(
     [opened] = memory_rows(first)
     await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = disconnected_service(path, clock, system_sample, network_sample)
     with monkeypatch.context() as patch:
         patch.setattr(restarted.database, "initialize", outage)
@@ -578,9 +607,13 @@ async def test_saved_logging_opt_out_keeps_explicit_provisional_operator_changes
         [provisional] = [a for a in restarted.live_alerts if a.rule_id == "memory"]
         await restarted.update_alert(provisional.id, AlertUpdate(acknowledged=True, dismissed=True))
     await run(restarted, clock, 1012, 1014)
-    current = restarted._live_alert(opened.id)
+    # Logging is off, so the stored episode is not resumed: the changes stay with
+    # the episode they were made on, and the stored one is closed as not confirmed.
+    current = restarted._live_alert(provisional.id)
     assert (current.acknowledged, current.dismissed) == (True, True)
-    assert current.occurrence_count == 2
+    stale = restarted._live_alert(opened.id)
+    assert stale.condition_active is False
+    assert (stale.acknowledged, stale.dismissed) == (stored.acknowledged, stored.dismissed)
     assert restarted.database.get_alert(opened.id) == stored
     assert restarted.database.get_alert(provisional.id) is None
 
@@ -630,6 +663,7 @@ async def test_delayed_restore_preserves_recurrence_after_provisional_recovery(
     [opened] = memory_rows(first)
     await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = disconnected_service(path, clock, system_sample, network_sample)
     with monkeypatch.context() as patch:
         patch.setattr(restarted.database, "initialize", outage)
@@ -685,7 +719,7 @@ async def test_provisional_identity_cannot_be_written_into_incident_history(
     assert restarted.database.get_alert(opened.id).incident_id == incident.id
 
 
-async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline(
+async def test_retention_keeps_an_open_episode_for_its_reconciled_delta(
     tmp_path, system_sample, network_sample, monkeypatch
 ):
     path = tmp_path / "synthetic.db"
@@ -697,6 +731,7 @@ async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline
     await first.update_alert(opened.id, AlertUpdate(acknowledged=True))
     first.database.save_settings(first.settings.model_copy(update={"alert_retention": 50}))
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = disconnected_service(path, clock, system_sample, network_sample)
     with monkeypatch.context() as patch:
         patch.setattr(restarted.database, "initialize", outage)
@@ -707,14 +742,15 @@ async def test_retention_cannot_recreate_a_reconciled_delta_without_its_baseline
         await run(restarted, clock, 1072, 1074)
     await run(restarted, clock, 1074, 1076)
 
-    # Queued Defender writes prune A before its positive-count recovery delta.
-    assert restarted.database.get_alert(opened.id) is None
+    # Queued Defender writes no longer prune open episode A before its positive-count
+    # recovery delta, so the stored record matches the live one.
     current = restarted._live_alert(opened.id)
-    assert current.occurrence_count == 4
-    assert (current.first_occurrence, current.last_occurrence) == (at(10), at(1070))
-    assert current.last_recovery == at(1072)
-    assert current.condition_active is False
-    assert current.acknowledged is True
+    for record in (current, restarted.database.get_alert(opened.id)):
+        assert record.occurrence_count == 4
+        assert (record.first_occurrence, record.last_occurrence) == (at(10), at(1070))
+        assert record.last_recovery == at(1072)
+        assert record.condition_active is False
+        assert record.acknowledged is True
     assert len(restarted.database.list_alerts(1000, True)) == 50
     assert restarted.storage.pending_writes == 0
 
@@ -1070,8 +1106,8 @@ async def test_restart_recovery_without_logging_preserves_episode_metadata(
     await restarted.collect_once()
 
     live = restarted._live_alert(opened.id)
-    assert live.condition_active is False
-    assert live.last_recovery == at(1000)
+    assert live.condition_active is False and "not confirmed" in live.explanation
+    assert live.last_recovery is None  # Not resumed, so the clear is not its recovery.
     assert (live.occurrence_count, live.first_occurrence, live.last_occurrence) == (
         2, at(10), at(70)
     )
@@ -1091,6 +1127,7 @@ async def test_restart_continuing_episode_does_not_duplicate_timeline(
     [original_event] = memory_events(first)
 
     clock = Clock(1000)
+    await first.stop()  # A clean stop records the episode the next start continues.
     restarted = await monitored(path, clock, system_sample, network_sample)
     await run(restarted, clock, 1000, 1072)
 
@@ -1102,7 +1139,7 @@ async def test_restart_continuing_episode_does_not_duplicate_timeline(
     assert row.occurrence_count == 3
 
 
-async def test_previous_beta_active_identity_is_resumed_until_recovery(
+async def test_previous_beta_active_identity_is_closed_not_resumed(
     tmp_path, system_sample, network_sample
 ):
     path = tmp_path / "synthetic.db"
@@ -1122,22 +1159,21 @@ async def test_previous_beta_active_identity_is_resumed_until_recovery(
     clock = Clock(1000)
     service = await monitored(path, clock, system_sample, network_sample)
     await run(service, clock, 1000, 1012)
-    [continued] = memory_rows(service)
-    assert continued.id == legacy.id
-    assert continued.first_occurrence == at(10)
-    assert continued.occurrence_count == 3
-    assert continued.acknowledged is True
-    assert await service.list_events(event_type="alert") == [original_event]
-
-    system_sample.memory_percent = CLEAR
-    await run(service, clock, 1012, 1014)
-    system_sample.memory_percent = BREACH
-    await run(service, clock, 1014, 1026)
-    [new] = [item for item in memory_rows(service) if item.condition_active is True]
-    assert new.id != legacy.id
-    assert new.occurrence_count == 1
-    assert new.first_occurrence == at(1024)
-    assert service.database.get_alert(legacy.id).condition_active is False
+    # A previous beta recorded no clean stop, so continuity cannot be proven: the
+    # stored episode is closed as not confirmed with its history intact, and the
+    # breach is a new episode.
+    rows = {row.id: row for row in memory_rows(service)}
+    previous = rows.pop(legacy.id)
+    assert previous.condition_active is False and "not confirmed" in previous.explanation
+    assert previous.last_recovery is None
+    assert (previous.first_occurrence, previous.last_occurrence) == (at(10), at(70))
+    assert (previous.occurrence_count, previous.acknowledged) == (2, True)
+    [new] = rows.values()
+    assert (new.condition_active, new.occurrence_count, new.acknowledged) == (True, 1, False)
+    assert new.first_occurrence == at(1010)
+    timeline = await service.list_events(event_type="alert")
+    assert original_event in timeline and len(timeline) == 2
+    assert {event.related_id for event in timeline} == {legacy.id, new.id}
 
 
 @pytest.mark.parametrize("queued", [False, True])
@@ -1155,6 +1191,10 @@ async def test_retention_expired_episode_is_not_recreated_by_recovery(
             id=f"synthetic-new-{index}", timestamp=at(11) + timedelta(milliseconds=index),
             severity="WARNING", source="synthetic", metric="synthetic", explanation="synthetic"
         ), 50)
+    # Retention now keeps open episodes; a row expired before that (or removed outside
+    # the service) must still not be recreated as an incomplete record.
+    with service.database._connect() as connection:
+        connection.execute("DELETE FROM alerts WHERE id = ?", (opened.id,))
     assert service.database.get_alert(opened.id) is None
 
     system_sample.memory_percent = CLEAR

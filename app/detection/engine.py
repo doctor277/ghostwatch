@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -48,16 +48,25 @@ class DetectionEngine:
         self._startup_first: dict[str, Alert] = {}
         self._startup_clear: dict[str, tuple[RuleEvaluation, datetime]] = {}
         self._startup_operator_changes: dict[str, dict[str, bool]] = {}
+        # Stored episodes restored without being resumed (at most one per rule).
+        self._unconfirmed: dict[str, Alert] = {}
         self._restored = False
         self._previous_connections: int | None = None
         self._collection_failure_active = False
         self._collection_failure_first: datetime | None = None
 
-    def restore_active(self, alerts: Iterable[Alert]) -> list[EpisodeRestoration]:
+    def restore_active(
+        self, alerts: Iterable[Alert], resumable: Container[str] | None = None
+    ) -> list[EpisodeRestoration]:
         """Bind an unconfirmed startup continuation to its stored episode.
 
         A readable clear is a boundary: episodes after it must remain independent.
         The service reconciles the returned deltas before any queued write runs.
+
+        Only stored episodes in resumable (all when None) are continued. Any other
+        may have ended without being recorded (process loss, or event logging off):
+        the next readable sample of its rule closes it as not confirmed, and any
+        breach is a new episode.
         """
         if self._restored:
             return []
@@ -74,6 +83,12 @@ class DetectionEngine:
                     "first_occurrence": alert.first_occurrence or alert.timestamp,
                     "last_occurrence": alert.last_occurrence or alert.timestamp,
                 })
+                if resumable is not None and alert.id not in resumable:
+                    # Startup observations and operator changes stay with their own
+                    # live episode; nothing is merged into the stored one.
+                    self._unconfirmed[alert.rule_id] = alert
+                    restored.append(EpisodeRestoration(alert, None, None, {}))
+                    continue
                 provisional = self._startup_first.get(alert.rule_id)
                 clear = self._startup_clear.get(alert.rule_id)
                 latest = alert.model_copy(update={
@@ -169,6 +184,9 @@ class DetectionEngine:
         for rule in rules:
             if rule.key == "collection_failure":
                 continue
+            if rule.available and rule.key in self._unconfirmed:
+                stale = self._unconfirmed.pop(rule.key)
+                alerts.append(self._unconfirmed_closure(stale))
             if not rule.breached:
                 self._breach_started.pop(rule.key, None)
                 if not self._restored and rule.available:
@@ -213,6 +231,20 @@ class DetectionEngine:
                 })
             alerts.append(observation)
         return alerts
+
+    @staticmethod
+    def _unconfirmed_closure(stale: Alert) -> Alert:
+        # No recovery was observed, so none is recorded: no recovery time, and the
+        # episode keeps its own timestamp and evidence, not those of this sample.
+        return stale.model_copy(update={
+            "occurrence_count": 0,
+            "condition_active": False,
+            "explanation": (
+                "Ended: not confirmed after restart. GhostWatch did not stop cleanly "
+                "or event logging was off, so this episode may have ended earlier "
+                "without being recorded."
+            ),
+        })
 
     @staticmethod
     def _recovery(rule: RuleEvaluation, observed_at: datetime, active: Alert) -> Alert:

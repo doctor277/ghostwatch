@@ -65,6 +65,26 @@ test("process search, sorting, drawer, and keyboard close work", async ({ page }
   await expect(page.locator("#process-drawer")).not.toHaveClass(/open/);
 });
 
+test("alert-derived events use the alert's own severity label", async ({ page }) => {
+  const alertsById = Object.fromEntries(backend.state.snapshot.alerts.map((alert) => [alert.id, alert]));
+  const shown = backend.state.events.slice(0, 6).map((event) => alertsById[event.related_id]?.severity);
+  const cells = page.locator("#overview-events tr td:nth-child(2)");
+  await expect(cells).toHaveText(shown);
+  await expect(cells.first()).not.toHaveText(/^(LOW|HIGH)$/);
+});
+
+test("network view separates closed sockets and discloses the bounded table", async ({ page }) => {
+  const network = backend.state.snapshot.network;
+  const total = network.active_connections + network.closing_connections;
+  await expect(page.locator("#metric-connections")).toHaveText(String(network.active_connections));
+  await expect(page.locator("#metric-established")).toContainText(`${network.closing_connections} closed (TIME_WAIT) not counted`);
+  await page.locator('[data-view="network"]').click();
+  await expect(page.locator("#network-total")).toHaveText(String(total));
+  await expect(page.locator("#network-detail-count")).toHaveText(
+    `Table holds ${backend.state.snapshot.connections.length} of ${total} sockets: established first, closed TIME_WAIT last`,
+  );
+});
+
 test("process metrics distinguish unavailable, stale, and measured values", async ({ page }) => {
   const [measured, unmeasured, stale] = backend.state.snapshot.processes;
   Object.assign(unmeasured, {
@@ -113,6 +133,38 @@ test("threshold alerts show their lifecycle state", async ({ page }) => {
   await expect(page.locator("#alert-list")).toContainText("STATE: RECOVERED");
   await expect(page.locator("#alert-list")).toContainText("Occurrences: 4");
   await expect(page.locator("#nav-alert-count")).toHaveText("0");
+});
+
+test("an episode ended without an observed recovery is not shown as recovered", async ({ page }) => {
+  const now = new Date().toISOString();
+  backend.state.snapshot.alerts = [{
+    id: "synthetic-unconfirmed-alert", timestamp: now, severity: "CRITICAL", source: "System",
+    metric: "Memory 95.0%", explanation: "Ended: not confirmed after restart.",
+    acknowledged: false, dismissed: false, rule_id: "memory", evidence: { observed_percent: 95, threshold_percent: 90 },
+    persistence_pending: false, first_occurrence: now, last_occurrence: now, occurrence_count: 2,
+    condition_active: false, last_recovery: null,
+  }];
+  backend.sendSnapshot();
+  await page.locator('[data-view="alerts"]').click();
+  await expect(page.locator("#alert-list")).toContainText("STATE: ENDED");
+  await expect(page.locator("#alert-list")).toContainText("Last recovery: none observed");
+  await expect(page.locator("#alert-list")).not.toContainText("RECOVERED");
+});
+
+test("a recovery from an earlier cycle does not mark an unconfirmed end as recovered", async ({ page }) => {
+  const now = Date.now();
+  backend.state.snapshot.alerts = [{
+    id: "synthetic-legacy-alert", timestamp: new Date(now).toISOString(), severity: "CRITICAL", source: "System",
+    metric: "Memory 95.0%", explanation: "Ended: not confirmed after restart.",
+    acknowledged: true, dismissed: false, rule_id: "memory", evidence: { observed_percent: 95, threshold_percent: 90 },
+    persistence_pending: false, first_occurrence: new Date(now - 600000).toISOString(),
+    last_occurrence: new Date(now - 60000).toISOString(), occurrence_count: 3,
+    condition_active: false, last_recovery: new Date(now - 300000).toISOString(),
+  }];
+  backend.sendSnapshot();
+  await page.locator('[data-view="alerts"]').click();
+  await expect(page.locator("#alert-list")).toContainText("STATE: ENDED");
+  await expect(page.locator("#alert-list")).not.toContainText("RECOVERED");
 });
 
 test("settings persist across a browser reload", async ({ page }) => {
@@ -237,6 +289,10 @@ test("dropped writes stay visible while storage is healthy", async ({ page }) =>
   await expect(status).toHaveText("STORAGE HEALTHY · 5 WRITES DROPPED");
   await expect(status).toHaveClass("status-warning");
   await expect(status).toHaveAttribute("title", /since GhostWatch started/);
+  backend.state.snapshot.storage = { ...backend.state.snapshot.storage, history_dropped_samples: 7, history_queue_depth: 12 };
+  backend.sendSnapshot();
+  await expect(status).toHaveText("STORAGE HEALTHY · 5 WRITES DROPPED · 7 HISTORY SAMPLES DROPPED");
+  await expect(status).toHaveAttribute("title", /12 history samples waiting/);
 });
 
 test("frontend presents a safe settings persistence failure", async ({ page }) => {

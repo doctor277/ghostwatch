@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -58,11 +59,35 @@ class SystemCollector:
         performance_memory_reader: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         self.psutil = psutil_module
+        # (total, busy) CPU seconds at the previous collection. Kept here because
+        # psutil.cpu_percent(interval=None) keeps its baseline per calling thread,
+        # and collections run on whichever executor thread is free.
+        self._cpu_baseline: tuple[float, float] | None = None
+        self._cpu_lock = threading.Lock()
         self.performance_memory_reader = (
             _windows_performance_memory
             if performance_memory_reader is None and psutil_module is psutil
             else performance_memory_reader
         )
+
+    def _cpu_percent(self) -> float | None:
+        """Busy share of all logical CPUs since the previous collection.
+
+        Uses the same busy/total accounting as psutil.cpu_percent(), with a baseline
+        that does not depend on the calling thread. None until two readings exist.
+        """
+        times = self.psutil.cpu_times()
+        fields = times._asdict() if hasattr(times, "_asdict") else vars(times)
+        values = {name: float(value) for name, value in fields.items()}
+        # Linux already counts guest time inside user time.
+        total = sum(value for name, value in values.items() if name not in ("guest", "guest_nice"))
+        busy = total - values.get("idle", 0.0) - values.get("iowait", 0.0)
+        with self._cpu_lock:
+            previous, self._cpu_baseline = self._cpu_baseline, (total, busy)
+        if previous is None or total <= previous[0]:
+            return None
+        percent = 100.0 * (busy - previous[1]) / (total - previous[0])
+        return round(min(100.0, max(0.0, percent)), 1)
 
     def collect(self) -> SystemSample:
         errors: list[str] = []
@@ -117,11 +142,16 @@ class SystemCollector:
                 errors.append(f"Paging telemetry unavailable ({type(exc).__name__})")
                 unavailable.extend(("pagefile_used", "pagefile_total", "pagefile_percent"))
         try:
-            cpu_percent = round(float(self.psutil.cpu_percent(interval=None)), 1)
+            measured_cpu = self._cpu_percent()
         except (psutil.Error, OSError, RuntimeError, TypeError, ValueError) as exc:
-            cpu_percent = 0.0
+            measured_cpu = None
             errors.append(f"CPU telemetry unavailable ({type(exc).__name__})")
+        if measured_cpu is None:
+            # The first collection has no interval yet; that is not 0% usage.
+            cpu_percent = 0.0
             unavailable.append("cpu_percent")
+        else:
+            cpu_percent = measured_cpu
         try:
             disk_percent = float(self.psutil.disk_usage("C:\\").percent)
         except (psutil.Error, OSError, RuntimeError, TypeError, ValueError) as exc:

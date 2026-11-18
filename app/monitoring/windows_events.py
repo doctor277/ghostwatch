@@ -21,6 +21,9 @@ SYSTEM_CHANNEL = "System"
 APPLICATION_CHANNEL = "Application"
 
 SERVICE_FAILURE_IDS = {7000, 7001, 7009, 7011, 7023, 7024, 7031, 7034}
+# Service Control Manager timeout events put the timeout (ms) in param1 and the
+# service in param2; the other service-failure events name the service first.
+SERVICE_NAME_PARAM = {7009: "param2", 7011: "param2"}
 DEFENDER_DETECTION_IDS = {1006, 1007, 1008, 1009, 1116}
 DEFENDER_ACTION_IDS = {1010, 1011, 1012, 1117, 1118, 1119}
 LEVELS = {
@@ -225,7 +228,9 @@ class WindowsEventCollector:
             values = self._event_values(node)
             category, tags = self._classify(channel, event_id)
             summary = self._summary(node, values, provider, event_id)
-            service_name = self._service_name(values) if category == "service_failure" else None
+            service_name = (
+                self._service_name(values, event_id) if category == "service_failure" else None
+            )
             records.append(
                 WindowsEventRecord(
                     id=f"windows:{channel}:{record_id}",
@@ -292,8 +297,8 @@ class WindowsEventCollector:
         return f"{fallback}: {evidence}"[:4000] if evidence else fallback
 
     @staticmethod
-    def _service_name(values: dict[str, str]) -> str | None:
-        for key in ("ServiceName", "serviceName", "param1"):
+    def _service_name(values: dict[str, str], event_id: int) -> str | None:
+        for key in ("ServiceName", "serviceName", SERVICE_NAME_PARAM.get(event_id, "param1")):
             if values.get(key):
                 return values[key][:300]
         return None

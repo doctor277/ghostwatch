@@ -68,6 +68,10 @@ Requirements:
 
 The launcher creates `.venv`, verifies the Python version, installs dependencies when the requirements hash changes, checks port `8765`, starts Uvicorn on `127.0.0.1`, waits for the health endpoint, and opens the dashboard. Use `-NoBrowser` to suppress automatic browser launch. Press `Ctrl+C` in the launcher window to stop GhostWatch.
 
+### Upgrading an existing installation
+
+No migration or configuration step is needed, and the database schema version is unchanged. Stop GhostWatch with `Ctrl+C` before upgrading. An open threshold alert continues across a restart only if GhostWatch recorded a clean stop. Earlier builds recorded none, so on the first start after the upgrade any alert still open is closed as **ENDED** ("not confirmed after restart"). A breach that is still present opens a new alert with its own timeline entry. The closed alert keeps its evidence, timestamps, occurrence count, acknowledge and dismiss state, and incident link. It is never shown as recovered, because no recovery was observed. The same applies after any crash or forced termination. Details: [restart blocker corrections](docs/V3_RESILIENCE_AUDIT.md#restart-blocker-corrections-2026-11-16).
+
 ### Demo Mode
 
 Open **Settings** and select **Enter Demo Mode**. A yellow banner identifies the data as synthetic and not saved. Demo Mode does not scan local folders or persist its observations, making it the safest way to explore the complete interface.
@@ -109,13 +113,20 @@ npm run test:e2e
 
 The Playwright suite starts a temporary loopback server and supplies synthetic REST/WebSocket data. Browser binaries are downloaded separately and are not committed or distributed with this repository.
 
+A live check against the real Windows collectors uses a database in a new temporary directory, never `data\ghostwatch.db`, and prints aggregate numbers only. Port `8765` must be free:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\live_smoke.py --seconds 300      # bounded smoke test
+.\.venv\Scripts\python.exe scripts\live_smoke.py --seconds 28800    # eight-hour soak
+```
+
 ## Verified results
 
 Evidence is kept in three groups, and each result applies only to the commit and date it names. No public beta release has been created. See [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#evidence-status) for the full record.
 
 ### Latest published CI
 
-[Hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) at `c162eed`, the head of draft [PR #7](https://github.com/doctor277/ghostwatch/pull/7): Windows Python 3.11.9 and 3.13.17 each reported 601 passed, synthetic Chromium reported 17 passed, and Ruff, Python compilation, and JavaScript syntax passed. This covers that commit only. PR #7 was open and unmerged at the last check on November 5, 2026, so `main` does not contain this work.
+[Hosted run 41974485263](https://github.com/doctor277/ghostwatch/actions/runs/41974485263) at `c162eed`, the head of [PR #7](https://github.com/doctor277/ghostwatch/pull/7): Windows Python 3.11.9 and 3.13.17 each reported 601 passed, synthetic Chromium reported 17 passed, and Ruff, Python compilation, and JavaScript syntax passed. This covers that commit only. PRs #7, #8, #10 and #11 have since been merged into `main`; hosted CI results for those merges are not recorded in this repository.
 
 ### Local-only results
 
@@ -145,11 +156,14 @@ Report suspected vulnerabilities privately as described in [SECURITY.md](SECURIT
 
 - This local beta supports one Windows user on one computer and has no multi-user authentication or remote deployment model.
 - Windows permissions can make process details, socket ownership, or Event Log data partial or unavailable; GhostWatch reports gaps instead of inferring values.
-- An open socket with no valid snapshot shows `TELEMETRY STALE` after `max(10 s, 3 x refresh interval + 5 s)`, and the last values stay on screen until the next valid snapshot. The watchdog is local work that depends on PR #7; see [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#telemetry-freshness-watchdog---november-5-2026).
+- An open socket with no valid snapshot shows `TELEMETRY STALE` after `max(10 s, 3 x refresh interval + 5 s)`, and the last values stay on screen until the next valid snapshot. `/api/health` reports the same snapshot age. Its `status` is `ok`, `degraded` (stale telemetry, a stopped background worker, unavailable storage, an unencodable snapshot, or any history sample, alert or event write dropped or rejected since the process started) or `unavailable` (the telemetry worker stopped), with the causes listed in `reasons`. It always answers HTTP 200 so the launcher's readiness check is unchanged; see [Current Beta Validation](docs/CURRENT_BETA_VALIDATION.md#telemetry-freshness-watchdog---november-5-2026).
+- System CPU is the share of time all logical processors were busy (the `% Processor Time` counter). On processors with frequency boosting, Task Manager shows `% Processor Utility` instead, which can read noticeably lower.
+- Active connections exclude closed TCP endpoints in `TIME_WAIT`, which are counted separately; history recorded before this change counted them as active.
+- History row caps bound the database size and can hold less than the configured retention hours. At about 2,700 process rows per minute, the 2,000,000-row process cap covers roughly 12 hours.
 - Chromium is the verified browser engine; Firefox, WebKit, and native Edge-specific behavior are not currently covered.
 - Python 3.11 is verified locally and in hosted CI. Python 3.13 is verified in hosted CI through `c162eed` only; it has not run on the later local commits.
-- Pending alert, event, and operator writes are held in bounded memory. Abrupt termination can lose them, so GhostWatch gives no durable exactly-once guarantee across a crash.
-- The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification. No 30-60 minute stability run or eight-hour soak has been executed.
+- Pending alert, event, and operator writes are held in bounded memory. Abrupt termination can lose them, so GhostWatch gives no durable exactly-once guarantee across a crash. After an unclean exit, open threshold alerts are closed as not confirmed instead of continued, so a condition that never cleared appears as two alerts.
+- The accepted short runs do not replace long-duration soak testing, independent penetration testing, or production security certification. Bounded live runs of up to five minutes have been executed; no 30-60 minute stability run or eight-hour soak has been executed.
 - Historical RC2-RC5 and V2 documents are retained for engineering traceability and do not describe the current beta state.
 
 ## Project documentation

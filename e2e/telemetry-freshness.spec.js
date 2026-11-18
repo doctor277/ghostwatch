@@ -93,6 +93,24 @@ test("a silent open socket turns stale at the deadline and stays open", async ({
   expect(await activeTimers(page)).toBe(0);
 });
 
+test("recent forensic events refresh while telemetry is live, at a bounded rate", async ({ page }) => {
+  await openConnected(page);
+  const firstTitle = backend.state.events[0].title;
+  await expect(page.locator("#overview-events")).toContainText(firstTitle);
+  const fresh = { ...backend.state.events[0], id: "synthetic-fresh-event", title: "Synthetic fresh event", timestamp: new Date().toISOString() };
+  backend.state.events = [fresh, ...backend.state.events];
+  const eventRequests = () => backend.state.requests.filter((request) => request.includes("/api/events")).length;
+  const before = eventRequests();
+
+  await deliverSnapshot(page);  // Within the refresh interval: no extra request.
+  expect(eventRequests()).toBe(before);
+  await page.clock.runFor(10000);
+  await deliverSnapshot(page);
+
+  await expect(page.locator("#overview-events")).toContainText("Synthetic fresh event");
+  expect(eventRequests()).toBe(before + 1);
+});
+
 test("a good snapshot clears stale without another socket", async ({ page }) => {
   await openConnected(page);
   await page.clock.runFor(DEADLINE_MS);

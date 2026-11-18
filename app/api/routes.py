@@ -67,12 +67,24 @@ async def health(request: Request) -> dict[str, object]:
         snapshot = "unavailable"
     else:
         snapshot = "available"
+    monitoring = service.monitoring_health()
+    status, reasons = monitoring["status"], monitoring["reasons"]
+    if snapshot == "unavailable":
+        reasons = [*reasons, "snapshot_unavailable"]
+        status = "degraded" if status == "ok" else status
+    # Always HTTP 200: the launcher's readiness check only needs a live server.
     return {
-        "status": "ok",
+        "status": status,
+        "reasons": reasons,
         "scope": "local-only",
-        "monitoring": "active" if service.latest is not None else "warming-up",
+        "monitoring": monitoring["monitoring"],
         "snapshot": snapshot,
-        "storage": service.storage.model_dump(mode="json"),
+        "snapshot_age_seconds": monitoring["snapshot_age_seconds"],
+        "stale_after_seconds": monitoring["stale_after_seconds"],
+        "workers": monitoring["workers"],
+        "storage": service.storage.model_copy(update=service._queue_health()).model_dump(
+            mode="json"
+        ),
         "rejected_writes": service.rejected_writes,
         "websocket_clients": len(service.clients),
     }

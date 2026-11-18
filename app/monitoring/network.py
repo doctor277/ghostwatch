@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import ipaddress
 import socket
 import time
@@ -14,6 +15,12 @@ import psutil
 from app.config import MAX_CONNECTIONS
 from app.models import ConnectionAggregate, ConnectionInfo, NetworkSample
 from app.text_utils import safe_text
+
+# Closed TCP endpoints the OS still lists. Windows reports TIME_WAIT under PID 0.
+CLOSING_STATES = frozenset({"TIME_WAIT", "CLOSE", "DELETE_TCB"})
+# Detail rows are kept in this order when the bounded table cannot show every socket.
+_TCP_DETAIL_RANK = {"ESTABLISHED": 0, "LISTEN": 2}
+PID_ZERO_NAME = "No owner (PID 0)"
 
 
 @dataclass(slots=True)
@@ -113,7 +120,9 @@ class NetworkCollector:
 
     def _process_name(self, pid: int | None, now: float) -> str:
         if pid in (0, None):
-            return "System" if pid == 0 else "Unavailable"
+            # PID 0 is the Idle process; it owns no sockets of its own, and Windows
+            # files closed TIME_WAIT endpoints under it. System is PID 4.
+            return PID_ZERO_NAME if pid == 0 else "Unavailable"
         cached = self._name_cache.get(pid)
         if cached and cached[1] >= now:
             return cached[0]
@@ -133,7 +142,12 @@ class NetworkCollector:
         reason: str = "provider_error",
     ) -> tuple[NetworkSample, list[ConnectionInfo]]:
         unavailable.extend(
-            ("active_connections", "established_connections", "unique_remote_destinations")
+            (
+                "active_connections",
+                "closing_connections",
+                "established_connections",
+                "unique_remote_destinations",
+            )
         )
         previous = self._last_connection_sample
         sample = NetworkSample(
@@ -142,6 +156,7 @@ class NetworkCollector:
             upload_mbps=round(sent_rate / 1_048_576, 3),
             download_mbps=round(recv_rate / 1_048_576, 3),
             active_connections=previous.active_connections if previous else 0,
+            closing_connections=previous.closing_connections if previous else 0,
             established_connections=previous.established_connections if previous else 0,
             unique_remote_destinations=(
                 previous.unique_remote_destinations if previous else 0
@@ -204,9 +219,10 @@ class NetworkCollector:
         endpoints_by_pid: dict[int, set[str]] = defaultdict(set)
         names: dict[int | None, str] = {}
         current_keys: set[tuple[object, ...]] = set()
-        details: list[ConnectionInfo] = []
+        detail_candidates: list[tuple[int, int, tuple[Any, ...]]] = []
         established = 0
         active = 0
+        closing = 0
         remote_destinations: set[str] = set()
         new_count = 0
         lifecycle_truncated = False
@@ -223,15 +239,27 @@ class NetworkCollector:
                 key = self._connection_key(
                     pid, protocol, local_address, local_port, remote_address, remote_port
                 )
-                active += 1
-                total_by_pid[pid] += 1
-                if pid is not None:
-                    counts[pid] += 1
+                is_closing = protocol == "TCP" and status in CLOSING_STATES
+                if is_closing:
+                    closing += 1
+                else:
+                    active += 1
+                    total_by_pid[pid] += 1
+                    if pid is not None:
+                        counts[pid] += 1
                 if pid not in names:
                     names[pid] = self._process_name(pid, now_monotonic)
                 if protocol == "TCP" and status == "ESTABLISHED":
                     established += 1
                     established_by_pid[pid] += 1
+                if is_closing:
+                    # A closed endpoint is neither a destination in use nor a new
+                    # connection: its open predecessor was counted when it opened,
+                    # and the closure is counted once when that open key disappears.
+                    detail_candidates.append(
+                        (4, len(detail_candidates), (key, pid, status, protocol, None, False))
+                    )
+                    continue
                 if remote_address != "—":
                     remote_destinations.add(remote_address)
                     destinations_by_pid[pid].add(remote_address)
@@ -252,29 +280,13 @@ class NetworkCollector:
                 is_new = seen is None
                 if is_new and tracked:
                     new_count += 1
-                if len(details) < self.detail_limit:
-                    first_seen = seen.first_seen if seen else now_datetime
-                    first_monotonic = seen.first_monotonic if seen else now_monotonic
-                    details.append(
-                        ConnectionInfo(
-                            id=self._connection_id(key),
-                            pid=pid,
-                            process_name=names[pid],
-                            local_address=local_address,
-                            local_port=local_port,
-                            remote_address=remote_address,
-                            remote_port=remote_port,
-                            protocol=protocol,
-                            status=status,
-                            first_seen=first_seen,
-                            last_seen=now_datetime,
-                            duration_seconds=round(
-                                max(0.0, now_monotonic - first_monotonic), 1
-                            ),
-                            address_scope=self._scope(remote_address),
-                            is_new=is_new,
-                        )
-                    )
+                if protocol == "UDP":
+                    rank = 3
+                else:
+                    rank = _TCP_DETAIL_RANK.get(status, 1)
+                detail_candidates.append(
+                    (rank, len(detail_candidates), (key, pid, status, protocol, seen, is_new))
+                )
         except (psutil.AccessDenied, PermissionError) as exc:
             errors.append(
                 f"Connection details unavailable ({type(exc).__name__}; access was denied mid-enumeration)"
@@ -288,6 +300,32 @@ class NetworkCollector:
             )
             return self._unavailable_connections(
                 sent_rate, recv_rate, errors, unavailable, "provider_error"
+            )
+
+        details: list[ConnectionInfo] = []
+        for _, _, (key, pid, status, protocol, seen, is_new) in heapq.nsmallest(
+            self.detail_limit, detail_candidates
+        ):
+            _, _, local_address, local_port, remote_address, remote_port = key
+            first_seen = seen.first_seen if seen else now_datetime
+            first_monotonic = seen.first_monotonic if seen else now_monotonic
+            details.append(
+                ConnectionInfo(
+                    id=self._connection_id(key),
+                    pid=pid,
+                    process_name=names[pid],
+                    local_address=local_address,
+                    local_port=local_port,
+                    remote_address=remote_address,
+                    remote_port=remote_port,
+                    protocol=protocol,
+                    status=status,
+                    first_seen=first_seen,
+                    last_seen=now_datetime,
+                    duration_seconds=round(max(0.0, now_monotonic - first_monotonic), 1),
+                    address_scope=self._scope(remote_address),
+                    is_new=is_new,
+                )
             )
 
         disappeared_keys: set[tuple[object, ...]] = set()
@@ -362,6 +400,7 @@ class NetworkCollector:
             upload_mbps=round(sent_rate / 1_048_576, 3),
             download_mbps=round(recv_rate / 1_048_576, 3),
             active_connections=active,
+            closing_connections=closing,
             established_connections=established,
             unique_remote_destinations=len(remote_destinations),
             new_connections=new_count,
